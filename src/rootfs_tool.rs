@@ -196,6 +196,9 @@ impl Tool for RootfsTool {
             Sysno::sethostname,
             Sysno::setdomainname,
             Sysno::chroot,
+            Sysno::chmod,
+            Sysno::chown,
+            Sysno::lchown,
         ]);
         subs
     }
@@ -245,7 +248,26 @@ impl Tool for RootfsTool {
                         openat.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
-                let ret = guest.inject(rewritten).await?;
+                let first = guest.inject(rewritten).await;
+                drop(_guard);
+                let ret = match first {
+                    Ok(r) => r,
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&host);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &host, |ptr| {
+                                openat.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        r2?
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 if ret >= 0 {
                     // Record fd → guest path for future *at calls.
                     let mut st = self.state.lock().unwrap();
@@ -346,7 +368,26 @@ impl Tool for RootfsTool {
                     let st = self.state.lock().unwrap();
                     self.guest_abs(&st, stat.dirfd(), &guest_path)
                 };
-                let ret = match guest.inject(rewritten).await {
+                let first = guest.inject(rewritten).await;
+                let first = match first {
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        drop(_guard);
+                        let saved = self.chmod_ancestors(&host);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &host, |ptr| {
+                                stat.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        r2
+                    }
+                    other => other,
+                };
+                let ret = match first {
                     Ok(r) => r,
                     Err(e)
                         if e == reverie::syscalls::Errno::ENOENT
@@ -445,7 +486,26 @@ impl Tool for RootfsTool {
                         unlink.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
-                Ok(guest.inject(rewritten).await?)
+                let first = guest.inject(rewritten).await;
+                drop(_guard);
+                match first {
+                    Ok(r) => Ok(r),
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&host);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &host, |ptr| {
+                                unlink.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        Ok(r2?)
+                    }
+                    Err(e) => Err(e.into()),
+                }
             }
             Syscall::Mkdirat(mkdir) => {
                 let Some(path_ptr) = mkdir.path() else {
@@ -598,7 +658,26 @@ impl Tool for RootfsTool {
                         rd.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
-                Ok(guest.inject(rewritten).await?)
+                let first = guest.inject(rewritten).await;
+                drop(_g);
+                match first {
+                    Ok(r) => Ok(r),
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&h);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &h, |ptr| {
+                                rd.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        Ok(r2?)
+                    }
+                    Err(e) => Err(e.into()),
+                }
             }
             Syscall::Unlink(un) => {
                 let Some(pp) = un.path() else {
@@ -611,7 +690,26 @@ impl Tool for RootfsTool {
                         un.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
-                Ok(guest.inject(rewritten).await?)
+                let first = guest.inject(rewritten).await;
+                drop(_g);
+                match first {
+                    Ok(r) => Ok(r),
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&h);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &h, |ptr| {
+                                un.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        Ok(r2?)
+                    }
+                    Err(e) => Err(e.into()),
+                }
             }
             Syscall::Mkdir(md) => {
                 let Some(pp) = md.path() else {
@@ -688,7 +786,26 @@ impl Tool for RootfsTool {
                         fc.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
-                Ok(guest.inject(rewritten).await?)
+                let first = guest.inject(rewritten).await;
+                drop(_g);
+                match first {
+                    Ok(r) => Ok(r),
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&h);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &h, |ptr| {
+                                fc.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        Ok(r2?)
+                    }
+                    Err(e) => Err(e.into()),
+                }
             }
             Syscall::Utimensat(ut) => {
                 let Some(pp) = ut.path() else {
@@ -725,6 +842,24 @@ impl Tool for RootfsTool {
                     .await?;
                 let buf_raw = sx.statx().map(|p| p.0.as_raw());
                 let r = guest.inject(rewritten).await;
+                let r = match r {
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        drop(_g);
+                        let saved = self.chmod_ancestors(&h);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &h, |ptr| {
+                                sx.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        r2
+                    }
+                    other => other,
+                };
                 if std::env::var_os("LITEROOT_DEBUG").is_some() {
                     eprintln!("literoot-tool: statx -> {r:?}");
                 }
@@ -748,6 +883,70 @@ impl Tool for RootfsTool {
                     self.spoof_stat_ids(guest, buf_raw, 20, 24);
                 }
                 Ok(ret)
+            }
+            Syscall::Chmod(cm) => {
+                let Some(pp) = cm.path() else {
+                    return Ok(guest.inject(cm).await?);
+                };
+                let g = pp.read(&guest.memory())?;
+                let h = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let (_g, rewritten) = self
+                    .with_guest_path(guest, &h, |ptr| {
+                        cm.with_path(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                let first = guest.inject(rewritten).await;
+                drop(_g);
+                match first {
+                    Ok(r) => Ok(r),
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        let saved = self.chmod_ancestors(&h);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &h, |ptr| {
+                                cm.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        Ok(r2?)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Syscall::Chown(co) => {
+                if self.fake_ids(guest).is_some() {
+                    return Ok(0);
+                }
+                let Some(pp) = co.path() else {
+                    return Ok(guest.inject(co).await?);
+                };
+                let g = pp.read(&guest.memory())?;
+                let h = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let (_g, rewritten) = self
+                    .with_guest_path(guest, &h, |ptr| {
+                        co.with_path(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                Ok(guest.inject(rewritten).await?)
+            }
+            Syscall::Lchown(co) => {
+                if self.fake_ids(guest).is_some() {
+                    return Ok(0);
+                }
+                let Some(pp) = co.path() else {
+                    return Ok(guest.inject(co).await?);
+                };
+                let g = pp.read(&guest.memory())?;
+                let h = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let (_g, rewritten) = self
+                    .with_guest_path(guest, &h, |ptr| {
+                        co.with_path(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                Ok(guest.inject(rewritten).await?)
             }
             Syscall::Chdir(chdir) => {
                 let Some(path_ptr) = chdir.path() else {
@@ -1524,6 +1723,59 @@ impl RootfsTool {
             unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(raw + mode_off) };
         let mode: u32 = libc::S_IFDIR | 0o755;
         let _ = mem.write(addr, &mode.to_ne_bytes());
+    }
+
+    /// Fake-root permission dance (proot fake_id0): temporarily
+    /// grant owner rwx on each ancestor directory of `host`,
+    /// returning (path, old_mode) pairs to restore afterwards.
+    /// Only for fake uid 0 (non-root -i must not bypass DAC).
+    fn chmod_ancestors(&self, host: &Path) -> Vec<(PathBuf, u32)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut saved = Vec::new();
+        // The target directory itself too (rm -fr on a mode-000
+        // dir must be able to open/list it).
+        if let Ok(md) = std::fs::metadata(host) {
+            if md.is_dir() {
+                let mode = md.permissions().mode();
+                if mode & 0o700 != 0o700
+                    && std::fs::set_permissions(
+                        host,
+                        std::fs::Permissions::from_mode(mode | 0o700),
+                    )
+                    .is_ok()
+                {
+                    saved.push((host.to_path_buf(), mode));
+                }
+            }
+        }
+        let mut cur = PathBuf::from("/");
+        let comps: Vec<_> = host.components().collect();
+        for c in comps.iter().take(comps.len().saturating_sub(1)) {
+            if let std::path::Component::Normal(n) = c {
+                cur.push(n);
+                if let Ok(md) = std::fs::metadata(&cur) {
+                    let mode = md.permissions().mode();
+                    if mode & 0o700 != 0o700 {
+                        if std::fs::set_permissions(
+                            &cur,
+                            std::fs::Permissions::from_mode(mode | 0o700),
+                        )
+                        .is_ok()
+                        {
+                            saved.push((cur.clone(), mode));
+                        }
+                    }
+                }
+            }
+        }
+        saved
+    }
+
+    fn restore_ancestors(&self, saved: Vec<(PathBuf, u32)>) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (p, mode) in saved.into_iter().rev() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
+        }
     }
 
     /// Fake-id stat post-processing (proot rule: files owned by

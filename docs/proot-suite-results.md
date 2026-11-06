@@ -15,7 +15,8 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b7 proc exe/fd | 72 | 51 | 11 |
 | b8 dot/tmp-env | 75 | 48 | 11 |
 | b9 shebang/mknod/virtual | 80 | 43 | 11 |
-| b10 getcwd/dirfd | 81 | 43 | 10 |
+| b10 getcwd/dirfd | 81 | 43 | 11 |
+| b11 stateful ids/perm dance | 83 | 39 | 10 |
 
 
 ## Failing under BOTH
@@ -33,18 +34,15 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 
 ## Failing only under literoot (retained by name)
 
-- `test-asymmetric-binding-root`
 - `test-bind-symlink-swap`
 - `test-execve-eacces-enoexec`
 - `test-execve-sysexit-seccomp`
 - `test-fake-id-auxv-chroot`
-- `test-fake-id0-permissions`
 - `test-foreign-binary-emulation`
 - `test-foreign-binary-proc-self-exe`
 - `test-gdb-breakpoint-run`
 - `test-gdb-ptrace`
 - `test-getresid-native`
-- `test-getresuid-getresgid-syscalls`
 - `test-kernel-release-uts-fields`
 - `test-kill-tracer-pid`
 - `test-nested-ptrace`
@@ -59,7 +57,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-readlink-proc-self-exe-raw-syscall`
 - `test-rootfs-arg-validation`
 - `test-setcap-fake-id`
-- `test-setuid-thread-vs-process`
 - `test-shebang-length-limit`
 - `test-strace-execve-count`
 - `test-strace-fork-wait`
@@ -70,6 +67,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 ## Passing under literoot
 
 - `test-asymmetric-bind-cwd-readlink`
+- `test-asymmetric-binding-root`
 - `test-bind-chdir-getcwd`
 - `test-bind-cwd-bash-pwd`
 - `test-bind-file-over-etc`
@@ -93,6 +91,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-exec-proc-self-exe`
 - `test-exec-proc-self-exe-null-argv`
 - `test-faccessat-nofollow-ignored`
+- `test-fake-id0-permissions`
 - `test-fchownat-symlink`
 - `test-fork-pipe-sigkill-stress`
 - `test-fork-stress-loop`
@@ -159,5 +158,5 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Note: test-asymmetric-binding-root regressed in the b10 full run and was fixed immediately after (explicit -w must not trigger host-cwd preservation; verified manually, full recount next batch). test-readlink-proc-self-exe-raw-syscall passes manually under both; intermittent in-suite, retained.
+Note: test-readlink-proc-self-exe-raw-syscall passes manually under both; intermittent in-suite, retained.
 
