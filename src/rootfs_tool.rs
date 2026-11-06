@@ -203,6 +203,38 @@ impl Tool for RootfsTool {
         subs
     }
 
+    async fn handle_post_exec<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        // Our interp/shebang exec routes make the kernel comm
+        // name the loader/interpreter; restore the program's
+        // basename (test-proc-comm-name-truncation). Best-effort:
+        // failure leaves the kernel name.
+        use reverie::Stack as _;
+        let exe = self.exe_guest(guest);
+        let base = exe
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if base.is_empty() {
+            return Ok(());
+        }
+        let mut cell = [0u8; 16];
+        let bytes = base.as_bytes();
+        let n = bytes.len().min(15);
+        cell[..n].copy_from_slice(&bytes[..n]);
+        let mut stack = guest.stack().await;
+        let addr = stack.push(cell);
+        if stack.commit().is_ok() {
+            let prctl = reverie::syscalls::Prctl::new()
+                .with_option(libc::PR_SET_NAME)
+                .with_arg2(unsafe { addr.as_ptr() } as u64);
+            let _ = guest.inject(prctl).await;
+        }
+        Ok(())
+    }
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -1045,11 +1077,11 @@ impl Tool for RootfsTool {
                         let st = self.state.lock().unwrap();
                         self.guest_abs(&st, libc::AT_FDCWD, &guest_path)
                     };
-                    let abs = self.canonical_exe(guest, &abs);
+                    let canon = self.canonical_exe(guest, &abs);
                     pid_exe_map()
                         .lock()
                         .unwrap()
-                        .insert(guest.pid().as_raw(), abs.clone());
+                        .insert(guest.pid().as_raw(), canon);
                     let mut st = self.state.lock().unwrap();
                     st.exe_guest = abs;
                 }
@@ -1545,7 +1577,7 @@ impl RootfsTool {
                 // in test-fork-vfork-execve with ./prog).
                 let p = PathBuf::from(init);
                 if p.is_absolute() {
-                    self.canonical_exe(guest, &p)
+                    p
                 } else {
                     let cfg = self.config(guest);
                     let host = cfg.translate(&p, &self.seed_cwd(guest), None);
@@ -1996,7 +2028,11 @@ impl RootfsTool {
             cfg.rootfs.as_os_str().as_bytes().to_vec()
         } else if is_self_exe(link_guest, guest.pid().as_raw()) {
             use std::os::unix::ffi::OsStrExt as _;
-            self.exe_guest(guest).as_os_str().as_bytes().to_vec()
+            let raw = self.exe_guest(guest);
+            self.canonical_exe(guest, &raw)
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
         } else if let Some(other) = proc_pid_exe(link_guest) {
             use std::os::unix::ffi::OsStrExt as _;
             match pid_exe_map().lock().unwrap().get(&other) {
@@ -2116,6 +2152,9 @@ fn parse_shebang(image: &[u8]) -> Option<(String, Option<String>)> {
     if !image.starts_with(b"#!") {
         return None;
     }
+    // Kernel reads at most BINPRM_BUF_SIZE (256) bytes for the
+    // shebang line; longer lines truncate mid-token.
+    let image = &image[..image.len().min(256)];
     let line_end = image.iter().position(|&c| c == b'\n').unwrap_or(image.len());
     let line = std::str::from_utf8(&image[2..line_end]).ok()?.trim();
     let mut parts = line.splitn(2, |c: char| c.is_whitespace());

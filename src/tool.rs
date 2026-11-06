@@ -119,11 +119,20 @@ pub fn run_guest(
     // Shebang scripts: exec the guest interpreter with the
     // script's guest path (argv0 fidelity: $0 is the script as
     // spelled, e.g. through a symlink — test-symlink-script-argv0).
-    if let Some((script_interp, script_opt)) = std::fs::read(&host_prog)
+    let shebang = std::fs::read(&host_prog)
         .ok()
         .filter(|img| !img.starts_with(b"\x7fELF"))
-        .and_then(|img| parse_shebang_pub(&img))
-    {
+        .and_then(|img| parse_shebang_pub(&img));
+    if let Some((script_interp, script_opt)) = shebang {
+        // Self-referential shebang: the kernel would ELOOP.
+        if resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp))
+            == host_prog
+        {
+            eprintln!(
+                "literoot: {guest_prog}: Too many levels of symbolic links"
+            );
+            return Err("Too many levels of symbolic links".into());
+        }
         let interp_host =
             resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp));
         let interp_interp = std::fs::read(&interp_host)
@@ -317,7 +326,8 @@ fn find_guest_in_path(
 ) -> Option<String> {
     // Guest PATH from the environment (proot semantics: empty
     // PATH finds nothing; unset uses the execvp default).
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".into());
+    // Unset PATH: proot performs no search (test-path-search).
+    let path_env = std::env::var("PATH").ok()?;
     for dir in path_env.split(':') {
         if dir.is_empty() {
             continue;
@@ -336,6 +346,9 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
     if !image.starts_with(b"#!") {
         return None;
     }
+    // Kernel reads at most BINPRM_BUF_SIZE (256) bytes for the
+    // shebang line; longer lines truncate mid-token.
+    let image = &image[..image.len().min(256)];
     let line_end = image.iter().position(|&c| c == b'\n').unwrap_or(image.len());
     let line = std::str::from_utf8(&image[2..line_end]).ok()?.trim();
     let mut parts = line.splitn(2, |c: char| c.is_whitespace());

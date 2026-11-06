@@ -62,6 +62,43 @@ Covered as correctness (byte-identical trees vs proot; see PR
 body). Timing cell not yet recorded — `apk add` wall time under
 each runner is future work, listed here so the gap is explicit.
 
+## Addendum 2026-11-05: seccomp value + ptrace-stop anatomy
+
+Same stat cell (20k stats, median of 7, same session/load —
+absolute values drifted vs Cell 1 (native 13.25 µs this run);
+within-run ratios are the claim). Commands:
+`proot -r ROOT /bin/statloop 20000 /etc/os-release` with and
+without `PROOT_NO_SECCOMP=1`; literoot slot `b4b81ae92`,
+export head `b231b65a`.
+
+| Runner | µs/stat |
+|---|---|
+| native (bwrap) | 13.25 |
+| proot default (seccomp) | 12.15 |
+| proot PROOT_NO_SECCOMP=1 | 18.76 |
+| literoot-liteinst | 9.78 |
+| literoot-ptrace | 69.26 |
+
+**Seccomp buys proot 1.54×** (18.76 → 12.15 µs/stat): the BPF
+filter stops only on cared-about syscalls instead of every
+syscall enter/exit.
+
+**Ptrace stops per op** (method: `strace -p <tracer-pid> -c -e
+trace=ptrace,wait4,waitid` attached ~50 ms into a 20k-stat run,
+counting syscalls made *by the tracer process*; lower bounds —
+startup stops before attach are missed, and literoot's waits
+were not observed on the attached thread): proot made 61,463
+`ptrace` + 15,368 `wait4` calls (≈3.1 ptrace + 0.8 wait per
+stat in-window — enter+exit stops with register/memory pokes);
+literoot-ptrace made **329,921 `ptrace` calls (≈16.5 per
+stat)**. Where the remaining literoot-ptrace gap goes:
+Reverie's generic per-syscall injection (register save/restore
++ guest-memory peek/poke for path staging + injected syscall
+execution, ~16 ptrace ops vs proot's ~4 lean enter/exit
+rewrites) plus async Tool runtime overhead — i.e. stop *count
+per op*, not stop latency; the in-guest backends remove stops
+entirely, which is why liteinst lands at 9.78 µs here.
+
 ## Retained in-guest failures (by name)
 
 - `inguest-exec-eopnotsupp`: guest execve → EOPNOTSUPP (stage-1b,

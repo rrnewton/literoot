@@ -16,7 +16,8 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b8 dot/tmp-env | 75 | 48 | 11 |
 | b9 shebang/mknod/virtual | 80 | 43 | 11 |
 | b10 getcwd/dirfd | 81 | 43 | 11 |
-| b11 stateful ids/perm dance | 83 | 39 | 10 |
+| b11 stateful ids/perm dance | 83 | 39 | 11 |
+| b12 PATH/shebang/comm | 86 | 36 | 10 |
 
 
 ## Failing under BOTH
@@ -46,9 +47,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-kernel-release-uts-fields`
 - `test-kill-tracer-pid`
 - `test-nested-ptrace`
-- `test-path-search`
 - `test-proc-cmdline-script-argv`
-- `test-proc-comm-name-truncation`
 - `test-ptrace-exec-trap`
 - `test-ptrace-setoptions`
 - `test-ptrace-sigtrap-execve`
@@ -57,7 +56,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-readlink-proc-self-exe-raw-syscall`
 - `test-rootfs-arg-validation`
 - `test-setcap-fake-id`
-- `test-shebang-length-limit`
 - `test-strace-execve-count`
 - `test-strace-fork-wait`
 - `test-symlink-self-referential`
@@ -114,9 +112,11 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-option-override-last-wins`
 - `test-path-env-lookup`
 - `test-path-lookup-directory-shadow`
+- `test-path-search`
 - `test-path-symlink-exec-argv`
 - `test-path-traversal-conformance`
 - `test-pipe2-nonblock`
+- `test-proc-comm-name-truncation`
 - `test-proc-fd-dir-traversal`
 - `test-proc-fd-dotdot-root`
 - `test-proc-self-cmdline-read`
@@ -143,6 +143,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-rootfs-exec`
 - `test-rootfs-shebang-exec`
 - `test-setuid-thread-vs-process`
+- `test-shebang-length-limit`
 - `test-sigtrap-self-raise`
 - `test-stat-fake-ids`
 - `test-symlink-create-dangling`
