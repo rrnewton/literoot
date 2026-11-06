@@ -110,6 +110,11 @@ struct ProcState {
     bootstrapped: bool,
     /// Emulated chroot: host directory acting as the new root.
     root_override: Option<PathBuf>,
+    /// Guest scratch page (injected mmap) for execve path
+    /// staging: guest-stack staging corrupts the execve
+    /// caller's frame in interp-route processes (measured
+    /// EFAULT on second execve, test-execve-eacces-enoexec).
+    scratch: Option<usize>,
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
     exe_guest: PathBuf,
@@ -146,6 +151,7 @@ impl Default for RootfsTool {
                 fds: HashMap::new(),
                 bootstrapped: false,
                 root_override: None,
+                scratch: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
                 argv: Vec::new(),
@@ -239,6 +245,35 @@ impl Tool for RootfsTool {
         &self,
         guest: &mut T,
     ) -> Result<(), reverie::syscalls::Errno> {
+        if std::env::var_os("LITEROOT_NO_POSTEXEC").is_some() {
+            return Ok(());
+        }
+        // New image: any previous scratch mapping is gone.
+        self.state.lock().unwrap().scratch = None;
+        // Pre-allocate the execve scratch page here: injecting
+        // an mmap between a guest's two execve calls was
+        // measured to make the second fail EFAULT.
+        {
+            let needs = self.state.lock().unwrap().scratch.is_none();
+            if needs {
+                let mmap = reverie::syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(4096)
+                    .with_prot(
+                        reverie::syscalls::ProtFlags::PROT_READ
+                            | reverie::syscalls::ProtFlags::PROT_WRITE,
+                    )
+                    .with_flags(
+                        reverie::syscalls::MapFlags::MAP_PRIVATE
+                            | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
+                    )
+                    .with_fd(-1)
+                    .with_offset(0);
+                if let Ok(addr) = guest.inject(mmap).await {
+                    self.state.lock().unwrap().scratch = Some(addr as usize);
+                }
+            }
+        }
         // Setuid/setgid exec under fake identity: euid/suid take
         // the file owner's fake id (owner == real caller maps to
         // 0 by proot's fake-id rule; test-getresid-native).
@@ -285,12 +320,13 @@ impl Tool for RootfsTool {
         let bytes = base.as_bytes();
         let n = bytes.len().min(15);
         cell[..n].copy_from_slice(&bytes[..n]);
-        let mut stack = guest.stack().await;
-        let addr = stack.push(cell);
-        if stack.commit().is_ok() {
+        // Stage via scratch page, NOT the guest stack: at
+        // post-exec the stack top holds argv/env strings that
+        // a later execve must copy intact (measured EFAULT).
+        if let Ok(addr) = self.scratch_write(guest, &cell).await {
             let prctl = reverie::syscalls::Prctl::new()
                 .with_option(libc::PR_SET_NAME)
-                .with_arg2(unsafe { addr.as_ptr() } as u64);
+                .with_arg2(addr as u64);
             let _ = guest.inject(prctl).await;
         }
         // Auxv patching: fake AT_UID/EUID/GID/EGID under fake
@@ -1574,11 +1610,16 @@ impl Tool for RootfsTool {
                         Err(e) => return Err(e),
                     }
                 }
-                let (_guard, rewritten) = self
-                    .with_guest_path(guest, &host, |ptr| {
-                        execve.with_path(PathPtr::from_ptr(ptr))
-                    })
-                    .await?;
+                // Stage the path in the scratch page, not on
+                // the guest stack (stack staging corrupts the
+                // execve caller's frame in interp-route
+                // processes; measured EFAULT on second execve).
+                let mut path_bytes = host.as_os_str().as_bytes().to_vec();
+                path_bytes.push(0);
+                let scratch = self.scratch_write(guest, &path_bytes).await?;
+                let rewritten = execve.with_path(PathPtr::from_ptr(
+                    scratch as *const libc::c_char,
+                ));
                 // Success does not return; mirror strace-tool shape.
                 let e = guest.inject(rewritten).await.unwrap_err();
                 Err(e.into())
@@ -1866,6 +1907,54 @@ impl Tool for RootfsTool {
 }
 
 impl RootfsTool {
+    /// Stage bytes in the per-process guest scratch page
+    /// (injected anonymous mmap, allocated once). Returns the
+    /// guest address. Used for execve paths, where guest-stack
+    /// staging is unsafe (see ProcState::scratch).
+    async fn scratch_write<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        bytes: &[u8],
+    ) -> Result<usize, Error> {
+        self.scratch_write_at(guest, bytes, 0).await
+    }
+
+    async fn scratch_write_at<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        bytes: &[u8],
+        offset: usize,
+    ) -> Result<usize, Error> {
+        use reverie::syscalls::MemoryAccess as _;
+        let existing = self.state.lock().unwrap().scratch;
+        let base = match existing {
+            Some(b) => b,
+            None => {
+                let mmap = reverie::syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(4096)
+                    .with_prot(
+                        reverie::syscalls::ProtFlags::PROT_READ
+                            | reverie::syscalls::ProtFlags::PROT_WRITE,
+                    )
+                    .with_flags(
+                        reverie::syscalls::MapFlags::MAP_PRIVATE
+                            | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
+                    )
+                    .with_fd(-1)
+                    .with_offset(0);
+                let addr = guest.inject(mmap).await? as usize;
+                self.state.lock().unwrap().scratch = Some(addr);
+                addr
+            }
+        };
+        let mut mem = guest.memory();
+        let addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(base + offset) };
+        mem.write(addr, bytes)?;
+        Ok(base + offset)
+    }
+
     /// Exec `guest_prog` through the rootfs interp `interp_guest`:
     /// new argv = [interp, guest_prog, orig argv[1..].., NULL],
     /// reusing original argument string pointers. The program's
@@ -2988,70 +3077,68 @@ impl RootfsTool {
         write_n as i64
     }
 
-    /// Two-path variant of `with_guest_path` (rename/link): both
-    /// strings staged under one stack guard (2×256B budget each).
+    /// Two-path variant: scratch slots 0 and 1024.
     async fn with_two_guest_paths<T: Guest<Self>, S, F>(
         &self,
         guest: &mut T,
         host_a: &Path,
         host_b: &Path,
         f: F,
-    ) -> Result<(<<T as Guest<Self>>::Stack as reverie::Stack>::StackGuard, S), Error>
+    ) -> Result<((), S), Error>
     where
         F: FnOnce(*const libc::c_char, *const libc::c_char) -> S,
     {
-        use reverie::Stack as _;
-        let stage = |p: &Path| -> Result<[u8; 256], Error> {
+        let mk = |p: &Path| -> Result<Vec<u8>, Error> {
             let c = CString::new(p.as_os_str().as_bytes())
                 .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
-            let b = c.as_bytes_with_nul();
-            if b.len() > 256 {
-                return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
-            }
-            let mut buf = [0u8; 256];
-            buf[..b.len()].copy_from_slice(b);
-            Ok(buf)
+            Ok(c.as_bytes_with_nul().to_vec())
         };
-        let mut stack = guest.stack().await;
-        let a = stack.push(stage(host_a)?);
-        let b = stack.push(stage(host_b)?);
-        let guard = stack.commit()?;
-        let pa = unsafe { a.as_ptr() } as *const libc::c_char;
-        let pb = unsafe { b.as_ptr() } as *const libc::c_char;
-        Ok((guard, f(pa, pb)))
+        let a = mk(host_a)?;
+        let b = mk(host_b)?;
+        if a.len() > 1024 || b.len() > 1024 {
+            return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
+        }
+        let pa = self.scratch_write_at(guest, &a, 0).await?;
+        let pb = self.scratch_write_at(guest, &b, 1024).await?;
+        Ok((
+            (),
+            f(pa as *const libc::c_char, pb as *const libc::c_char),
+        ))
     }
 
-    /// Stage `host` path bytes on the guest stack and build the
-    /// rewritten syscall with `f`. The returned guard MUST be held
-    /// by the caller across `inject` (dropping it sooner frees the
-    /// staged bytes — measured: guest then reads garbage paths).
+    /// Stage `host` path bytes in the scratch page and build
+    /// the rewritten syscall with `f`. (Guest-stack staging was
+    /// measured to corrupt execve callers' frames; scratch page
+    /// staging cannot.)
     async fn with_guest_path<T: Guest<Self>, S, F>(
         &self,
         guest: &mut T,
         host: &Path,
         f: F,
-    ) -> Result<(<<T as Guest<Self>>::Stack as reverie::Stack>::StackGuard, S), Error>
+    ) -> Result<((), S), Error>
     where
         F: FnOnce(*const libc::c_char) -> S,
     {
-        use reverie::Stack as _;
         let cstr = CString::new(host.as_os_str().as_bytes())
             .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
         let bytes = cstr.as_bytes_with_nul();
-        if bytes.len() > PATH_BUF {
+        if bytes.len() > 1024 {
             return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
         }
-        let mut buf = [0u8; PATH_BUF];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        let mut stack = guest.stack().await;
-        let addr = stack.push(buf);
-        let guard = stack.commit()?;
-        let ptr = unsafe { addr.as_ptr() } as *const libc::c_char;
-        Ok((guard, f(ptr)))
+        let ptr = self.scratch_write_at(guest, bytes, 0).await?;
+        Ok(((), f(ptr as *const libc::c_char)))
+    }
+
+    fn drop(&mut self) {
+        crate::translate::bump_probe_gen();
     }
 }
 
-
+/// Follow a symlink chain at the *final* component of a translated
+/// host path, keeping absolute targets inside the rootfs (design
+/// §4.2). Without this, the kernel resolves e.g. Alpine's
+/// `/bin/sh -> /bin/busybox` against the host root and escapes.
+/// Intermediate-component symlinks remain a documented gap.
 /// Rewrite a host path containing /proc/self (or thread-self)
 /// for Tool-side reading: the Tool's own /proc/self is the
 /// wrong task; the guest's pid names the right one.
@@ -3072,6 +3159,7 @@ fn host_for_tool_read(host: &Path, guest_pid: i32) -> PathBuf {
     }
     host.to_path_buf()
 }
+
 
 fn init_fake(ids: Option<(u32, u32)>) -> [u32; 6] {
     let (u, g) = ids.unwrap_or((0, 0));
@@ -3169,11 +3257,7 @@ fn is_self_exe(link_guest: &Path, pid: i32) -> bool {
             || comps[1].to_string_lossy() == pid.to_string())
 }
 
-/// Follow a symlink chain at the *final* component of a translated
-/// host path, keeping absolute targets inside the rootfs (design
-/// §4.2). Without this, the kernel resolves e.g. Alpine's
-/// `/bin/sh -> /bin/busybox` against the host root and escapes.
-/// Intermediate-component symlinks remain a documented gap.
+
 fn resolve_symlink_chain(cfg: &RootConfig, host: PathBuf) -> PathBuf {
     // Never follow /proc magic links Tool-side: readlink from
     // the Tool process names the wrong task's objects
