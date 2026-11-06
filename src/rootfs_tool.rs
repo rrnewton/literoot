@@ -196,6 +196,9 @@ impl Tool for RootfsTool {
             Sysno::sethostname,
             Sysno::setdomainname,
             Sysno::chroot,
+            Sysno::bind,
+            Sysno::connect,
+            Sysno::getsockname,
             Sysno::chmod,
             Sysno::chown,
             Sysno::lchown,
@@ -207,6 +210,35 @@ impl Tool for RootfsTool {
         &self,
         guest: &mut T,
     ) -> Result<(), reverie::syscalls::Errno> {
+        // Setuid/setgid exec under fake identity: euid/suid take
+        // the file owner's fake id (owner == real caller maps to
+        // 0 by proot's fake-id rule; test-getresid-native).
+        if self.fake_ids(guest).is_some() {
+            use std::os::unix::fs::MetadataExt as _;
+            let exe = self.exe_guest(guest);
+            let host = self.translate_follow(guest, libc::AT_FDCWD, &exe);
+            if let Ok(md) = std::fs::metadata(&host) {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = md.permissions().mode();
+                let real_uid = unsafe { libc::getuid() };
+                let real_gid = unsafe { libc::getgid() };
+                let fake_cfg = self.fake_ids(guest);
+                let mut st = self.state.lock().unwrap();
+                let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
+                {
+                    if mode & 0o4000 != 0 {
+                        let mapped = if md.uid() == real_uid { 0 } else { md.uid() };
+                        f[1] = mapped;
+                        f[2] = mapped;
+                    }
+                    if mode & 0o2000 != 0 {
+                        let mapped = if md.gid() == real_gid { 0 } else { md.gid() };
+                        f[4] = mapped;
+                        f[5] = mapped;
+                    }
+                }
+            }
+        }
         // Our interp/shebang exec routes make the kernel comm
         // name the loader/interpreter; restore the program's
         // basename (test-proc-comm-name-truncation). Best-effort:
@@ -1359,6 +1391,43 @@ impl Tool for RootfsTool {
                 st.cwd = PathBuf::from("/");
                 Ok(0)
             }
+            Syscall::Bind(b) => {
+                use reverie::syscalls::FromToRaw as _;
+                match self.stage_sockaddr(guest, b.umyaddr(), b.addrlen()).await? {
+                    Some((_g, raw, len)) => {
+                        let rewritten = b
+                            .with_umyaddr(reverie::syscalls::AddrMut::from_ptr(
+                                raw as *const libc::sockaddr,
+                            ))
+                            .with_addrlen(len);
+                        Ok(guest.inject(rewritten).await?)
+                    }
+                    None => Ok(guest.inject(b).await?),
+                }
+            }
+            Syscall::Connect(c) => {
+                use reverie::syscalls::FromToRaw as _;
+                match self.stage_sockaddr(guest, c.uservaddr(), c.addrlen()).await? {
+                    Some((_g, raw, len)) => {
+                        let rewritten = c
+                            .with_uservaddr(reverie::syscalls::AddrMut::from_ptr(
+                                raw as *const libc::sockaddr,
+                            ))
+                            .with_addrlen(len);
+                        Ok(guest.inject(rewritten).await?)
+                    }
+                    None => Ok(guest.inject(c).await?),
+                }
+            }
+            Syscall::Getsockname(gs) => {
+                let addr = gs.usockaddr();
+                let len_ptr = gs.usockaddr_len();
+                let ret = guest.inject(gs).await?;
+                if ret == 0 {
+                    self.detranslate_sockaddr(guest, addr, len_ptr);
+                }
+                Ok(ret)
+            }
             other => Ok(guest.inject(other).await?),
         }
     }
@@ -1987,6 +2056,119 @@ impl RootfsTool {
         let cfg = self.config(guest);
         let host = self.translate_for(guest, dirfd, path);
         resolve_symlink_chain(&cfg, host)
+    }
+
+    /// Stage a translated AF_UNIX sockaddr copy on the guest
+    /// stack. Some((guard, raw_ptr, new_addrlen)) or None to pass
+    /// through (non-Unix family, abstract socket, fault).
+    async fn stage_sockaddr<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        addr: Option<reverie::syscalls::AddrMut<'_, libc::sockaddr>>,
+        addrlen: i32,
+    ) -> Result<
+        Option<(
+            <<T as Guest<Self>>::Stack as reverie::Stack>::StackGuard,
+            usize,
+            i32,
+        )>,
+        Error,
+    > {
+        use reverie::Stack as _;
+        use reverie::syscalls::MemoryAccess as _;
+        let Some(addr) = addr else { return Ok(None) };
+        if !(3..=110).contains(&addrlen) {
+            return Ok(None);
+        }
+        let mem = guest.memory();
+        let base: reverie::syscalls::AddrMut<u8> =
+            unsafe { std::mem::transmute_copy(&addr) };
+        let base_r: reverie::syscalls::Addr<u8> =
+            unsafe { std::mem::transmute_copy(&base) };
+        let mut buf = vec![0u8; addrlen as usize];
+        if mem.read(base_r, &mut buf).is_err() {
+            return Ok(None);
+        }
+        // AF_UNIX=1, non-abstract (sun_path[0] != 0), absolute only.
+        if buf[0] != libc::AF_UNIX as u8 || buf.get(2) != Some(&b'/') {
+            return Ok(None);
+        }
+        let end = buf[2..]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|p| p + 2)
+            .unwrap_or(buf.len());
+        use std::os::unix::ffi::OsStringExt as _;
+        let guest_path =
+            PathBuf::from(std::ffi::OsString::from_vec(buf[2..end].to_vec()));
+        let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path);
+        use std::os::unix::ffi::OsStrExt as _;
+        let hb = host.as_os_str().as_bytes();
+        if hb.len() + 3 > 110 {
+            return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
+        }
+        let mut out = [0u8; 128];
+        out[0] = buf[0];
+        out[1] = buf[1];
+        out[2..2 + hb.len()].copy_from_slice(hb);
+        let mut stack = guest.stack().await;
+        let a = stack.push(out);
+        let guard = stack.commit()?;
+        let raw = unsafe { a.as_ptr() } as usize;
+        Ok(Some((guard, raw, (2 + hb.len() + 1) as i32)))
+    }
+
+    fn detranslate_sockaddr<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        addr: Option<reverie::syscalls::AddrMut<libc::sockaddr>>,
+        len_ptr: Option<reverie::syscalls::AddrMut<libc::socklen_t>>,
+    ) {
+        use reverie::syscalls::MemoryAccess as _;
+        let (Some(addr), Some(len_ptr)) = (addr, len_ptr) else { return };
+        let mut mem = guest.memory();
+        let len_addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { std::mem::transmute_copy(&len_ptr) };
+        let mut lenb = [0u8; 4];
+        let len_a: reverie::syscalls::Addr<u8> =
+            unsafe { std::mem::transmute_copy(&len_addr) };
+        if mem.read(len_a, &mut lenb).is_err() {
+            return;
+        }
+        let total = (u32::from_ne_bytes(lenb) as usize).min(110);
+        if total <= 2 {
+            return;
+        }
+        let base: reverie::syscalls::AddrMut<u8> =
+            unsafe { std::mem::transmute_copy(&addr) };
+        let base_r: reverie::syscalls::Addr<u8> =
+            unsafe { std::mem::transmute_copy(&base) };
+        let mut buf = vec![0u8; total];
+        if mem.read(base_r, &mut buf).is_err() {
+            return;
+        }
+        if buf[0] != libc::AF_UNIX as u8 || buf[2] == 0 {
+            return;
+        }
+        let end = buf[2..].iter().position(|&c| c == 0).map(|p| p + 2).unwrap_or(total);
+        use std::os::unix::ffi::OsStringExt as _;
+        let host_path = PathBuf::from(
+            std::ffi::OsString::from_vec(buf[2..end].to_vec()),
+        );
+        let cfg = self.config(guest);
+        if let Some(g) = cfg.reverse(&host_path) {
+            use std::os::unix::ffi::OsStrExt as _;
+            let gb = g.as_os_str().as_bytes();
+            let new_total = 2 + gb.len() + 1;
+            if new_total <= 110 {
+                let mut out = vec![0u8; new_total];
+                out[0] = buf[0];
+                out[1] = buf[1];
+                out[2..2 + gb.len()].copy_from_slice(gb);
+                let _ = mem.write(base, &out);
+                let _ = mem.write(len_addr, &(new_total as u32).to_ne_bytes());
+            }
+        }
     }
 
     /// Post-process a readlink result: de-translate the stored

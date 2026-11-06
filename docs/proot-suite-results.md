@@ -17,7 +17,8 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b9 shebang/mknod/virtual | 80 | 43 | 11 |
 | b10 getcwd/dirfd | 81 | 43 | 11 |
 | b11 stateful ids/perm dance | 83 | 39 | 11 |
-| b12 PATH/shebang/comm | 86 | 36 | 10 |
+| b12 PATH/shebang/comm | 86 | 36 | 11 |
+| b13 sockets/suid-exec | 88 | 34 | 10 |
 
 
 ## Failing under BOTH
@@ -43,7 +44,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-foreign-binary-proc-self-exe`
 - `test-gdb-breakpoint-run`
 - `test-gdb-ptrace`
-- `test-getresid-native`
 - `test-kernel-release-uts-fields`
 - `test-kill-tracer-pid`
 - `test-nested-ptrace`
@@ -60,7 +60,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-strace-fork-wait`
 - `test-symlink-self-referential`
 - `test-trace-without-parent-wait`
-- `test-unix-socket-bind-getsockname`
 
 ## Passing under literoot
 
@@ -95,6 +94,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-fork-stress-loop`
 - `test-fork-vfork-execve`
 - `test-fork-wait-exit-status`
+- `test-getresid-native`
 - `test-getresuid-getresgid-syscalls`
 - `test-kernel-release-truncation`
 - `test-kompat-rm-recursive`
@@ -149,6 +149,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-symlink-create-dangling`
 - `test-symlink-script-argv0`
 - `test-sysexit`
+- `test-unix-socket-bind-getsockname`
 - `test-unix-socket-path-length`
 
 ## Skipped under literoot only

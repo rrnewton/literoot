@@ -64,24 +64,29 @@ each runner is future work, listed here so the gap is explicit.
 
 ## Addendum 2026-11-05: seccomp value + ptrace-stop anatomy
 
-Same stat cell (20k stats, median of 7, same session/load —
-absolute values drifted vs Cell 1 (native 13.25 µs this run);
-within-run ratios are the claim). Commands:
+Same stat cell (20k stats), literoot slot `b4b81ae92`,
+export head `b231b65a`. Commands:
 `proot -r ROOT /bin/statloop 20000 /etc/os-release` with and
-without `PROOT_NO_SECCOMP=1`; literoot slot `b4b81ae92`,
-export head `b231b65a`.
+without `PROOT_NO_SECCOMP=1`.
 
-| Runner | µs/stat |
-|---|---|
-| native (bwrap) | 13.25 |
-| proot default (seccomp) | 12.15 |
-| proot PROOT_NO_SECCOMP=1 | 18.76 |
-| literoot-liteinst | 9.78 |
-| literoot-ptrace | 69.26 |
+**Corrected measurement (interleaved rerun):** 9 rounds,
+randomized cell order per round, one warmup pass per cell,
+same path/filesystem. Medians: native (bwrap) 2.89 µs/stat
+(IQR 2.85–3.05), proot default 7.65 (7.30–8.25),
+proot `PROOT_NO_SECCOMP=1` 11.37 (11.15–11.65),
+literoot-liteinst 6.72 (6.60–6.95). The first (sequential,
+non-interleaved) run reported native 13.25 µs *slower* than
+proot — an artifact of drifting machine load between
+sequential cell blocks (native ran first under a load spike;
+its IQR was 3× wider than any interleaved cell). Interleaving
+removes the ordering confound; the sequential native/proot
+numbers from that run should not be used.
 
-**Seccomp buys proot 1.54×** (18.76 → 12.15 µs/stat): the BPF
-filter stops only on cared-about syscalls instead of every
-syscall enter/exit.
+**Seccomp buys proot 1.49×** (11.37 → 7.65 µs/stat,
+interleaved; 1.54× in the sequential run — same conclusion):
+the BPF filter stops only on cared-about syscalls instead of
+every syscall enter/exit. literoot-ptrace same-session
+sequential figure was 69.26 µs/stat.
 
 **Ptrace stops per op** (method: `strace -p <tracer-pid> -c -e
 trace=ptrace,wait4,waitid` attached ~50 ms into a 20k-stat run,
