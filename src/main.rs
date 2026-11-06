@@ -212,7 +212,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     // (proot order rule, test-rootfs-arg-validation): allowed
     // only when declared before an explicit -r / (rootfs wins).
     if binds.iter().any(|b| b.guest == Path::new("/")) {
-        let ok = root_bind_before_rootfs && rootfs == Path::new("/");
+        let ok = root_bind_before_rootfs && saw_explicit_rootfs && rootfs == Path::new("/");
         if !ok {
             return Err("literoot: binding over / conflicts with the rootfs".into());
         }
