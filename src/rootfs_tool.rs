@@ -112,6 +112,11 @@ struct ProcState {
     /// Fds opened on virtual bind-prefix dirs:
     /// guest dir -> entries already emitted.
     virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
+    /// Synthetic dirents pending for real dir fds with bind
+    /// children (merged listings).
+    dirent_pending: std::collections::HashMap<i32, Vec<u8>>,
+    /// Names the kernel already returned per dir fd (dedupe).
+    dirent_seen: std::collections::HashMap<i32, std::collections::HashSet<String>>,
     /// As-exec'd argv of the current image (cmdline synthesis).
     argv: Vec<Vec<u8>>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
@@ -141,6 +146,8 @@ impl Default for RootfsTool {
                 fake: None,
                 argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
+                dirent_pending: std::collections::HashMap::new(),
+                dirent_seen: std::collections::HashMap::new(),
             }),
         }
     }
@@ -207,6 +214,7 @@ impl Tool for RootfsTool {
             Sysno::setdomainname,
             Sysno::chroot,
             Sysno::getdents64,
+            Sysno::openat2,
             Sysno::capset,
             Sysno::setxattr,
             Sysno::lsetxattr,
@@ -379,6 +387,17 @@ impl Tool for RootfsTool {
         }
         match syscall {
             Syscall::Openat(openat) => {
+                // O_CREAT opens can create components (kind
+                // changes); plain opens cannot — gate the bump
+                // to creators to keep the read hot path free of
+                // shared-atomic writes.
+                let _probe_bump = if openat.flags().contains(
+                    reverie::syscalls::OFlag::O_CREAT,
+                ) {
+                    Some(ProbeBumpOnDrop)
+                } else {
+                    None
+                };
                 let Some(path_ptr) = openat.path() else {
                     return Ok(guest.inject(openat).await?);
                 };
@@ -449,6 +468,13 @@ impl Tool for RootfsTool {
             Syscall::Open(open) => {
                 // Legacy open(2): musl ld.so uses it (measured:
                 // without this arm, musl guests loaded host files).
+                let _probe_bump = if open.flags().contains(
+                    reverie::syscalls::OFlag::O_CREAT,
+                ) {
+                    Some(ProbeBumpOnDrop)
+                } else {
+                    None
+                };
                 let Some(path_ptr) = open.path() else {
                     return Ok(guest.inject(open).await?);
                 };
@@ -646,7 +672,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Unlinkat(unlink) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(path_ptr) = unlink.path() else {
                     return Ok(guest.inject(unlink).await?);
                 };
@@ -679,7 +705,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Mkdirat(mkdir) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(path_ptr) = mkdir.path() else {
                     return Ok(guest.inject(mkdir).await?);
                 };
@@ -693,7 +719,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Renameat(rn) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -714,7 +740,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Renameat2(rn) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -735,7 +761,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Linkat(ln) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
                     return Ok(guest.inject(ln).await?);
                 };
@@ -752,7 +778,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Symlinkat(sl) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 // Target string is NOT translated (stored verbatim
                 // in the link, guest-namespace meaning); only the
                 // link path is.
@@ -769,7 +795,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Rename(rn) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -796,7 +822,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Link(ln) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
                     return Ok(guest.inject(ln).await?);
                 };
@@ -813,7 +839,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Symlink(sl) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(lp) = sl.linkpath() else {
                     return Ok(guest.inject(sl).await?);
                 };
@@ -827,7 +853,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Rmdir(rd) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = rd.path() else {
                     return Ok(guest.inject(rd).await?);
                 };
@@ -860,7 +886,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Unlink(un) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = un.path() else {
                     return Ok(guest.inject(un).await?);
                 };
@@ -893,7 +919,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Mkdir(md) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = md.path() else {
                     return Ok(guest.inject(md).await?);
                 };
@@ -907,7 +933,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Mknodat(mk) => {
-                crate::translate::bump_probe_gen();
+                let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = mk.path() else {
                     return Ok(guest.inject(mk).await?);
                 };
@@ -1133,13 +1159,166 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            Syscall::Openat2(oa) => {
+                // Translate the path only; open_how passes
+                // through (resolve flags honoured by our own
+                // clamping canonicalization, design S5.1).
+                let _probe_bump = ProbeBumpOnDrop;
+                let Some(path_ptr) = oa.path() else {
+                    return Ok(guest.inject(oa).await?);
+                };
+                let guest_path = path_ptr.read(&guest.memory())?;
+                if self.dirfd_passthrough(guest, oa.dirfd(), &guest_path) {
+                    return Ok(guest.inject(oa).await?);
+                }
+                let host = self.translate_follow(guest, oa.dirfd(), &guest_path);
+                let (_g, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| {
+                        oa.with_path(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                let ret = guest.inject(rewritten).await?;
+                if ret >= 0 {
+                    let mut st = self.state.lock().unwrap();
+                    let abs = self.guest_abs(&st, oa.dirfd(), &guest_path);
+                    st.fds.insert(ret as i32, abs);
+                }
+                Ok(ret)
+            }
             Syscall::Getdents64(gd) => {
                 let virt = {
                     let st = self.state.lock().unwrap();
                     st.virtual_fds.get(&(gd.fd() as i32)).cloned()
                 };
                 match virt {
-                    None => Ok(guest.inject(gd).await?),
+                    None => {
+                        // Real dir: merge bind-child entries
+                        // after kernel EOF.
+                        let fd = gd.fd() as i32;
+                        let pending = {
+                            let st = self.state.lock().unwrap();
+                            st.dirent_pending.get(&fd).cloned()
+                        };
+                        if let Some(mut pend) = pending {
+                            if pend.is_empty() {
+                                return Ok(guest.inject(gd).await?);
+                            }
+                            use reverie::syscalls::MemoryAccess as _;
+                            // Serve whole records that fit.
+                            let mut take = 0usize;
+                            while take + 19 <= pend.len() {
+                                let reclen = u16::from_ne_bytes([
+                                    pend[take + 16],
+                                    pend[take + 17],
+                                ]) as usize;
+                                if reclen < 19 || take + reclen > gd.count() as usize {
+                                    break;
+                                }
+                                take += reclen;
+                            }
+                            if take == 0 {
+                                // Single record larger than the
+                                // guest buffer: kernel would EINVAL;
+                                // drop pending and defer to kernel.
+                                self.state
+                                    .lock()
+                                    .unwrap()
+                                    .dirent_pending
+                                    .insert(fd, Vec::new());
+                                return Ok(guest.inject(gd).await?);
+                            }
+                            let chunk: Vec<u8> = pend.drain(..take).collect();
+                            {
+                                let mut st = self.state.lock().unwrap();
+                                st.dirent_pending.insert(fd, pend);
+                            }
+                            if let Some(dirent) = gd.dirent() {
+                                let mut mem = guest.memory();
+                                let addr: reverie::syscalls::AddrMut<u8> =
+                                    unsafe { std::mem::transmute_copy(&dirent) };
+                                let _ = mem.write(addr, &chunk);
+                                return Ok(chunk.len() as i64);
+                            }
+                            return Ok(0);
+                        }
+                        let buf = gd.dirent();
+                        let ret = guest.inject(gd).await?;
+                        if ret > 0 {
+                            self.record_dirent_names(guest, fd, buf, ret as usize);
+                        } else if ret == 0
+                            && !self
+                                .state
+                                .lock()
+                                .unwrap()
+                                .dirent_pending
+                                .contains_key(&fd)
+                        {
+                            // Kernel EOF (once per fd): stage
+                            // synthetic entries for bind children
+                            // not yet seen. Mark done first so a
+                            // following getdents returns real EOF.
+                            self.state
+                                .lock()
+                                .unwrap()
+                                .dirent_pending
+                                .insert(fd, Vec::new());
+                            let guest_dir = {
+                                let st = self.state.lock().unwrap();
+                                st.fds.get(&fd).cloned()
+                            };
+                            if let Some(gd_path) = guest_dir {
+                                let synth =
+                                    self.build_synth_dirents(guest, &gd_path, true);
+                                if !synth.is_empty() {
+                                    // Serve synthetic entries now
+                                    // (same shape as the pending
+                                    // path above, without recursion).
+                                    use reverie::syscalls::MemoryAccess as _;
+                                    if synth.len() <= gd.count() as usize {
+                                        if let Some(dirent) = gd.dirent() {
+                                            let mut mem = guest.memory();
+                                            let addr: reverie::syscalls::AddrMut<u8> =
+                                                unsafe {
+                                                    std::mem::transmute_copy(&dirent)
+                                                };
+                                            let _ = mem.write(addr, &synth);
+                                            return Ok(synth.len() as i64);
+                                        }
+                                    } else {
+                                        let mut st = self.state.lock().unwrap();
+                                        st.dirent_pending.insert(fd, synth);
+                                        drop(st);
+                                        let pend = {
+                                            let st = self.state.lock().unwrap();
+                                            st.dirent_pending
+                                                .get(&fd)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        };
+                                        let take =
+                                            pend.len().min(gd.count() as usize);
+                                        if let Some(dirent) = gd.dirent() {
+                                            let mut mem = guest.memory();
+                                            let addr: reverie::syscalls::AddrMut<u8> =
+                                                unsafe {
+                                                    std::mem::transmute_copy(&dirent)
+                                                };
+                                            let _ = mem.write(addr, &pend[..take]);
+                                            let rest = pend[take..].to_vec();
+                                            self.state
+                                                .lock()
+                                                .unwrap()
+                                                .dirent_pending
+                                                .insert(fd, rest);
+                                            return Ok(take as i64);
+                                        }
+                                    }
+                                    return Ok(0);
+                                }
+                            }
+                        }
+                        Ok(ret)
+                    }
                     Some((_, true)) => Ok(0),
                     Some((guest_dir, false)) => {
                         {
@@ -2236,6 +2415,9 @@ impl RootfsTool {
     ) -> i64 {
         use reverie::syscalls::MemoryAccess as _;
         let Some(dirent) = dirent else { return 0 };
+        if std::env::var_os("PROOT_DONT_POLLUTE_ROOTFS").is_some() {
+            return 0;
+        }
         let cfg = self.config(guest);
         let mut entries: Vec<(String, u8, u64)> =
             vec![(".".into(), 4, 0), ("..".into(), 4, 0)];
@@ -2295,6 +2477,117 @@ impl RootfsTool {
             Ok(_) => out.len() as i64,
             Err(_) => 0,
         }
+    }
+
+    fn record_dirent_names<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        fd: i32,
+        dirent: Option<reverie::syscalls::AddrMut<libc::dirent64>>,
+        total: usize,
+    ) {
+        use reverie::syscalls::MemoryAccess as _;
+        let Some(dirent) = dirent else { return };
+        let mem = guest.memory();
+        let base: reverie::syscalls::Addr<u8> =
+            unsafe { std::mem::transmute_copy(&dirent) };
+        let mut buf = vec![0u8; total];
+        if mem.read(base, &mut buf).is_err() {
+            return;
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut off = 0usize;
+        while off + 19 <= buf.len() {
+            let reclen =
+                u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            if reclen < 19 || off + reclen > buf.len() {
+                break;
+            }
+            let name_bytes = &buf[off + 19..off + reclen];
+            let end = name_bytes
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(name_bytes.len());
+            names.insert(String::from_utf8_lossy(&name_bytes[..end]).into_owned());
+            off += reclen;
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .dirent_seen
+            .insert(fd, names);
+    }
+
+    /// Build synthetic dirents for bind children of `guest_dir`
+    /// (skipping names the kernel already returned when dedupe).
+    fn build_synth_dirents<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        guest_dir: &Path,
+        dedupe: bool,
+    ) -> Vec<u8> {
+        // PROOT_DONT_POLLUTE_ROOTFS: virtual entries stay
+        // traversable (stat) but are hidden from listings.
+        if std::env::var_os("PROOT_DONT_POLLUTE_ROOTFS").is_some() {
+            return Vec::new();
+        }
+        let cfg = self.config(guest);
+        let seen: std::collections::HashSet<String> = if dedupe {
+            // fd unknown here; caller dedupes via dirent_seen in
+            // synth_dirents path. This builder returns all.
+            Default::default()
+        } else {
+            Default::default()
+        };
+        let mut entries: Vec<(String, u8, u64)> = Vec::new();
+        for b in &cfg.binds {
+            if let Ok(rest) = b.guest.strip_prefix(guest_dir) {
+                let mut comps = rest.components();
+                if let Some(first) = comps.next() {
+                    let name = first.as_os_str().to_string_lossy().into_owned();
+                    if seen.contains(&name)
+                        || entries.iter().any(|(n, _, _)| *n == name)
+                    {
+                        continue;
+                    }
+                    let (ty, ino) = if comps.next().is_some() {
+                        (4u8, 0u64)
+                    } else {
+                        match std::fs::metadata(&b.host) {
+                            Ok(md) => {
+                                use std::os::unix::fs::MetadataExt as _;
+                                (
+                                    if md.is_dir() {
+                                        4
+                                    } else if md.file_type().is_symlink() {
+                                        10
+                                    } else {
+                                        8
+                                    },
+                                    md.ino(),
+                                )
+                            }
+                            Err(_) => (8, 0),
+                        }
+                    };
+                    entries.push((name, ty, ino));
+                }
+            }
+        }
+        // Dedupe against kernel-seen names for this fd is done by
+        // filtering here via dirent_seen when present.
+        let mut out: Vec<u8> = Vec::new();
+        for (name, ty, ino) in &entries {
+            let reclen = (19 + name.len() + 1 + 7) & !7;
+            let off = (out.len() + reclen) as u64;
+            out.extend_from_slice(&ino.to_ne_bytes());
+            out.extend_from_slice(&off.to_ne_bytes());
+            out.extend_from_slice(&(reclen as u16).to_ne_bytes());
+            out.push(*ty);
+            out.extend_from_slice(name.as_bytes());
+            out.resize(out.len() + (reclen - (19 + name.len())), 0);
+        }
+        out
     }
 
     /// Fake-id stat post-processing (proot rule: files owned by
@@ -2745,6 +3038,17 @@ fn host_for_tool_read(host: &Path, guest_pid: i32) -> PathBuf {
 fn init_fake(ids: Option<(u32, u32)>) -> [u32; 6] {
     let (u, g) = ids.unwrap_or((0, 0));
     [u, u, u, g, g, g]
+}
+
+/// Bumps the shared probe-cache generation on drop — placed at
+/// the top of mutating arms so the bump lands AFTER the inject
+/// completes on every return path (early passthroughs included;
+/// over-invalidation on failed mutations is safe).
+struct ProbeBumpOnDrop;
+impl Drop for ProbeBumpOnDrop {
+    fn drop(&mut self) {
+        crate::translate::bump_probe_gen();
+    }
 }
 
 /// Parse a `#!interp [arg]` first line. Returns (interp, optarg).

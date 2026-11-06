@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Probe-cache generation: bumped by the Tool on any successful
 /// mutating path syscall so cached component kinds never outlive
-/// a rename/unlink/symlink change.
+/// a rename/unlink/symlink change. If the memfd env is scrubbed
+/// or the fd was closed before first use, this silently falls
+/// back to the process-local counter (per-process coherence
+/// only) — same stated limit class as host-side mutation.
 ///
 /// Coherence scope: the counter lives in a launcher-created
 /// memfd (MAP_SHARED) inherited across the whole guest tree, so
@@ -23,6 +26,11 @@ static PROBE_GEN_LOCAL: AtomicU64 = AtomicU64::new(0);
 static PROBE_GEN_SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn shared_gen() -> Option<&'static AtomicU64> {
+    // Mutant switch for the coherence test: force the
+    // process-local generation (must FAIL cross-process).
+    if std::env::var_os("LITEROOT_PROBE_LOCAL").is_some() {
+        return None;
+    }
     if let Some(p) = PROBE_GEN_SHARED.get() {
         return Some(unsafe { &*(*p as *const AtomicU64) });
     }

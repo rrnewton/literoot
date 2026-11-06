@@ -19,9 +19,10 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b11 | 83 | 39 | 11 |
 | b12 | 86 | 36 | 11 |
 | b13 | 88 | 34 | 10 |
-| b14 shared probe gen | 90 | 32 | 10 |
+| b14 shared gen | 90 | 32 | 10 |
 | b15 auxv/cmdline | 93 | 29 | 10 |
 | b16 SIGTERM | 94 | 28 | 10 |
+| b17 gate fixes | 94 | 28 | 10 |
 
 
 ## Failing under BOTH
@@ -163,5 +164,5 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Remaining classes: guest-ptrace/gdb coexistence (ptrace-backend inherent), foreign/qemu (design out-of-scope), bind symlink-swap canonicalization, readdir merged real+virtual listings, proc cmdline for non-child pids, in-suite-only flakes (execve-eacces, readlink-raw — pass manually).
+Remaining classes: guest-ptrace/gdb/strace coexistence (ptrace-backend inherent; in-guest post-stage-1b), foreign/qemu (design out-of-scope), bind symlink-swap canonicalization, in-suite-only flakes (execve-eacces, readlink-raw — pass manually).
 
