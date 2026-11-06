@@ -219,6 +219,8 @@ impl Tool for RootfsTool {
             Sysno::chroot,
             Sysno::getdents64,
             Sysno::openat2,
+            Sysno::name_to_handle_at,
+            Sysno::open_by_handle_at,
             Sysno::capset,
             Sysno::setxattr,
             Sysno::lsetxattr,
@@ -1188,6 +1190,31 @@ impl Tool for RootfsTool {
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
+            }
+            Syscall::NameToHandleAt(nh) => {
+                let Some(pp) = nh.pathname() else {
+                    return Ok(guest.inject(nh).await?);
+                };
+                let g = pp.read(&guest.memory())?;
+                if g.as_os_str().is_empty() {
+                    return Ok(guest.inject(nh).await?);
+                }
+                if self.dirfd_passthrough(guest, nh.dirfd(), &g) {
+                    return Ok(guest.inject(nh).await?);
+                }
+                let h = self.translate_for(guest, nh.dirfd(), &g);
+                let (_g2, rewritten) = self
+                    .with_guest_path(guest, &h, |ptr| {
+                        nh.with_pathname(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                Ok(guest.inject(rewritten).await?)
+            }
+            Syscall::OpenByHandleAt(_ob) => {
+                // File handles embed host filesystem identity we
+                // cannot reverse-translate soundly; refuse by
+                // name instead of passing through (design S4.1).
+                Err(reverie::syscalls::Errno::EOPNOTSUPP.into())
             }
             Syscall::Getdents64(gd) => {
                 let virt = {
