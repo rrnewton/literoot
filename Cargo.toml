@@ -1,0 +1,19 @@
+[package]
+name = "literoot"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast drop-in proot replacement: unprivileged rootfs execution with in-guest syscall interception (early development)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rrnewton/literoot"
+homepage = "https://github.com/rrnewton/literoot"
+authors = ["Hermit/Reverie contributors"]
+readme = "README.md"
+keywords = ["proot", "rootfs", "container", "instrumentation", "linux"]
+categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
+
+[[bin]]
+name = "literoot"
+path = "src/main.rs"
+
+[dependencies]
