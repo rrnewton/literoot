@@ -44,6 +44,9 @@ pub struct LiterootConfig {
     pub kernel_release: Option<String>,
     /// Guest path of the initial program (argv-resolved).
     pub initial_exe: String,
+    /// Full initial argv as spelled on the literoot command
+    /// line (for /proc/self/cmdline synthesis).
+    pub initial_argv: Vec<String>,
 }
 
 impl LiterootConfig {
@@ -109,6 +112,8 @@ struct ProcState {
     /// Fds opened on virtual bind-prefix dirs:
     /// guest dir -> entries already emitted.
     virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
+    /// As-exec'd argv of the current image (cmdline synthesis).
+    argv: Vec<Vec<u8>>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
     /// setres* must be observable via getres* afterwards.
     fake: Option<[u32; 6]>,
@@ -134,6 +139,7 @@ impl Default for RootfsTool {
                 root_override: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
+                argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
             }),
         }
@@ -273,6 +279,74 @@ impl Tool for RootfsTool {
                 .with_arg2(unsafe { addr.as_ptr() } as u64);
             let _ = guest.inject(prctl).await;
         }
+        // Auxv patching: fake AT_UID/EUID/GID/EGID under fake
+        // identity; zero AT_HWCAP when -k requests it (proot's
+        // UTS form carries hwcap as field 7; a plain release
+        // string leaves it alone).
+        let fake = self.fake_ids(guest);
+        let zero_hwcap = guest
+            .config()
+            .kernel_release
+            .as_deref()
+            .map(|k| k.contains('\\'))
+            .unwrap_or(false);
+        if fake.is_some() || zero_hwcap {
+            use reverie::syscalls::MemoryAccess as _;
+            {
+                let regs = guest.regs().await;
+                let mut mem = guest.memory();
+                let read64 = |mem: &<T as Guest<Self>>::Memory, at: u64| -> Option<u64> {
+                    let a: reverie::syscalls::Addr<u8> =
+                        unsafe { reverie::syscalls::Addr::from_raw_unchecked(at as usize) };
+                    let mut b = [0u8; 8];
+                    mem.read(a, &mut b).ok()?;
+                    Some(u64::from_ne_bytes(b))
+                };
+                if let Some(argc) = read64(&mem, regs.rsp) {
+                    // stack: argc, argv[argc+1], envp[n+1], auxv pairs
+                    let mut p = regs.rsp + 8 + (argc + 1) * 8;
+                    for _ in 0..4096 {
+                        match read64(&mem, p) {
+                            Some(0) => {
+                                p += 8;
+                                break;
+                            }
+                            Some(_) => p += 8,
+                            None => break,
+                        }
+                    }
+                    for _ in 0..64 {
+                        let (Some(ty), Some(val)) =
+                            (read64(&mem, p), read64(&mem, p + 8))
+                        else {
+                            break;
+                        };
+                        if ty == 0 {
+                            break;
+                        }
+                        let new_val = match (ty, fake) {
+                            (11, Some((u, _))) => Some(u as u64),
+                            (12, Some((u, _))) => Some(u as u64),
+                            (13, Some((_, g))) => Some(g as u64),
+                            (14, Some((_, g))) => Some(g as u64),
+                            (16, _) if zero_hwcap => Some(0),
+                            _ => None,
+                        };
+                        if let Some(nv) = new_val {
+                            if nv != val {
+                                let a: reverie::syscalls::AddrMut<u8> = unsafe {
+                                    reverie::syscalls::AddrMut::from_raw_unchecked(
+                                        (p + 8) as usize,
+                                    )
+                                };
+                                let _ = mem.write(a, &nv.to_ne_bytes());
+                            }
+                        }
+                        p += 16;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -311,6 +385,9 @@ impl Tool for RootfsTool {
                 let mut guest_path = path_ptr.read(&guest.memory())?;
                 if is_self_exe(&guest_path, guest.pid().as_raw()) {
                     guest_path = self.exe_guest(guest);
+                }
+                if let Some(fd) = self.open_synthetic_cmdline(guest, &guest_path).await {
+                    return Ok(fd);
                 }
                 if self.dirfd_passthrough(guest, openat.dirfd(), &guest_path) {
                     return Ok(guest.inject(openat).await?);
@@ -866,7 +943,9 @@ impl Tool for RootfsTool {
                 // Fake-root: chown always reports success (design
                 // §4.4); without -0 the path is translated and the
                 // real call decides.
-                if self.config(guest).fake_root {
+                if self.config(guest).fake_ids == Some((0, 0))
+                    || (self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0)
+                {
                     return Ok(0);
                 }
                 let Some(pp) = fc.path() else {
@@ -1023,7 +1102,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Chown(co) => {
-                if self.fake_ids(guest).is_some() {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     return Ok(0);
                 }
                 let Some(pp) = co.path() else {
@@ -1039,7 +1118,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Lchown(co) => {
-                if self.fake_ids(guest).is_some() {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     return Ok(0);
                 }
                 let Some(pp) = co.path() else {
@@ -1162,6 +1241,51 @@ impl Tool for RootfsTool {
                     return Err(e.into());
                 };
                 let mut guest_path = path_ptr.read(&guest.memory())?;
+                // Remember as-exec'd argv for /proc/self/cmdline.
+                {
+                    use reverie::syscalls::ReadAddr as _;
+                    let mut argv: Vec<Vec<u8>> = Vec::new();
+                    if let Some(a) = execve.argv() {
+                        if let Ok(ptrs) = a.read(&guest.memory()) {
+                            for p in ptrs.iter().take(64) {
+                                if let Ok(cs) = p.read(&guest.memory()) {
+                                    argv.push(cs.into_bytes());
+                                }
+                            }
+                        }
+                    }
+                    if argv.is_empty() {
+                        argv.push(guest_path.as_os_str().as_bytes().to_vec());
+                    }
+                    pid_argv_map()
+                        .lock()
+                        .unwrap()
+                        .insert(guest.pid().as_raw(), argv.clone());
+                    self.state.lock().unwrap().argv = argv;
+                }
+                let mut guest_path = path_ptr.read(&guest.memory())?;
+                // Remember as-exec'd argv for /proc/self/cmdline.
+                {
+                    use reverie::syscalls::ReadAddr as _;
+                    let mut argv: Vec<Vec<u8>> = Vec::new();
+                    if let Some(a) = execve.argv() {
+                        if let Ok(ptrs) = a.read(&guest.memory()) {
+                            for p in ptrs.iter().take(64) {
+                                if let Ok(cs) = p.read(&guest.memory()) {
+                                    argv.push(cs.into_bytes());
+                                }
+                            }
+                        }
+                    }
+                    if argv.is_empty() {
+                        argv.push(guest_path.as_os_str().as_bytes().to_vec());
+                    }
+                    pid_argv_map()
+                        .lock()
+                        .unwrap()
+                        .insert(guest.pid().as_raw(), argv.clone());
+                    self.state.lock().unwrap().argv = argv;
+                }
                 if is_self_exe(&guest_path, guest.pid().as_raw()) {
                     guest_path = self.exe_guest(guest);
                 }
@@ -1469,6 +1593,11 @@ impl Tool for RootfsTool {
             }
             // ---- chroot emulation: re-root replicated state ----
             Syscall::Chroot(cr) => {
+                // Only fake-root may chroot (proot: non-root fake
+                // ids get the kernel EPERM).
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] != 0 {
+                    return Ok(guest.inject(cr).await?);
+                }
                 let Some(pp) = cr.path() else {
                     return Ok(guest.inject(cr).await?);
                 };
@@ -1601,6 +1730,26 @@ impl RootfsTool {
         script_interp: &str,
         script_opt: Option<&str>,
     ) -> Result<Result<i64, Error>, Error> {
+        // Kernel binfmt argv for scripts: [interp, opt?, script,
+        // orig args...] — what /proc/self/cmdline must show.
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut argv: Vec<Vec<u8>> = vec![script_interp.as_bytes().to_vec()];
+            if let Some(opt) = script_opt {
+                argv.push(opt.as_bytes().to_vec());
+            }
+            let prev = self.state.lock().unwrap().argv.clone();
+            if prev.is_empty() {
+                argv.push(_script_guest.as_os_str().as_bytes().to_vec());
+            } else {
+                argv.extend(prev);
+            }
+            pid_argv_map()
+                .lock()
+                .unwrap()
+                .insert(guest.pid().as_raw(), argv.clone());
+            self.state.lock().unwrap().argv = argv;
+        }
         use reverie::Stack as _;
         use reverie::syscalls::CArrayPtr;
         use reverie::syscalls::CStrPtr;
@@ -1850,7 +1999,8 @@ impl RootfsTool {
         let mut fields: [Option<String>; 6] = Default::default();
         if let Some(k) = &kr {
             if k.contains('\\') {
-                for (i, part) in k.split('\\').take(6).enumerate() {
+                let k2 = k.strip_prefix('\\').unwrap_or(k);
+                for (i, part) in k2.split('\\').take(6).enumerate() {
                     if !part.is_empty() && part != "0" {
                         fields[i] = Some(part.to_string());
                     }
@@ -1970,6 +2120,71 @@ impl RootfsTool {
         for (p, mode) in saved.into_iter().rev() {
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
         }
+    }
+
+    /// /proc/self/cmdline (or own-pid) synthesis: the kernel
+    /// buffer names our loader argv; guests must see the
+    /// as-exec'd argv. Returns a host temp-file fd via injected
+    /// openat, or None to fall through.
+    async fn open_synthetic_cmdline<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        guest_path: &Path,
+    ) -> Option<i64> {
+        let comps: Vec<String> = guest_path
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(v) => Some(v.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let target_pid: Option<i32> = if comps.len() == 3 && comps[0] == "proc" && comps[2] == "cmdline" {
+            if comps[1] == "self" || comps[1] == "thread-self" {
+                Some(guest.pid().as_raw())
+            } else {
+                comps[1].parse().ok()
+            }
+        } else {
+            None
+        };
+        let Some(target_pid) = target_pid else { return None };
+        let argv: Vec<Vec<u8>> = if target_pid == guest.pid().as_raw() {
+            let st = self.state.lock().unwrap();
+            st.argv.clone()
+        } else {
+            match pid_argv_map().lock().unwrap().get(&target_pid) {
+                Some(a) => a.clone(),
+                None => return None,
+            }
+        };
+        let argv = if argv.is_empty() {
+            let init = guest.config().initial_argv.clone();
+            if init.is_empty() {
+                return None;
+            }
+            init.into_iter().map(|s| s.into_bytes()).collect::<Vec<_>>()
+        } else {
+            argv
+        };
+        let mut content: Vec<u8> = Vec::new();
+        for a in &argv {
+            content.extend_from_slice(a);
+            content.push(0);
+        }
+        let tmp = format!("/tmp/.literoot-cmdline-{}", guest.pid().as_raw());
+        std::fs::write(&tmp, &content).ok()?;
+        let open_req = reverie::syscalls::Openat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_flags(reverie::syscalls::OFlag::O_RDONLY);
+        let (_g, rewritten) = self
+            .with_guest_path(guest, Path::new(&tmp), |ptr| {
+                open_req.with_path(PathPtr::from_ptr(ptr))
+            })
+            .await
+            .ok()?;
+        let r = guest.inject(rewritten).await.ok();
+        let _ = std::fs::remove_file(&tmp);
+        r
     }
 
     /// Open the nearest existing ancestor of a virtual bind
@@ -2686,6 +2901,13 @@ static UTS_DOMAIN: Mutex<Option<String>> = Mutex::new(None);
 /// *other* guest processes (e.g. sh reading /proc/$$/exe from a
 /// child). Populated on every guest execve; ptrace backend hosts
 /// all Tools in one process so a static map is exact there.
+static PID_ARGV: std::sync::OnceLock<Mutex<std::collections::HashMap<i32, Vec<Vec<u8>>>>> =
+    std::sync::OnceLock::new();
+
+fn pid_argv_map() -> &'static Mutex<std::collections::HashMap<i32, Vec<Vec<u8>>>> {
+    PID_ARGV.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 static PID_EXE: std::sync::OnceLock<Mutex<std::collections::HashMap<i32, PathBuf>>> =
     std::sync::OnceLock::new();
 

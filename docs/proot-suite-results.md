@@ -20,6 +20,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b12 PATH/shebang/comm | 86 | 36 | 11 |
 | b13 sockets/suid-exec | 88 | 34 | 10 |
 | b14 shared probe gen | 90 | 32 | 10 |
+| b15 auxv/cmdline | 93 | 29 | 10 |
 
 
 ## Failing under BOTH
@@ -40,15 +41,12 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-bind-symlink-swap`
 - `test-execve-eacces-enoexec`
 - `test-execve-sysexit-seccomp`
-- `test-fake-id-auxv-chroot`
 - `test-foreign-binary-emulation`
 - `test-foreign-binary-proc-self-exe`
 - `test-gdb-breakpoint-run`
 - `test-gdb-ptrace`
-- `test-kernel-release-uts-fields`
 - `test-kill-tracer-pid`
 - `test-nested-ptrace`
-- `test-proc-cmdline-script-argv`
 - `test-ptrace-exec-trap`
 - `test-ptrace-setoptions`
 - `test-ptrace-sigtrap-execve`
@@ -87,6 +85,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-exec-proc-self-exe`
 - `test-exec-proc-self-exe-null-argv`
 - `test-faccessat-nofollow-ignored`
+- `test-fake-id-auxv-chroot`
 - `test-fake-id0-permissions`
 - `test-fchownat-symlink`
 - `test-fork-pipe-sigkill-stress`
@@ -96,6 +95,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-getresid-native`
 - `test-getresuid-getresgid-syscalls`
 - `test-kernel-release-truncation`
+- `test-kernel-release-uts-fields`
 - `test-kompat-rm-recursive`
 - `test-ldd-passthrough`
 - `test-lstat-trailing-slash-symlink`
@@ -115,6 +115,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-path-symlink-exec-argv`
 - `test-path-traversal-conformance`
 - `test-pipe2-nonblock`
+- `test-proc-cmdline-script-argv`
 - `test-proc-comm-name-truncation`
 - `test-proc-fd-dir-traversal`
 - `test-proc-fd-dotdot-root`

@@ -73,6 +73,7 @@ pub fn run_guest(
         fake_gid: config.fake_ids.map(|(_, g)| g),
         kernel_release: config.kernel_release.clone(),
         initial_exe: String::new(),
+        initial_argv: Vec::new(),
     };
     let mut cfg = cfg;
     set_config(cfg.clone());
@@ -99,6 +100,7 @@ pub fn run_guest(
         (host, found)
     };
     cfg.initial_exe = guest_found.clone();
+    cfg.initial_argv = command.to_vec();
     set_config(cfg.clone());
     // Execute permission is checked by the kernel on the real
     // execve; our interp/shebang routes would bypass it, so
