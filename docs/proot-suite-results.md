@@ -164,5 +164,44 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp passes manually and in isolated make runs (in-suite flake); test-execve-eacces-enoexec is Reverie ptrace exec-failure stack fidelity (passes with rootfs=/, fails in-rootfs via interp route).
+Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp passes manually and in isolated make runs (in-suite flake); test-execve-eacces-enoexec is an upstream test bug (reclassified 2026-11-06, see below; retained by name).
+
+## Reclassification: test-execve-eacces-enoexec (2026-11-06, museport/W1)
+
+The upstream test declares `extern char *environ[];` (array, not
+pointer-to-pointer), so both execve calls receive the address of the
+`environ` variable as `envp`. Whether the kernel's envp walk then faults
+depends on static-glibc copy-relocation/layout: with gcc 11.5 / glibc
+2.34 (devbig030) the second execve returns EFAULT **natively, with no
+tracer**, at -O0/-O1/-O2 and any environment size; correcting the
+declaration to `extern char **environ;` makes the verbatim test pass
+both natively and under literoot-ptrace. Frame-independent asm repros
+(direct syscalls; stack-local and .data argv variants) show errno
+sequence (EACCES then ENOEXEC), red zone, and 512 bytes below rsp fully
+preserved across both failed execves under the Reverie ptrace backend,
+identical to native — no backend guest-state corruption was found. The
+earlier native-pass/literoot-fail split was the same latent UB surfacing
+under a different toolchain. The name stays in the failing list (the
+pinned upstream suite is the comparator and is not edited); the
+corrected-declaration build of the same source is the W4
+failed-exec-atomicity oracle candidate for stage-1b (it passes on
+ptrace today, so S2 inherits a real gate). Docs/execve-eacces-evidence.md
+retains the original characterization for history.
+
+## Local reproduction baseline (devbig030) and run rules
+
+Reproduced 2026-11-06 (EPYC 9D85, kernel 7.1.3, literoot @ PR#1 head
+031dc11, reverie @ ac71ee9c): **97 ok / 25 FAILED / 10 skipped** — the
+b17 set plus `test-unix-socket-bind-getsockname`. Two host-environment
+deltas, both proven environmental, must not be re-derived as bugs:
+
+- Run the suite with `TMPDIR` **unset for the guest** (host-side build
+  `TMPDIR` must not leak into `make check`): a long host TMPDIR breaks
+  `test-readlinkat-empty-pathname` (it builds its link path from
+  `getenv("TMPDIR")`).
+- Keep the suite rootfs at a **short host path**: translated AF_UNIX
+  socket paths must fit `sun_path` (107 bytes);
+  `test-unix-socket-bind-getsockname` fails with ENAMETOOLONG when
+  `<rootfs>/test-nnnnnnnn-socket` exceeds it (110 bytes at this slot's
+  depth).
 
