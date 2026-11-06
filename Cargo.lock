@@ -602,14 +602,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "liteinst2"
-version = "0.1.0"
-source = "git+https://github.com/rrnewton/liteinst2?rev=d64dc833418a4c265803645653b8f597d0f25060#d64dc833418a4c265803645653b8f597d0f25060"
+name = "liteinst"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38e2e683117ef65c460ef78aa3d4e80a8ba5f8c81890bed76c799cc7a0b7d828"
 dependencies = [
  "iced-x86",
  "libc",
+ "liteinst-x86",
  "memmap2",
  "nix 0.31.3",
+]
+
+[[package]]
+name = "liteinst-x86"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c663b904c7a56bd98d1acc594d0b26d4eee1c96a6c50eb4a982505f0ced3bad3"
+dependencies = [
+ "iced-x86",
 ]
 
 [[package]]
@@ -936,7 +947,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reverie-core"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -965,7 +976,7 @@ dependencies = [
 [[package]]
 name = "reverie-inguest"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "bincode",
  "libc",
@@ -982,12 +993,12 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "bincode",
  "iced-x86",
  "libc",
- "liteinst2",
+ "liteinst",
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",
@@ -1000,7 +1011,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "syscalls",
 ]
@@ -1008,7 +1019,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "bincode",
  "bitflags 2.13.2",
@@ -1025,7 +1036,7 @@ dependencies = [
 [[package]]
 name = "reverie-ptrace"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1057,7 +1068,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1072,7 +1083,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "bitflags 2.13.2",
  "derive_more",
@@ -1131,7 +1142,7 @@ dependencies = [
 [[package]]
 name = "safeptrace"
 version = "0.5.4"
-source = "git+https://github.com/facebookexperimental/reverie?rev=ac71ee9c844def23714c22f0a37f92bb1e838817#ac71ee9c844def23714c22f0a37f92bb1e838817"
+source = "git+https://github.com/facebookexperimental/reverie?rev=778a446cd3283ecd1c220792071a84b27c14db56#778a446cd3283ecd1c220792071a84b27c14db56"
 dependencies = [
  "bitflags 2.13.2",
  "futures 0.3.34",
