@@ -205,3 +205,103 @@ deltas, both proven environmental, must not be re-derived as bugs:
   `<rootfs>/test-nnnnnnnn-socket` exceeds it (110 bytes at this slot's
   depth).
 
+## In-guest backends — first scores (2026-11-06, museport/W1)
+
+Date: 2026-11-06 (museport, W1). Host: devbig030, AMD EPYC 9D85,
+kernel 7.1.3, gcc 11.5/glibc 2.34.
+
+Versions (aligned run — launcher and preload from the same Reverie):
+
+- literoot: branch `museport/w1-x86-literoot` @ `3e25697` (PR #1 head
+  `031dc11` + docs/pin commits; src identical to PR head)
+- Reverie (launcher libs + preload): `778a446cd3283ecd1c220792071a84b27c14db56`
+  for both `literoot/Cargo.toml` and `literoot/preload/Cargo.toml`
+- Suite: proot-me/proot `25dc6a3` (v5.5.0), `test/`, 132 cases
+
+Exact commands (per backend; `TMPDIR` unset for the guest, short
+suite-rootfs path — see run rules in the ptrace results doc):
+
+```sh
+make -C proot-suite/test PROOT="<abs>/literoot --backend liteinst" CARE=/bin/false check
+make -C proot-suite/test PROOT="<abs>/literoot --backend trap"     CARE=/bin/false check
+```
+
+### Scores
+
+| backend | ok | FAILED | skipped |
+|---|---|---|---|
+| liteinst (in-guest) | 36 | 44 | 52 |
+| trap (in-guest) | 36 | 44 | 52 |
+| ptrace (reference, same host) | 97 | 25 | 10 |
+
+Both in-guest backends are name-identical on every case. This is
+real, not a flag mix-up (backend selection banner-verified): at this
+frontier the outcomes are decided above the backend — rootfs/tool
+semantics and guest composition — not by patch-vs-trap.
+
+### Failure classification (44, same both backends)
+
+- **Static-utility shell tests: 41 of 44 are `.sh` tests.** The
+  suite rootfs `bin/` utilities on this host are statically linked;
+  a static guest never loads the in-guest preload, so literoot
+  reports "guest exited before connecting to the coordinator;
+  static executables ... unsupported" and the check fails. This
+  covers the binding/readlink/proc/cwd clusters (20), care (6,
+  `CARE=/bin/false` stub by construction), sockets via shell (3 of
+  the socket names are `.sh`-driven here), and misc shell cases.
+  Root cause class: **rootfs composition**, not backend syscall
+  semantics. Fix path: compose the suite rootfs from dynamic
+  utilities (or a dynamic busybox) so the preload loads; expected
+  to move most of this bucket without backend changes.
+- **Semantic `.c` failures: 3** — `test-exec-proc-self-exe`,
+  `test-exec-proc-self-exe-null-argv` (/proc/self/exe fidelity
+  after exec under the in-guest launcher), `test-rlimit-stack-brk`
+  (stack rlimit/brk handling). These connected and ran; they are
+  the genuine in-guest fidelity frontier.
+- Coexistence names in FAILED: `test-gdb-breakpoint-run`,
+  `test-strace-execve-count`, `test-strace-fork-wait` (shell-driven;
+  in the static-utility bucket above — they never reach a ptrace
+  interaction in-guest).
+
+### Skipped (52): what literoot refuses and the cost to support
+
+All 52 are exit-125 self-skips: literoot (or the test's own probe)
+refuses the invocation before the case runs. Groups, by what would
+have to be supported:
+
+- **CLI/rootfs forms literoot rejects** (proot options outside the
+  implemented subset — e.g. `-S`, `--link2symlink`, `-q`/
+  qemu forms, `--kill-on-exit`, `-0` fake-root variants used by the
+  case, nested-proot invocations): the long tail of binding,
+  readlink, cwd, rootfs-exec and nested cases. Cost: per-option;
+  fake-root (`-0`) and link2symlink are feature-sized, the rest are
+  mostly option-parse + binding-semantics work in `translate.rs`.
+- **Guest-ptrace consumers** (`test-gdb-ptrace`,
+  `test-ptrace-*`, `test-nested-ptrace`, `test-trace-without-parent-wait`):
+  in-guest the backend itself is not ptrace, but literoot currently
+  refuses the shapes these cases drive; cost = W6a re-bootstrap
+  territory (tracked in docs/w6a-coexistence-coverage.md).
+- **Host prerequisites absent here**: 32-bit (`test-getresid-m32`,
+  `test-exec-32bit-from-64bit`), docker, python getdents, qemu
+  foreign (`test-ld-library-path-foreign`). Cost: environment, not
+  code.
+- **Deliberately refused semantics**: thread creation and variants
+  (`test-chdir-thread-fork`, `test-thread-execve-nyi`, fork-stress
+  family) — the single-thread envelope; cost = W7.
+
+### Ptrace-baseline misses re-examined on this host
+
+- `test-execve-sysexit-seccomp`: deterministic here (6/6 isolated),
+  **environment**: host glibc prints `AT_??? (0x1b/0x1c)` entries
+  after `AT_RANDOM`, breaking the test's `tail -1 | grep ^AT_RANDOM`
+  assumption; AT_SYSINFO handling itself is correct.
+- `test-unix-socket-bind-getsockname`: translated socket path is
+  110 bytes at this slot depth (> 107-byte `sun_path`) —
+  **environment** (suite-rootfs path length).
+- `test-execve-eacces-enoexec`: upstream test bug
+  (`extern char *environ[]`), fails natively on this toolchain;
+  see the reclassification note in this doc's history (PR #1 doc).
+
+Logs: slot `w1/evidence/suite-liteinst.log`, `suite-trap.log`
+(pre-alignment run, identical counts) — aligned rerun logs retained
+with the lane status file references in the commit message.
