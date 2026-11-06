@@ -104,7 +104,7 @@ a stated divergence from proot, which re-probes every time;
 if the memfd env is scrubbed or the fd closed, the cache
 silently falls back to per-process generation) restored most of
 it: second interleaved rerun (9 rounds): native 2.84,
-literoot-liteinst 5.04 (1.77× native, shared-memfd cache generation), proot 7.87,
+literoot-liteinst 5.04 (1.77× native, shared-memfd cache generation; probe cache APPROVED in Muse delta review at 40edbc39, PR #1), proot 7.87,
 proot-noseccomp 11.93 µs/stat. **The ≤2×-native M1 claim is
 therefore op- and commit-dependent, stated per cell:** stat
 loop 1.44× (pre-canonicalizer) / 2.3× (uncached) / 1.77×

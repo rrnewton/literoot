@@ -28,6 +28,9 @@ static PROBE_GEN_SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
 fn shared_gen() -> Option<&'static AtomicU64> {
     // Mutant switch for the coherence test: force the
     // process-local generation (must FAIL cross-process).
+    // TEST-ONLY: production must never set this; it opts the
+    // process out of shared coherence (a guest can only desync
+    // itself, but the resulting numbers must not be quoted).
     if std::env::var_os("LITEROOT_PROBE_LOCAL").is_some() {
         return None;
     }
