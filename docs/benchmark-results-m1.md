@@ -96,9 +96,14 @@ syscall from Tool code — measurable extra work per stat
 (no coordinator RPC is involved: `send_rpc` appears nowhere
 in the Tool; a 200-stat in-guest run produces exactly 200
 Tool syscall events). A generation-validated probe cache
-(invalidated on any mutating path syscall) restored most of
+(invalidated on any mutating path syscall *in the same Tool
+process*; cross-process coherence via shared-memory generation
+is the coord7-gated follow-up — until it lands, cached numbers
+are per-process-coherent only, and host-side mutation between
+guest operations can leave a stale component kind where proot
+re-probes every time) restored most of
 it: second interleaved rerun (9 rounds): native 2.84,
-literoot-liteinst 5.04 (1.77× native), proot 7.87,
+literoot-liteinst 5.04 (1.77× native, **per-process cache generation — cross-process coherence fix in flight, see below**), proot 7.87,
 proot-noseccomp 11.93 µs/stat. **The ≤2×-native M1 claim is
 therefore op- and commit-dependent, stated per cell:** stat
 loop 1.44× (pre-canonicalizer) / 2.3× (uncached) / 1.77×

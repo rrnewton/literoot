@@ -226,6 +226,12 @@ fn run_backend(
     backend: &str,
     in_guest: bool,
 ) -> Result<u8, String> {
+    // Shared probe-cache generation (memfd inherited by the
+    // whole guest tree; translate.rs probe coherence).
+    let gen_fd = crate::translate::create_shared_gen_fd();
+    if gen_fd >= 0 {
+        cmd.env("LITEROOT_PROBE_GEN_FD", gen_fd.to_string());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

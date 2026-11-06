@@ -11,10 +11,83 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Probe-cache generation: bumped by the Tool on any successful
 /// mutating path syscall so cached component kinds never outlive
 /// a rename/unlink/symlink change.
-static PROBE_GEN: AtomicU64 = AtomicU64::new(0);
+///
+/// Coherence scope: the counter lives in a launcher-created
+/// memfd (MAP_SHARED) inherited across the whole guest tree, so
+/// a mutation in any guest process invalidates every process's
+/// cache. Without the memfd (unit tests, --check) it falls back
+/// to a process-local atomic. Host-side mutation (outside any
+/// guest) is NOT detected — a stated divergence from proot,
+/// which re-probes on every canonicalization.
+static PROBE_GEN_LOCAL: AtomicU64 = AtomicU64::new(0);
+static PROBE_GEN_SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn shared_gen() -> Option<&'static AtomicU64> {
+    if let Some(p) = PROBE_GEN_SHARED.get() {
+        return Some(unsafe { &*(*p as *const AtomicU64) });
+    }
+    if let Ok(fd_s) = std::env::var("LITEROOT_PROBE_GEN_FD") {
+        if let Ok(fd) = fd_s.parse::<i32>() {
+            init_shared_gen_from_fd(fd);
+            return PROBE_GEN_SHARED
+                .get()
+                .map(|p| unsafe { &*(*p as *const AtomicU64) });
+        }
+    }
+    None
+}
+
+/// mmap the shared generation counter from `fd` (idempotent).
+pub fn init_shared_gen_from_fd(fd: i32) {
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            8,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        if ptr != libc::MAP_FAILED {
+            let _ = PROBE_GEN_SHARED.set(ptr as usize);
+        }
+    }
+}
+
+/// Create the shared generation memfd (launcher side). Returns
+/// the fd (CLOEXEC cleared) to pass to the guest via env, or -1.
+pub fn create_shared_gen_fd() -> i32 {
+    unsafe {
+        let name = c"literoot-probe-gen";
+        let fd = libc::memfd_create(name.as_ptr(), 0);
+        if fd < 0 {
+            return -1;
+        }
+        if libc::ftruncate(fd, 8) != 0 {
+            libc::close(fd);
+            return -1;
+        }
+        init_shared_gen_from_fd(fd);
+        fd
+    }
+}
+
+pub fn probe_gen() -> u64 {
+    match shared_gen() {
+        Some(g) => g.load(Ordering::SeqCst),
+        None => PROBE_GEN_LOCAL.load(Ordering::SeqCst),
+    }
+}
 
 pub fn bump_probe_gen() {
-    PROBE_GEN.fetch_add(1, Ordering::SeqCst);
+    match shared_gen() {
+        Some(g) => {
+            g.fetch_add(1, Ordering::SeqCst);
+        }
+        None => {
+            PROBE_GEN_LOCAL.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -35,7 +108,7 @@ thread_local! {
 /// syscall; without this, a stat loop pays one extra real
 /// syscall per component (measured in-guest regression).
 fn probe(host: &Path) -> ProbeKind {
-    let gen = PROBE_GEN.load(Ordering::SeqCst);
+    let gen = probe_gen();
     if let Some(k) = PROBE_CACHE.with(|c| {
         c.borrow()
             .get(host)

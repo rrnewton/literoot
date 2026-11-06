@@ -19,6 +19,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b11 stateful ids/perm dance | 83 | 39 | 11 |
 | b12 PATH/shebang/comm | 86 | 36 | 11 |
 | b13 sockets/suid-exec | 88 | 34 | 10 |
+| b14 shared probe gen | 90 | 32 | 10 |
 
 
 ## Failing under BOTH
@@ -52,10 +53,8 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-ptrace-setoptions`
 - `test-ptrace-sigtrap-execve`
 - `test-ptrace-traceme-basic`
-- `test-readdir-nested-bindings`
 - `test-readlink-proc-self-exe-raw-syscall`
 - `test-rootfs-arg-validation`
-- `test-setcap-fake-id`
 - `test-strace-execve-count`
 - `test-strace-fork-wait`
 - `test-symlink-self-referential`
@@ -130,6 +129,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-pwd-physical-smoke`
 - `test-pwd-preserves-host-cwd`
 - `test-readdir-bind-parent-traversal`
+- `test-readdir-nested-bindings`
 - `test-readdir-symlinked-dir`
 - `test-readlink-abs-rel-symlink`
 - `test-readlink-bind-detranslate`
@@ -142,6 +142,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-rmdir-dot-path`
 - `test-rootfs-exec`
 - `test-rootfs-shebang-exec`
+- `test-setcap-fake-id`
 - `test-setuid-thread-vs-process`
 - `test-shebang-length-limit`
 - `test-sigtrap-self-raise`

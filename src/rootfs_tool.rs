@@ -201,6 +201,10 @@ impl Tool for RootfsTool {
             Sysno::setdomainname,
             Sysno::chroot,
             Sysno::getdents64,
+            Sysno::capset,
+            Sysno::setxattr,
+            Sysno::lsetxattr,
+            Sysno::fsetxattr,
             Sysno::bind,
             Sysno::connect,
             Sysno::getsockname,
@@ -1386,6 +1390,38 @@ impl Tool for RootfsTool {
                     Ok(guest.inject(s).await?)
                 }
             }
+            Syscall::Capset(c) => {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    let _ = c;
+                    Ok(0)
+                } else {
+                    Ok(guest.inject(c).await?)
+                }
+            }
+            Syscall::Setxattr(x) => {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    let _ = x;
+                    Ok(0)
+                } else {
+                    Ok(guest.inject(x).await?)
+                }
+            }
+            Syscall::Lsetxattr(x) => {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    let _ = x;
+                    Ok(0)
+                } else {
+                    Ok(guest.inject(x).await?)
+                }
+            }
+            Syscall::Fsetxattr(x) => {
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    let _ = x;
+                    Ok(0)
+                } else {
+                    Ok(guest.inject(x).await?)
+                }
+            }
             // ---- uname / hostname (design §2 -k) ----
             Syscall::Uname(un) => {
                 let buf = un.buf();
@@ -1952,6 +1988,10 @@ impl RootfsTool {
             }
             let host = cfg.translate(&anc, Path::new("/"), None);
             if host.is_dir() {
+                // Open the rootfs root as placeholder fd: the
+                // ancestor itself may be unreadable in-guest
+                // (mode -rw in test-readdir-nested-bindings).
+                let host = cfg.rootfs.clone();
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         orig.with_path(PathPtr::from_ptr(ptr))
