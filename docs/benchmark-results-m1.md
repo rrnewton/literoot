@@ -88,6 +88,23 @@ the BPF filter stops only on cared-about syscalls instead of
 every syscall enter/exit. literoot-ptrace same-session
 sequential figure was 69.26 µs/stat.
 
+**Why in-guest moved between Cell 1 and the rerun (same op,
+same binary, same path):** Cell 1 predates the
+kernel-faithful canonicalizer (batch 6), which probes every
+intermediate path component with a real `symlink_metadata`
+syscall from Tool code — measurable extra work per stat
+(no coordinator RPC is involved: `send_rpc` appears nowhere
+in the Tool; a 200-stat in-guest run produces exactly 200
+Tool syscall events). A generation-validated probe cache
+(invalidated on any mutating path syscall) restored most of
+it: second interleaved rerun (9 rounds): native 2.84,
+literoot-liteinst 5.04 (1.77× native), proot 7.87,
+proot-noseccomp 11.93 µs/stat. **The ≤2×-native M1 claim is
+therefore op- and commit-dependent, stated per cell:** stat
+loop 1.44× (pre-canonicalizer) / 2.3× (uncached) / 1.77×
+(cached); walker open-read-close 1.29×. It is not a blanket
+per-syscall bound.
+
 **Ptrace stops per op** (method: `strace -p <tracer-pid> -c -e
 trace=ptrace,wait4,waitid` attached ~50 ms into a 20k-stat run,
 counting syscalls made *by the tracer process*; lower bounds —

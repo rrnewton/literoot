@@ -106,6 +106,9 @@ struct ProcState {
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
     exe_guest: PathBuf,
+    /// Fds opened on virtual bind-prefix dirs:
+    /// guest dir -> entries already emitted.
+    virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
     /// setres* must be observable via getres* afterwards.
     fake: Option<[u32; 6]>,
@@ -131,6 +134,7 @@ impl Default for RootfsTool {
                 root_override: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
+                virtual_fds: std::collections::HashMap::new(),
             }),
         }
     }
@@ -196,6 +200,7 @@ impl Tool for RootfsTool {
             Sysno::sethostname,
             Sysno::setdomainname,
             Sysno::chroot,
+            Sysno::getdents64,
             Sysno::bind,
             Sysno::connect,
             Sysno::getsockname,
@@ -314,6 +319,26 @@ impl Tool for RootfsTool {
                     .await?;
                 let first = guest.inject(rewritten).await;
                 drop(_guard);
+                // Virtual bind-prefix directory: open the
+                // nearest real ancestor and synthesize entries
+                // in getdents64 (readdir nested bindings).
+                let first = match first {
+                    Err(e) if e == reverie::syscalls::Errno::ENOENT => {
+                        let abs = {
+                            let st = self.state.lock().unwrap();
+                            self.guest_abs(&st, openat.dirfd(), &guest_path)
+                        };
+                        if self.is_virtual_bind_dir(guest, &abs) {
+                            match self.open_virtual_dir(guest, openat, &abs).await? {
+                                Some(fd) => Ok(fd),
+                                None => Err(e),
+                            }
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    other => other,
+                };
                 let ret = match first {
                     Ok(r) => r,
                     Err(e)
@@ -540,6 +565,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Unlinkat(unlink) => {
+                crate::translate::bump_probe_gen();
                 let Some(path_ptr) = unlink.path() else {
                     return Ok(guest.inject(unlink).await?);
                 };
@@ -572,6 +598,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Mkdirat(mkdir) => {
+                crate::translate::bump_probe_gen();
                 let Some(path_ptr) = mkdir.path() else {
                     return Ok(guest.inject(mkdir).await?);
                 };
@@ -585,6 +612,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Renameat(rn) => {
+                crate::translate::bump_probe_gen();
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -605,6 +633,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Renameat2(rn) => {
+                crate::translate::bump_probe_gen();
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -625,6 +654,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Linkat(ln) => {
+                crate::translate::bump_probe_gen();
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
                     return Ok(guest.inject(ln).await?);
                 };
@@ -641,6 +671,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Symlinkat(sl) => {
+                crate::translate::bump_probe_gen();
                 // Target string is NOT translated (stored verbatim
                 // in the link, guest-namespace meaning); only the
                 // link path is.
@@ -657,6 +688,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Rename(rn) => {
+                crate::translate::bump_probe_gen();
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
                     return Ok(guest.inject(rn).await?);
                 };
@@ -683,6 +715,7 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Link(ln) => {
+                crate::translate::bump_probe_gen();
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
                     return Ok(guest.inject(ln).await?);
                 };
@@ -699,6 +732,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Symlink(sl) => {
+                crate::translate::bump_probe_gen();
                 let Some(lp) = sl.linkpath() else {
                     return Ok(guest.inject(sl).await?);
                 };
@@ -712,6 +746,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Rmdir(rd) => {
+                crate::translate::bump_probe_gen();
                 let Some(pp) = rd.path() else {
                     return Ok(guest.inject(rd).await?);
                 };
@@ -744,6 +779,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Unlink(un) => {
+                crate::translate::bump_probe_gen();
                 let Some(pp) = un.path() else {
                     return Ok(guest.inject(un).await?);
                 };
@@ -776,6 +812,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Mkdir(md) => {
+                crate::translate::bump_probe_gen();
                 let Some(pp) = md.path() else {
                     return Ok(guest.inject(md).await?);
                 };
@@ -789,6 +826,7 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Mknodat(mk) => {
+                crate::translate::bump_probe_gen();
                 let Some(pp) = mk.path() else {
                     return Ok(guest.inject(mk).await?);
                 };
@@ -1011,6 +1049,25 @@ impl Tool for RootfsTool {
                     })
                     .await?;
                 Ok(guest.inject(rewritten).await?)
+            }
+            Syscall::Getdents64(gd) => {
+                let virt = {
+                    let st = self.state.lock().unwrap();
+                    st.virtual_fds.get(&(gd.fd() as i32)).cloned()
+                };
+                match virt {
+                    None => Ok(guest.inject(gd).await?),
+                    Some((_, true)) => Ok(0),
+                    Some((guest_dir, false)) => {
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            if let Some(v) = st.virtual_fds.get_mut(&(gd.fd() as i32)) {
+                                v.1 = true;
+                            }
+                        }
+                        Ok(self.synth_dirents(guest, gd.dirent(), gd.count(), &guest_dir))
+                    }
+                }
             }
             Syscall::Chdir(chdir) => {
                 let Some(path_ptr) = chdir.path() else {
@@ -1876,6 +1933,112 @@ impl RootfsTool {
         use std::os::unix::fs::PermissionsExt as _;
         for (p, mode) in saved.into_iter().rev() {
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    /// Open the nearest existing ancestor of a virtual bind
+    /// dir and mark the fd virtual (entries synthesized).
+    async fn open_virtual_dir<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        orig: reverie::syscalls::Openat,
+        guest_abs: &Path,
+    ) -> Result<Option<i64>, Error> {
+        let cfg = self.config(guest);
+        let mut anc = guest_abs.to_path_buf();
+        loop {
+            if !anc.pop() {
+                return Ok(None);
+            }
+            let host = cfg.translate(&anc, Path::new("/"), None);
+            if host.is_dir() {
+                let (_g, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| {
+                        orig.with_path(PathPtr::from_ptr(ptr))
+                            .with_dirfd(libc::AT_FDCWD)
+                    })
+                    .await?;
+                let fd = guest.inject(rewritten).await?;
+                if fd >= 0 {
+                    let mut st = self.state.lock().unwrap();
+                    st.virtual_fds
+                        .insert(fd as i32, (guest_abs.to_path_buf(), false));
+                    st.fds.insert(fd as i32, guest_abs.to_path_buf());
+                }
+                return Ok(Some(fd));
+            }
+        }
+    }
+
+    /// Synthesize linux_dirent64 records for a virtual dir:
+    /// "." ".." plus one entry per bind child at this level.
+    fn synth_dirents<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        dirent: Option<reverie::syscalls::AddrMut<libc::dirent64>>,
+        count: u32,
+        guest_dir: &Path,
+    ) -> i64 {
+        use reverie::syscalls::MemoryAccess as _;
+        let Some(dirent) = dirent else { return 0 };
+        let cfg = self.config(guest);
+        let mut entries: Vec<(String, u8, u64)> =
+            vec![(".".into(), 4, 0), ("..".into(), 4, 0)];
+        for b in &cfg.binds {
+            if let Ok(rest) = b.guest.strip_prefix(guest_dir) {
+                let mut comps = rest.components();
+                if let Some(first) = comps.next() {
+                    let name = first.as_os_str().to_string_lossy().into_owned();
+                    if entries.iter().any(|(n, _, _)| *n == name) {
+                        continue;
+                    }
+                    let (ty, ino) = if comps.next().is_some() {
+                        (4u8, 0u64)
+                    } else {
+                        match std::fs::metadata(&b.host) {
+                            Ok(md) => {
+                                use std::os::unix::fs::MetadataExt as _;
+                                (
+                                    if md.is_dir() {
+                                        4
+                                    } else if md.file_type().is_symlink() {
+                                        10
+                                    } else {
+                                        8
+                                    },
+                                    md.ino(),
+                                )
+                            }
+                            Err(_) => (8, 0),
+                        }
+                    };
+                    entries.push((name, ty, ino));
+                }
+            }
+        }
+        let mut out: Vec<u8> = Vec::new();
+        for (name, ty, ino) in &entries {
+            let reclen = (19 + name.len() + 1 + 7) & !7;
+            if out.len() + reclen > count as usize {
+                break;
+            }
+            let off = (out.len() + reclen) as u64;
+            out.extend_from_slice(&ino.to_ne_bytes());
+            out.extend_from_slice(&off.to_ne_bytes());
+            out.extend_from_slice(&(reclen as u16).to_ne_bytes());
+            out.push(*ty);
+            out.extend_from_slice(name.as_bytes());
+            out.resize(out.len() + (reclen - (19 + name.len())), 0);
+        }
+        if out.is_empty() {
+            return 0;
+        }
+        let mut mem = guest.memory();
+        let addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { std::mem::transmute_copy(&dirent) };
+        match mem.write(addr, &out) {
+            Ok(_) => out.len() as i64,
+            Err(_) => 0,
         }
     }
 

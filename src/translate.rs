@@ -3,7 +3,61 @@
 //! Pure and std-only so it unit-tests without any backend and can be
 //! shared unchanged by the x86-64 (M1) and aarch64 (M2) Tools.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Probe-cache generation: bumped by the Tool on any successful
+/// mutating path syscall so cached component kinds never outlive
+/// a rename/unlink/symlink change.
+static PROBE_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn bump_probe_gen() {
+    PROBE_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProbeKind {
+    Dir,
+    Symlink,
+    Other,
+    Missing,
+}
+
+thread_local! {
+    static PROBE_CACHE: RefCell<HashMap<PathBuf, (u64, ProbeKind)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// symlink_metadata with a generation-validated cache. The
+/// canonicalizer probes every intermediate component on every
+/// syscall; without this, a stat loop pays one extra real
+/// syscall per component (measured in-guest regression).
+fn probe(host: &Path) -> ProbeKind {
+    let gen = PROBE_GEN.load(Ordering::SeqCst);
+    if let Some(k) = PROBE_CACHE.with(|c| {
+        c.borrow()
+            .get(host)
+            .and_then(|(g, k)| if *g == gen { Some(*k) } else { None })
+    }) {
+        return k;
+    }
+    let k = match std::fs::symlink_metadata(host) {
+        Ok(m) if m.file_type().is_symlink() => ProbeKind::Symlink,
+        Ok(m) if m.is_dir() => ProbeKind::Dir,
+        Ok(_) => ProbeKind::Other,
+        Err(_) => ProbeKind::Missing,
+    };
+    PROBE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 4096 {
+            c.clear();
+        }
+        c.insert(host.to_path_buf(), (gen, k));
+    });
+    k
+}
 
 /// One bind entry: guest prefix → host prefix (proot `-b host[:guest]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,9 +248,8 @@ impl RootConfig {
                     // Resolve a symlink at the top first: its
                     // parent is the target's parent, not ours.
                     let host = self.host_of_bound(&stack, bound.as_ref());
-                    let md = std::fs::symlink_metadata(&host);
-                    match md {
-                        Ok(m) if m.file_type().is_symlink() => {
+                    match probe(&host) {
+                        ProbeKind::Symlink => {
                             hops += 1;
                             if hops > 40 {
                                 literal.push(std::ffi::OsString::from(".."));
@@ -214,14 +267,11 @@ impl RootConfig {
                             rest.extend(pending);
                             pending = rest;
                         }
-                        Ok(m) if m.is_dir() => {
+                        ProbeKind::Dir => {
                             stack.pop();
                         }
-                        Ok(_) => {
+                        ProbeKind::Other | ProbeKind::Missing => {
                             // File/.. : kernel ENOTDIR — keep literal.
-                            literal.push(std::ffi::OsString::from(".."));
-                        }
-                        Err(_) => {
                             literal.push(std::ffi::OsString::from(".."));
                         }
                     }
@@ -260,8 +310,8 @@ impl RootConfig {
                         // Intermediate component: resolve symlink
                         // splice; stop at nonexistent (literal tail).
                         let host = self.host_of_bound(&stack, bound.as_ref());
-                        match std::fs::symlink_metadata(&host) {
-                            Ok(m) if m.file_type().is_symlink() => {
+                        match probe(&host) {
+                            ProbeKind::Symlink => {
                                 hops += 1;
                                 if hops <= 40 {
                                     let target = std::fs::read_link(&host)
@@ -276,8 +326,8 @@ impl RootConfig {
                                     pending = rest;
                                 }
                             }
-                            Ok(_) => {}
-                            Err(_) => {
+                            ProbeKind::Dir | ProbeKind::Other => {}
+                            ProbeKind::Missing => {
                                 // Nonexistent intermediate: keep
                                 // walking lexically (bind matching
                                 // still applies); only a later `..`
