@@ -6,21 +6,22 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 |---|---|---|---|
 | proot 5.5.0 | 117 | 10 | 5 |
 | literoot b0 | 43 | 79 | 13 |
-| b1 readlink/bind/cwd | 49 | 74 | 12 |
-| b2 detranslate/PWD/cwd | 56 | 68 | 11 |
-| b3 identity/uname/chroot | 60 | 64 | 11 |
-| b4 PATH/options/binds | 62 | 62 | 11 |
-| b5 proc-self/exe | 64 | 60 | 11 |
+| b1 | 49 | 74 | 12 |
+| b2 | 56 | 68 | 11 |
+| b3 | 60 | 64 | 11 |
+| b4 | 62 | 62 | 11 |
+| b5 | 64 | 60 | 11 |
 | b6 canonicalize | 69 | 54 | 11 |
-| b7 proc exe/fd | 72 | 51 | 11 |
-| b8 dot/tmp-env | 75 | 48 | 11 |
-| b9 shebang/mknod/virtual | 80 | 43 | 11 |
-| b10 getcwd/dirfd | 81 | 43 | 11 |
-| b11 stateful ids/perm dance | 83 | 39 | 11 |
-| b12 PATH/shebang/comm | 86 | 36 | 11 |
-| b13 sockets/suid-exec | 88 | 34 | 10 |
+| b7 | 72 | 51 | 11 |
+| b8 | 75 | 48 | 11 |
+| b9 | 80 | 43 | 11 |
+| b10 | 81 | 43 | 11 |
+| b11 | 83 | 39 | 11 |
+| b12 | 86 | 36 | 11 |
+| b13 | 88 | 34 | 10 |
 | b14 shared probe gen | 90 | 32 | 10 |
 | b15 auxv/cmdline | 93 | 29 | 10 |
+| b16 SIGTERM | 94 | 28 | 10 |
 
 
 ## Failing under BOTH
@@ -45,7 +46,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-foreign-binary-proc-self-exe`
 - `test-gdb-breakpoint-run`
 - `test-gdb-ptrace`
-- `test-kill-tracer-pid`
 - `test-nested-ptrace`
 - `test-ptrace-exec-trap`
 - `test-ptrace-setoptions`
@@ -96,6 +96,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-getresuid-getresgid-syscalls`
 - `test-kernel-release-truncation`
 - `test-kernel-release-uts-fields`
+- `test-kill-tracer-pid`
 - `test-kompat-rm-recursive`
 - `test-ldd-passthrough`
 - `test-lstat-trailing-slash-symlink`
@@ -162,5 +163,5 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Note: test-readlink-proc-self-exe-raw-syscall passes manually under both; intermittent in-suite, retained.
+Remaining classes: guest-ptrace/gdb coexistence (ptrace-backend inherent), foreign/qemu (design out-of-scope), bind symlink-swap canonicalization, readdir merged real+virtual listings, proc cmdline for non-child pids, in-suite-only flakes (execve-eacces, readlink-raw — pass manually).
 

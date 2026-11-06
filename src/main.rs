@@ -259,6 +259,13 @@ fn print_usage() {
 }
 
 fn main() -> ExitCode {
+    // proot's tracer survives SIGTERM sent by the guest to its
+    // TracerPid (test-kill-tracer-pid); ignore it in the
+    // launcher (guests keep their own disposition via exec).
+    #[cfg(feature = "run")]
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
     // proot compat: PROOT_TMP_DIR must be a writable directory
     // when set (proot stages temp files there; literoot only
     // validates it — test-proot-tmp-dir-env).
