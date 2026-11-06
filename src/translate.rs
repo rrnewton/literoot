@@ -173,7 +173,11 @@ impl RootConfig {
         // rootfs resolved): mid-walk binding substitution compares
         // canonical stacks (test-readdir-symlinked-dir).
         for b in &mut binds {
-            b.guest = canonicalize_plain(&rootfs, &b.guest);
+            // `!` bindings match the literal spelling only:
+            // never canonicalize their guest side.
+            if !b.no_follow {
+                b.guest = canonicalize_plain(&rootfs, &b.guest);
+            }
         }
         Self { rootfs, binds, fake_root: false, fake_ids: None, kernel_release: None }
     }
@@ -301,6 +305,13 @@ impl RootConfig {
         let mut bound = self.bind_at(&stack);
         let mut pending: VecDeque<Comp> =
             path.components().map(to_comp).collect();
+        // A trailing slash forces resolution of the final
+        // component (kernel directory semantics).
+        let force_final = {
+            use std::os::unix::ffi::OsStrExt as _;
+            let b = path.as_os_str().as_bytes();
+            b.ends_with(b"/") || b.ends_with(b"/.")
+        };
         let mut literal: Vec<std::ffi::OsString> = Vec::new();
         let mut unresolved = false;
         let mut hops = 0u32;
@@ -387,7 +398,14 @@ impl RootConfig {
                             .first()
                             .map(|c| c.as_os_str() == "proc")
                             .unwrap_or(false);
-                    if !pending.is_empty() && !proc_head {
+                    // A just-crossed binding is terminal: do not
+                    // splice the bound host root itself (e.g.
+                    // /bin -> usr/bin would leave the binding).
+                    let at_bound_root = bound
+                        .as_ref()
+                        .map(|(gc, _)| stack.len() == gc.len())
+                        .unwrap_or(false);
+                    if (!pending.is_empty() || force_final) && !proc_head && !at_bound_root {
                         // Intermediate component: resolve symlink
                         // splice; stop at nonexistent (literal tail).
                         let host = self.host_of_bound(&stack, bound.as_ref());
@@ -419,6 +437,9 @@ impl RootConfig {
                     }
                 }
             }
+        }
+        if bound.is_none() {
+            bound = self.bind_at(&stack);
         }
         // Trailing "/." (invisible to Path::components) forces
         // directory semantics in the kernel: keep it literal

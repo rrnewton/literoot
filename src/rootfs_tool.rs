@@ -36,7 +36,7 @@ use crate::translate::{Bind, RootConfig};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiterootConfig {
     pub rootfs: String,
-    pub binds: Vec<(String, String)>, // (guest, host)
+    pub binds: Vec<(String, String, bool)>, // (guest, host, no_follow)
     pub cwd: String,
     pub fake_root: bool,
     pub fake_uid: Option<u32>,
@@ -55,7 +55,11 @@ impl LiterootConfig {
             PathBuf::from(&self.rootfs),
             self.binds
                 .iter()
-                .map(|(g, h)| Bind { guest: PathBuf::from(g), host: PathBuf::from(h), no_follow: false })
+                .map(|(g, h, nf)| Bind {
+                    guest: PathBuf::from(g),
+                    host: PathBuf::from(h),
+                    no_follow: *nf,
+                })
                 .collect(),
         );
         c.fake_root = self.fake_root;
@@ -2944,7 +2948,14 @@ impl RootfsTool {
             return ret;
         }
         let write_n = guest_bytes.len().min(buf_len);
-        if mem.write(addr, &guest_bytes[..write_n]).is_err() {
+        // NUL-terminate at write_n: the kernel buffer was
+        // pre-zeroed by callers expecting the returned length
+        // to bound the string (test-readlink-proc-self-exe-raw).
+        let mut out = guest_bytes[..write_n].to_vec();
+        if write_n < buf_len {
+            out.push(0);
+        }
+        if mem.write(addr, &out).is_err() {
             return ret;
         }
         write_n as i64

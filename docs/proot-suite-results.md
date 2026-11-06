@@ -22,7 +22,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 | b14 shared gen | 90 | 32 | 10 |
 | b15 auxv/cmdline | 93 | 29 | 10 |
 | b16 SIGTERM | 94 | 28 | 10 |
-| b17 gate fixes | 94 | 28 | 10 |
+| b17 bound-splice | 98 | 24 | 10 |
 
 
 ## Failing under BOTH
@@ -40,7 +40,6 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 
 ## Failing only under literoot (retained by name)
 
-- `test-bind-symlink-swap`
 - `test-execve-eacces-enoexec`
 - `test-execve-sysexit-seccomp`
 - `test-foreign-binary-emulation`
@@ -52,11 +51,8 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-ptrace-setoptions`
 - `test-ptrace-sigtrap-execve`
 - `test-ptrace-traceme-basic`
-- `test-readlink-proc-self-exe-raw-syscall`
-- `test-rootfs-arg-validation`
 - `test-strace-execve-count`
 - `test-strace-fork-wait`
-- `test-symlink-self-referential`
 - `test-trace-without-parent-wait`
 
 ## Passing under literoot
@@ -71,6 +67,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-bind-order-independence`
 - `test-bind-proc-self-mounts`
 - `test-bind-single-file`
+- `test-bind-symlink-swap`
 - `test-bind-write-same-path`
 - `test-brk-syscall`
 - `test-bug-138`
@@ -139,10 +136,12 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-readlink-deepest-binding`
 - `test-readlink-getcwd-raw-syscall`
 - `test-readlink-getcwd-shared-buffer`
+- `test-readlink-proc-self-exe-raw-syscall`
 - `test-readlinkat-empty-pathname`
 - `test-relative-exec-w-bin`
 - `test-rlimit-stack-brk`
 - `test-rmdir-dot-path`
+- `test-rootfs-arg-validation`
 - `test-rootfs-exec`
 - `test-rootfs-shebang-exec`
 - `test-setcap-fake-id`
@@ -152,6 +151,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-stat-fake-ids`
 - `test-symlink-create-dangling`
 - `test-symlink-script-argv0`
+- `test-symlink-self-referential`
 - `test-sysexit`
 - `test-unix-socket-bind-getsockname`
 - `test-unix-socket-path-length`
@@ -164,5 +164,5 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Remaining classes: guest-ptrace/gdb/strace coexistence (ptrace-backend inherent; in-guest post-stage-1b), foreign/qemu (design out-of-scope), bind symlink-swap canonicalization, in-suite-only flakes (execve-eacces, readlink-raw — pass manually).
+Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp passes manually and in isolated make runs (in-suite flake); test-execve-eacces-enoexec is Reverie ptrace exec-failure stack fidelity (passes with rootfs=/, fails in-rootfs via interp route).
 
