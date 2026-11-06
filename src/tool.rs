@@ -64,6 +64,7 @@ pub fn run_guest(
                 (
                     b.guest.to_string_lossy().into_owned(),
                     b.host.to_string_lossy().into_owned(),
+                    b.no_follow,
                 )
             })
             .collect(),
