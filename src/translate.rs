@@ -109,10 +109,13 @@ enum ProbeKind {
     Missing,
 }
 
-thread_local! {
-    static PROBE_CACHE: RefCell<HashMap<PathBuf, (u64, ProbeKind)>> =
-        RefCell::new(HashMap::new());
-}
+// Process-global, not thread-local: in-guest dispatch may run on a
+// different host thread per syscall, so a thread-local cache never
+// warmed there (measured: bind-root probes paid in full on every
+// in-guest dispatch while the ptrace tracer's single thread hit).
+// Entries stay generation-validated exactly as before.
+static PROBE_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, (u64, ProbeKind)>>> =
+    std::sync::Mutex::new(None);
 
 /// symlink_metadata with a generation-validated cache. The
 /// canonicalizer probes every intermediate component on every
@@ -120,11 +123,13 @@ thread_local! {
 /// syscall per component (measured in-guest regression).
 fn probe(host: &Path) -> ProbeKind {
     let gen = probe_gen();
-    if let Some(k) = PROBE_CACHE.with(|c| {
-        c.borrow()
-            .get(host)
-            .and_then(|(g, k)| if *g == gen { Some(*k) } else { None })
-    }) {
+    if let Some(k) = PROBE_CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .get(host)
+        .and_then(|(g, k)| if *g == gen { Some(*k) } else { None })
+    {
         return k;
     }
     let k = match std::fs::symlink_metadata(host) {
@@ -133,13 +138,14 @@ fn probe(host: &Path) -> ProbeKind {
         Ok(_) => ProbeKind::Other,
         Err(_) => ProbeKind::Missing,
     };
-    PROBE_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
+    {
+        let mut guard = PROBE_CACHE.lock().unwrap();
+        let c = guard.get_or_insert_with(HashMap::new);
         if c.len() > 4096 {
             c.clear();
         }
         c.insert(host.to_path_buf(), (gen, k));
-    });
+    }
     k
 }
 
@@ -758,8 +764,12 @@ fn canonicalize_plain(rootfs: &Path, guest: &Path) -> PathBuf {
             C::Name(n) => {
                 stack.push(n);
                 let host = host_of(&stack);
-                if let Ok(m) = std::fs::symlink_metadata(&host) {
-                    if m.file_type().is_symlink() && hops <= 40 {
+                // Route through the generation-validated probe cache:
+                // bind-prefix canonicalization runs on every config
+                // rebuild (several per dispatch) and must not re-stat
+                // the same bind roots each time.
+                if probe(&host) == ProbeKind::Symlink {
+                    if hops <= 40 {
                         hops += 1;
                         let target = std::fs::read_link(&host).unwrap_or_default();
                         stack.pop();
