@@ -131,6 +131,18 @@ struct ProcState {
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
     /// setres* must be observable via getres* afterwards.
     fake: Option<[u32; 6]>,
+    /// Per-dispatch translation memo (stat-gap fix): one syscall
+    /// dispatch translates the same (dirfd, path) through several
+    /// helpers; memoize within the dispatch only, keyed by the
+    /// dispatch counter below. Never lives across dispatches, so no
+    /// cross-syscall staleness is possible.
+    dispatch_seq: u64,
+    translate_memo: Vec<((u64, i32, PathBuf, bool), PathBuf)>,
+    /// RootConfig built for the current dispatch (same keying: a
+    /// RootConfig rebuild re-canonicalizes every bind prefix, which
+    /// probes the host filesystem; several helpers per dispatch ask
+    /// for the config).
+    config_memo: Option<(u64, Option<PathBuf>, RootConfig)>,
 }
 
 /// The literoot Tool: one instance per guest process.
@@ -154,6 +166,9 @@ impl Default for RootfsTool {
                 scratch: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
+                dispatch_seq: 0,
+                translate_memo: Vec::new(),
+                config_memo: None,
                 argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
                 dirent_pending: std::collections::HashMap::new(),
@@ -405,6 +420,13 @@ impl Tool for RootfsTool {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        // New dispatch: per-dispatch translation memo is keyed by this
+        // counter and never consulted across dispatches.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
+            st.translate_memo.clear();
+        }
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
             eprintln!("literoot-tool: syscall {:?}", syscall.number());
         }
@@ -2143,9 +2165,27 @@ impl RootfsTool {
         // GlobalTool Config to each guest handle (in-guest tools
         // run in a different process than the launcher, so a
         // process-global stash cannot work there).
+        // Per-dispatch memo: RootConfig::new canonicalizes bind
+        // prefixes through the host filesystem, and several helpers
+        // per dispatch ask for the config. Keyed by dispatch and
+        // root override, so a mid-dispatch chroot is honored and
+        // nothing survives into the next dispatch.
+        {
+            let st = self.state.lock().unwrap();
+            if let Some((seq, root, cfg)) = &st.config_memo {
+                if *seq == st.dispatch_seq && *root == st.root_override {
+                    return cfg.clone();
+                }
+            }
+        }
         let mut cfg = guest.config().to_root_config();
-        if let Some(root) = self.state.lock().unwrap().root_override.clone() {
-            cfg.rootfs = root;
+        let root_override = self.state.lock().unwrap().root_override.clone();
+        if let Some(root) = &root_override {
+            cfg.rootfs = root.clone();
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.config_memo = Some((st.dispatch_seq, root_override, cfg.clone()));
         }
         cfg
     }
@@ -2818,6 +2858,30 @@ impl RootfsTool {
     }
 
     fn translate_for<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
+        if let Some(hit) = self.memoized_translate(dirfd, path, false) {
+            return hit;
+        }
+        let host = self.translate_for_uncached(guest, dirfd, path);
+        self.memoize_translate(dirfd, path, false, &host);
+        host
+    }
+
+    fn memoized_translate(&self, dirfd: i32, path: &Path, follow: bool) -> Option<PathBuf> {
+        let st = self.state.lock().unwrap();
+        let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
+        st.translate_memo
+            .iter()
+            .find(|(k, _)| k == &key)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn memoize_translate(&self, dirfd: i32, path: &Path, follow: bool, host: &Path) {
+        let mut st = self.state.lock().unwrap();
+        let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
+        st.translate_memo.push((key, host.to_path_buf()));
+    }
+
+    fn translate_for_uncached<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
         let cfg = self.config(guest);
         let st = self.state.lock().unwrap();
         let cwd = if st.cwd == Path::new("/__literoot_unset__") {
@@ -2884,9 +2948,14 @@ impl RootfsTool {
     /// syscalls that follow symlinks (open/stat/access). Lstat and
     /// readlink must use plain translate_for.
     fn translate_follow<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
+        if let Some(hit) = self.memoized_translate(dirfd, path, true) {
+            return hit;
+        }
         let cfg = self.config(guest);
         let host = self.translate_for(guest, dirfd, path);
-        resolve_symlink_chain(&cfg, host)
+        let resolved = resolve_symlink_chain(&cfg, host);
+        self.memoize_translate(dirfd, path, true, &resolved);
+        resolved
     }
 
     /// Stage a translated AF_UNIX sockaddr copy on the guest
