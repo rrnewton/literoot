@@ -149,8 +149,19 @@ fn in_guest_cross_process_swap_shared_vs_mutant() {
     let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("preload/target/release/libliteroot_preload.so");
     if !preload.exists() {
-        eprintln!("coherence-ig: preload not built — skipping");
-        return;
+        // A silent skip here once hid a preload compile break:
+        // fail loudly unless a human explicitly opted in.
+        // Integration gates never set LITEROOT_ALLOW_SKIP_PRELOAD.
+        if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
+            eprintln!("coherence-ig: preload not built — skipping (opt-in)");
+            return;
+        }
+        panic!(
+            "coherence-ig: preload not built at {} — build the preload \
+             (cargo build -p literoot-preload --release) or set \
+             LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
+            preload.display()
+        );
     }
     let mk_root = |name: &str| -> String {
         let root = dir.join(name);
@@ -174,7 +185,15 @@ fn in_guest_cross_process_swap_shared_vs_mutant() {
             cmd.env("LITEROOT_PROBE_LOCAL", "1");
         }
         let out = cmd.output().expect("spawn in-guest swap");
-        String::from_utf8_lossy(&out.stdout).to_string()
+        // Carry status + stderr into the assertion messages: a
+        // failed launch (e.g. preload install refusal) must not
+        // read as a coherence failure ("swap invisible").
+        format!(
+            "stdout={} status={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
     };
     // Shared generation: swap must become visible.
     let shared = run(&mk_root("root-shared"), false);
