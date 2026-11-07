@@ -37,6 +37,12 @@ mapped-successor = [
     "reverie-liteinst/loader-private-runtime",
     "reverie-inguest/loader-private-runtime",
 ]
+# Watched exec (W6a spawn swap): allows this preload build to
+# arm TrapOptions.exec_watch when the launcher asserted watched
+# mode in the tool selector. Default off; an asserted watched
+# launch against a preload without this feature is refused by
+# name (see rootfs_tool::exec_watch_for_selector).
+exec-watch = []
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1" }

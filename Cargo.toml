@@ -37,6 +37,12 @@ in-guest = ["dep:reverie-liteinst"]
 # reverie-ptrace or reverie-liteinst anywhere in the graph.
 inguest-trap = ["tool", "dep:reverie-inguest"]
 ptrace-only = ["run"]
+# Watched exec (W6a spawn swap): allows this launcher build to
+# assert watched mode to an exec-watch preload. Default off;
+# arming additionally requires the launcher-asserted watched
+# selection at runtime (see rootfs_tool::tool_selector) — the
+# feature alone never arms anything.
+exec-watch = []
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", optional = true }

@@ -4229,6 +4229,57 @@ static LAUNCHER_EXEC_SEEN: std::sync::atomic::AtomicBool =
 pub fn mark_launcher_exec_seen() {
     LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// Tool selector for an unwatched launch (today's only shape).
+pub const TOOL_SELECTOR: &[u8] = b"literoot";
+/// Tool selector for a watched launch: the launcher asserts a
+/// real exec supervisor (`spawn_watched` + rearm loop) owns
+/// this guest's exec stops. Written only by the watched spawn
+/// path (W-2); never derived from guest-controlled input.
+pub const TOOL_SELECTOR_WATCHED: &[u8] = b"literoot-watched";
+
+/// Launcher side: the selector bytes for a launch. `watched`
+/// may be true only when the caller actually spawned the guest
+/// seized under a supervisor that re-bootstraps successors;
+/// asserting it for an unwatched spawn would arm the guest's
+/// exec forwarding into a dead trap handler.
+#[allow(dead_code)] // launcher-side; unused in the preload build of this file
+pub fn tool_selector(watched: bool) -> &'static [u8] {
+    if watched {
+        TOOL_SELECTOR_WATCHED
+    } else {
+        TOOL_SELECTOR
+    }
+}
+
+/// Preload side: map a tool selector to the `exec_watch`
+/// arming decision. "literoot" never arms. "literoot-watched"
+/// arms only in `exec-watch` builds; a preload built without
+/// the feature refuses the asserted launch by name rather
+/// than silently running unarmed under a watcher (and a
+/// feature-on preload under an unasserted launch simply
+/// installs unarmed, exactly as today).
+#[allow(dead_code)] // preload-side; unused in the launcher build of this file
+pub fn exec_watch_for_selector(selector: &str) -> Result<bool, String> {
+    match selector {
+        "literoot" => Ok(false),
+        "literoot-watched" => {
+            #[cfg(feature = "exec-watch")]
+            {
+                Ok(true)
+            }
+            #[cfg(not(feature = "exec-watch"))]
+            {
+                Err("launcher asserted watched mode but this preload was \
+                     built without the exec-watch feature"
+                    .to_string())
+            }
+        }
+        other => Err(format!(
+            "unknown tool selector {other:?} (expected \"literoot\")"
+        )),
+    }
+}
 static UTS_DOMAIN: Mutex<Option<String>> = Mutex::new(None);
 
 /// pid -> guest exe path, for /proc/<pid>/exe de-translation of
@@ -4471,5 +4522,44 @@ mod tests {
         // clone will fail in the kernel and the handler clears
         // the staged snapshot on return, so staging is safe.
         assert!(clone_is_process(0));
+    }
+}
+
+#[cfg(test)]
+mod exec_watch_gate_tests {
+    use super::{exec_watch_for_selector, tool_selector, TOOL_SELECTOR, TOOL_SELECTOR_WATCHED};
+
+    #[test]
+    fn selector_bytes_follow_watched_bit() {
+        assert_eq!(tool_selector(false), TOOL_SELECTOR);
+        assert_eq!(tool_selector(true), TOOL_SELECTOR_WATCHED);
+        assert_eq!(tool_selector(false), b"literoot");
+    }
+
+    #[test]
+    fn unwatched_selector_never_arms() {
+        // The no-watcher case: an ordinary launch must install
+        // unarmed in every build flavour, exactly as today.
+        assert_eq!(exec_watch_for_selector("literoot"), Ok(false));
+    }
+
+    #[test]
+    fn watched_selector_arms_only_with_feature() {
+        #[cfg(feature = "exec-watch")]
+        assert_eq!(exec_watch_for_selector("literoot-watched"), Ok(true));
+        #[cfg(not(feature = "exec-watch"))]
+        {
+            let err = exec_watch_for_selector("literoot-watched").unwrap_err();
+            assert!(
+                err.contains("without the exec-watch feature"),
+                "mismatch must refuse by name, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_selector_refused_by_name() {
+        let err = exec_watch_for_selector("bogus").unwrap_err();
+        assert!(err.contains("unknown tool selector"), "got: {err}");
     }
 }

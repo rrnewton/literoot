@@ -103,14 +103,24 @@ unsafe extern "C" fn initialize(
             Ok(selected) => selected,
             Err(_) => fail("tool selector is not valid UTF-8"),
         };
+        let armed = match rootfs_tool::exec_watch_for_selector(&selected) {
+            Ok(armed) => armed,
+            Err(msg) => fail(&msg),
+        };
         let socket = bootstrap.coordinator;
         let result = match selected.as_str() {
-            "literoot" => unsafe {
-                reverie_inguest::guest::tool_install::install_tool_with::<rootfs_tool::RootfsTool, _>(
+            "literoot" | "literoot-watched" => unsafe {
+                reverie_inguest::guest::tool_install::install_tool_with::<
+                    rootfs_tool::RootfsTool,
+                    _,
+                >(
                     &socket,
                     false,
                     reverie_inguest::guest::tool_install::TrapHost::new(
-                        reverie_inguest::guest::tool_install::TrapOptions::default(),
+                        reverie_inguest::guest::tool_install::TrapOptions {
+                            exec_watch: armed,
+                            ..Default::default()
+                        },
                     ),
                 )
             },
@@ -133,6 +143,20 @@ unsafe extern "C" fn initialize(
             Ok(selected) => selected,
             Err(_) => fail("tool selector is not valid UTF-8"),
         };
+        // Watched mode is TrapHost-only: the liteinst runtime's
+        // exec_watch knob is not reachable from literoot, so an
+        // asserted watched launch against this flavour refuses
+        // by name instead of silently running unarmed.
+        let armed = match rootfs_tool::exec_watch_for_selector(&selected) {
+            Ok(armed) => armed,
+            Err(msg) => fail(&msg),
+        };
+        if armed {
+            fail(
+                "launcher asserted watched mode but this preload is the \
+                 liteinst flavour; exec-watch arming is TrapHost-only",
+            );
+        }
         let socket = bootstrap.coordinator;
         let result = match selected.as_str() {
             "literoot" => unsafe {

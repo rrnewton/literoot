@@ -359,6 +359,15 @@ fn run_backend(
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     if in_guest {
+        // Watched exec (W6a spawn swap, W-1 gate): no spawn path
+        // in this build seizes the guest under a supervisor, so
+        // watched mode is never asserted. The W-2 spawn swap is
+        // the only writer that may set this, in the same change
+        // that actually spawns watched; asserting it here would
+        // arm the guest's exec forwarding with no watcher to
+        // re-bootstrap successors.
+        let watched = false;
+        let selector = crate::rootfs_tool::tool_selector(watched).to_vec();
         // Same Tool, hosted in-guest via the literoot preload. The
         // trap backend prefers Reverie's TrapHost launcher when this
         // build has it (inguest-trap): zero ptrace, no site patching.
@@ -375,7 +384,7 @@ fn run_backend(
             let (output, _global) = runtime.block_on(async {
                 reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
                     RootfsTool,
-                >(cmd, cfg, preload, b"literoot".to_vec())
+                >(cmd, cfg, preload, selector.clone())
                 .await
                 .map_err(|e| format!("in-guest ({backend}) run: {e}"))
             })?;
@@ -411,7 +420,7 @@ fn run_backend(
                     cmd,
                     cfg,
                     preload,
-                    b"literoot".to_vec(),
+                    selector.clone(),
                 )
                 .await
                 .map_err(|e| format!("in-guest ({backend}) run: {e}"))

@@ -845,6 +845,7 @@ dependencies = [
  "bincode",
  "libc",
  "reverie-core",
+ "reverie-loader",
  "reverie-rpc-transport",
  "reverie-syscalls",
  "serde",
@@ -872,6 +873,11 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "reverie-loader"
+version = "0.5.4"
+source = "git+https://github.com/rrnewton/reverie?rev=02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1#02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1"
 
 [[package]]
 name = "reverie-memory"
