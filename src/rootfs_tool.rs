@@ -3481,6 +3481,20 @@ static UTS_NODENAME: Mutex<Option<String>> = Mutex::new(None);
 /// leaked fork-child execs and broke exe tracking).
 static LAUNCHER_EXEC_SEEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Seed the launcher-exec one-shot: this Tool instance was
+/// installed by the in-guest preload, so the launcher exec
+/// already happened before the Tool existed and no execve it
+/// will ever see is the launcher's. Called from the preload's
+/// `.init_array` initializer in every new guest image;
+/// fork children inherit the set flag. Without this, each
+/// image's first guest execve took the passthrough and skipped
+/// translation, the self-exe rewrite, shebang and PT_INTERP
+/// handling (measured: nested exec died EOPNOTSUPP in-guest
+/// while direct syscalls in the same guest passed).
+pub fn mark_launcher_exec_seen() {
+    LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 static UTS_DOMAIN: Mutex<Option<String>> = Mutex::new(None);
 
 /// pid -> guest exe path, for /proc/<pid>/exe de-translation of

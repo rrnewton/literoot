@@ -78,6 +78,12 @@ unsafe extern "C" fn initialize(
     if !unsafe { loaded_as_preload() } {
         return;
     }
+    // In-guest hosting: the launcher exec already happened
+    // (this constructor runs in the new image), so no execve
+    // the Tool sees is the launcher's. Seed the passthrough
+    // one-shot or each image's first guest execve would skip
+    // translation (see rootfs_tool::mark_launcher_exec_seen).
+    rootfs_tool::mark_launcher_exec_seen();
     #[cfg(feature = "inguest-trap")]
     {
         let bootstrap = match unsafe { reverie_inguest::bootstrap::take_preload_bootstrap() } {
