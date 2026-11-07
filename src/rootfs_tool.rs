@@ -213,10 +213,11 @@ impl RootfsTool {
     /// Snapshot continuity state into the pending slot, called
     /// immediately before each final exec inject (direct,
     /// `exec_via_interp`, `exec_script`), after the handler has
-    /// written the successor's `exe_guest`/argv. Capture failure
-    /// (over the size cap) refuses the exec by name before
-    /// injection rather than completing it with degraded state.
-    fn stage_exec_snapshot<T: Guest<Self>>(
+    /// written the successor's `exe_guest`/argv, and before
+    /// process-creating clone-family injects (step 4). Capture
+    /// failure (over the size cap) refuses the syscall by name
+    /// before injection rather than completing it degraded.
+    fn stage_snapshot<T: Guest<Self>>(
         &self,
         guest: &mut T,
     ) -> Result<(), reverie::syscalls::Errno> {
@@ -242,6 +243,42 @@ impl RootfsTool {
     fn clear_exec_snapshot<T: Guest<Self>>(&self, guest: &mut T) {
         guest.thread_state_mut().pending = None;
     }
+
+    /// Apply a pending snapshot staged by the predecessor image
+    /// (exec) or parent process (fork), if any. Validation runs
+    /// against the launch config (not a config already folded
+    /// with an override). A bad snapshot is a fatal admission
+    /// error — never fall back to launch-config seeding, which is
+    /// exactly the state loss B4 exists to remove. Returns
+    /// whether a snapshot was consumed.
+    fn consume_pending<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<bool, reverie::syscalls::Errno> {
+        let Some(state) = guest.thread_state_mut().pending.take() else {
+            return Ok(false);
+        };
+        let cfg = guest.config().to_root_config();
+        {
+            let mut st = self.state.lock().unwrap();
+            state
+                .apply_to(&mut st, &cfg)
+                .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+        }
+        // Backward compatibility for the ptrace-era guard: a
+        // restored process is never the initial image.
+        LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
+    }
+}
+
+/// B4 step 4 staging decision: snapshot for a new *process*, never
+/// for a new thread in the same thread group. Unreadable clone3
+/// args read back as empty flags (CloneFamily::flags), which
+/// stages — safe, because that clone fails in the kernel and the
+/// handler clears the snapshot on return.
+fn clone_is_process(flags: u64) -> bool {
+    flags & (libc::CLONE_THREAD as u64) == 0
 }
 
 // Reverie's ptrace guest-stack arena is ~896 bytes total; stage at
@@ -313,6 +350,10 @@ impl Tool for RootfsTool {
             Sysno::bind,
             Sysno::connect,
             Sysno::getsockname,
+            // B4 step 4: snapshot-and-tail-inject only (no
+            // semantic change to the syscall itself).
+            Sysno::clone,
+            Sysno::clone3,
         ]);
         // Legacy non-*at syscalls exist only in the x86-64 table; the
         // aarch64 generic table carries the *at forms subscribed above
@@ -334,10 +375,42 @@ impl Tool for RootfsTool {
             Sysno::chmod,
             Sysno::chown,
             Sysno::lchown,
+            Sysno::fork,
+            Sysno::vfork,
         ]);
         #[cfg(target_arch = "aarch64")]
         subs.syscalls([Sysno::fstatat]);
         subs
+    }
+
+    fn init_thread_state(
+        &self,
+        _child: reverie::Tid,
+        parent: Option<(reverie::Tid, &Self::ThreadState)>,
+    ) -> Self::ThreadState {
+        // B4 step 4: the child inherits exactly the snapshot the
+        // parent staged for this process-creating clone (the
+        // handler stages only then, and clears its own copy after
+        // inject; init runs inside that inject, so ordering is
+        // stage -> clone-to-child -> parent clear). Unstaged
+        // parents and process-tree roots clone nothing.
+        match parent {
+            Some((_, parent)) => RootfsThreadState {
+                pending: parent.pending.clone(),
+            },
+            None => RootfsThreadState::default(),
+        }
+    }
+
+    async fn handle_thread_start<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), Error> {
+        // Fork-child restore: apply the inherited snapshot to the
+        // child's fresh Tool before ordinary execution. Threads
+        // (never staged) take the None fast path, unchanged.
+        self.consume_pending(guest)?;
+        Ok(())
     }
 
     async fn handle_post_exec<T: Guest<Self>>(
@@ -347,27 +420,12 @@ impl Tool for RootfsTool {
         if std::env::var_os("LITEROOT_NO_POSTEXEC").is_some() {
             return Ok(());
         }
-        // B4 restore: a pending exec snapshot (staged by the
+        // B4 restore: a pending snapshot (staged by the
         // predecessor image at its final inject) is applied before
         // anything else observes state, so the scratch realloc,
         // fake set-id transition, comm restore and auxv patch
-        // below compose on top of predecessor state. Validate
-        // against the launch config (not a config already folded
-        // with an override). A bad snapshot is a fatal admission
-        // error — never fall back to launch-config seeding, which
-        // is exactly the state loss B4 exists to remove.
-        if let Some(state) = guest.thread_state_mut().pending.take() {
-            let cfg = guest.config().to_root_config();
-            {
-                let mut st = self.state.lock().unwrap();
-                state
-                    .apply_to(&mut st, &cfg)
-                    .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
-            }
-            // Backward compatibility for the ptrace-era guard: a
-            // restored process is never the initial image.
-            LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        // below compose on top of predecessor state.
+        self.consume_pending(guest)?;
         // New image: any previous scratch mapping is gone.
         self.state.lock().unwrap().scratch = None;
         // Pre-allocate the execve scratch page here: injecting
@@ -1670,6 +1728,56 @@ impl Tool for RootfsTool {
                 mem.write(addr, &with_nul)?;
                 Ok((bytes.len() + 1) as i64)
             }
+            // B4 step 4: snapshot-and-tail-inject. The syscall
+            // itself is forwarded bit-identically; staging only
+            // seeds the child's thread state (see
+            // init_thread_state/handle_thread_start). The parent
+            // clears its own copy after inject — init clones it
+            // to the child inside that inject.
+            Syscall::Clone(clone) => {
+                let fam = reverie::syscalls::family::CloneFamily::Clone(clone);
+                if clone_is_process(fam.flags(&guest.memory()).bits()) {
+                    if let Err(e) = self.stage_snapshot(guest) {
+                        return Err(e.into());
+                    }
+                    let ret = guest.inject(clone).await;
+                    self.clear_exec_snapshot(guest);
+                    Ok(ret?)
+                } else {
+                    Ok(guest.inject(clone).await?)
+                }
+            }
+            Syscall::Clone3(clone3) => {
+                let fam = reverie::syscalls::family::CloneFamily::Clone3(clone3);
+                if clone_is_process(fam.flags(&guest.memory()).bits()) {
+                    if let Err(e) = self.stage_snapshot(guest) {
+                        return Err(e.into());
+                    }
+                    let ret = guest.inject(clone3).await;
+                    self.clear_exec_snapshot(guest);
+                    Ok(ret?)
+                } else {
+                    Ok(guest.inject(clone3).await?)
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Fork(fork) => {
+                if let Err(e) = self.stage_snapshot(guest) {
+                    return Err(e.into());
+                }
+                let ret = guest.inject(fork).await;
+                self.clear_exec_snapshot(guest);
+                Ok(ret?)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Vfork(vfork) => {
+                if let Err(e) = self.stage_snapshot(guest) {
+                    return Err(e.into());
+                }
+                let ret = guest.inject(vfork).await;
+                self.clear_exec_snapshot(guest);
+                Ok(ret?)
+            }
             Syscall::Execve(execve) => {
                 // Initial launcher execve: its path is already a
                 // host path inside the rootfs (the launcher execs
@@ -1835,7 +1943,7 @@ impl Tool for RootfsTool {
                 let rewritten = execve.with_path(PathPtr::from_ptr(
                     scratch as *const libc::c_char,
                 ));
-                if let Err(e) = self.stage_exec_snapshot(guest) {
+                if let Err(e) = self.stage_snapshot(guest) {
                     return Err(e.into());
                 }
                 // Success does not return; mirror strace-tool shape.
@@ -2233,7 +2341,7 @@ impl RootfsTool {
             .with_path(PathPtr::from_ptr(interp_ptr as *const libc::c_char))
             .with_argv(Option::<CArrayPtr<CStrPtr>>::from_raw(argv_ptr))
             .with_envp(Option::<CArrayPtr<CStrPtr>>::from_raw(envp_raw));
-        if let Err(e) = self.stage_exec_snapshot(guest) {
+        if let Err(e) = self.stage_snapshot(guest) {
             return Ok(Err(e.into()));
         }
         let e = guest.inject(rewritten).await.unwrap_err();
@@ -2359,7 +2467,7 @@ impl RootfsTool {
         // exec_script already rewrote state.argv to the kernel
         // binfmt argv above, so staging here captures the
         // successor's own argv as B4 requires.
-        if let Err(e) = self.stage_exec_snapshot(guest) {
+        if let Err(e) = self.stage_snapshot(guest) {
             return Ok(Err(e.into()));
         }
         let e = guest.inject(rewritten).await.unwrap_err();
@@ -3672,5 +3780,54 @@ mod tests {
     #[test]
     fn thread_state_default_is_inert() {
         assert_eq!(RootfsThreadState::default().pending, None);
+    }
+
+    /// B4 step 4: a staged fork snapshot clones into the child
+    /// thread state; unstaged parents and process-tree roots
+    /// clone nothing. (Which clones stage is decided in the
+    /// handler from clone flags — see clone_is_process.)
+    #[test]
+    fn init_thread_state_clones_only_staged_pending() {
+        let tool = RootfsTool::default();
+        let snap = ExecState {
+            cwd: b"/work".to_vec(),
+            exe_guest: b"/bin/sh".to_vec(),
+            ..Default::default()
+        };
+        let staged = RootfsThreadState {
+            pending: Some(snap.clone()),
+        };
+        let child = tool.init_thread_state(
+            reverie::Tid::from_raw(4243),
+            Some((reverie::Tid::from_raw(4242), &staged)),
+        );
+        assert_eq!(child.pending, Some(snap));
+        let unstaged = RootfsThreadState::default();
+        let child = tool.init_thread_state(
+            reverie::Tid::from_raw(4244),
+            Some((reverie::Tid::from_raw(4242), &unstaged)),
+        );
+        assert_eq!(child.pending, None);
+        let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
+        assert_eq!(root.pending, None);
+    }
+
+    #[test]
+    fn clone_is_process_classifies_flags() {
+        let sigchld = libc::SIGCHLD as u64;
+        // fork(2) as deduced by CloneFamily::flags.
+        assert!(clone_is_process(sigchld));
+        // vfork(2) deduced flags: still a new process.
+        assert!(clone_is_process(
+            libc::CLONE_VFORK as u64 | libc::CLONE_VM as u64 | sigchld
+        ));
+        // Thread creation must never stage a fork snapshot.
+        assert!(!clone_is_process(
+            libc::CLONE_THREAD as u64 | libc::CLONE_VM as u64 | sigchld
+        ));
+        // Unreadable clone3 args read back as empty flags; the
+        // clone will fail in the kernel and the handler clears
+        // the staged snapshot on return, so staging is safe.
+        assert!(clone_is_process(0));
     }
 }

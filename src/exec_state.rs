@@ -138,12 +138,38 @@ impl ExecState {
             })
             .collect();
         dirent_seen.sort();
+        // exe_guest is seeded lazily from config on first use, so
+        // a fork before any exec (or any exe_guest() call) still
+        // holds the empty default. Materialize it the same way:
+        // fall back to cfg.initial_exe, absolutized against the
+        // materialized cwd. Without this, capture of a perfectly
+        // live pre-exec state would encode a relative/empty path
+        // and refuse the fork.
+        let exe_guest = {
+            let raw: &[u8] = if st.exe_guest.as_os_str().is_empty() {
+                cfg.initial_exe.as_bytes()
+            } else {
+                st.exe_guest.as_os_str().as_bytes()
+            };
+            if raw.first() == Some(&b'/') {
+                raw.to_vec()
+            } else if raw.is_empty() {
+                cwd.clone()
+            } else {
+                let mut joined = cwd.clone();
+                if !joined.ends_with(b"/") {
+                    joined.push(b'/');
+                }
+                joined.extend_from_slice(raw);
+                joined
+            }
+        };
         ExecState {
             cwd,
             root_override: st.root_override.as_ref().map(bytes),
             fds,
             fake: st.fake,
-            exe_guest: bytes(&st.exe_guest),
+            exe_guest,
             argv: st.argv.clone(),
             virtual_fds,
             dirent_pending,
@@ -754,6 +780,29 @@ mod tests {
         st.cwd = PathBuf::from("/real");
         let s = ExecState::capture(&st, &cfg("/from/config"));
         assert_eq!(s.cwd, b"/real");
+    }
+
+    #[test]
+    fn capture_materializes_unseeded_exe_guest() {
+        // Regression: a fork before any exec/exe_guest() call
+        // holds the empty default; capture must seed it from
+        // config (absolutized) instead of encoding an
+        // empty/relative path that encode() would refuse.
+        let mut st = proc_state();
+        st.exe_guest = PathBuf::new();
+        let mut c = cfg("/work/dir");
+        c.initial_exe = "/bin/sh".to_string();
+        let s = ExecState::capture(&st, &c);
+        assert_eq!(s.exe_guest, b"/bin/sh");
+        assert!(s.encode().is_ok());
+        c.initial_exe = "bin/sh".to_string();
+        let s = ExecState::capture(&st, &c);
+        assert_eq!(s.exe_guest, b"/work/dir/bin/sh");
+        assert!(s.encode().is_ok());
+        // A materialized exe_guest is never replaced by config.
+        st.exe_guest = PathBuf::from("/bin/bash");
+        let s = ExecState::capture(&st, &c);
+        assert_eq!(s.exe_guest, b"/bin/bash");
     }
 
     #[test]
