@@ -25,8 +25,13 @@ path = "src/main.rs"
 #   reverie  git fc15d6c5e3066a3b9fce8b04be4fece1e2374564
 #   liteinst crates.io 0.2.0 (via reverie-liteinst)
 # Flip each edge to a crates.io version as releases land.
-default = ["run"]
-run = ["dep:reverie", "dep:reverie-ptrace", "dep:reverie-liteinst", "dep:libc", "dep:serde", "dep:tokio"]
+default = ["run", "in-guest"]
+# `run` alone is the ptrace-only build: no in-guest backend crates
+# (reverie-liteinst / reverie-inguest / liteinst) are compiled, so it
+# builds on architectures the in-guest stack does not serve yet.
+run = ["dep:reverie", "dep:reverie-ptrace", "dep:libc", "dep:serde", "dep:tokio"]
+in-guest = ["dep:reverie-liteinst"]
+ptrace-only = ["run"]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "fc15d6c5e3066a3b9fce8b04be4fece1e2374564", optional = true }

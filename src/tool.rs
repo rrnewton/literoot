@@ -241,6 +241,15 @@ fn run_backend(
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     if in_guest {
+        #[cfg(not(feature = "in-guest"))]
+        {
+            return Err(format!(
+                "backend {backend:?} unavailable: in-guest backends compiled out \
+                 (ptrace-only build; rebuild with default features)"
+            ));
+        }
+        #[cfg(feature = "in-guest")]
+        {
         // Same Tool, hosted in-guest via the literoot preload.
         cmd.env(
             reverie_liteinst::SITE_PATCHING_ENV,
@@ -268,6 +277,7 @@ fn run_backend(
         return Ok(status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8);
+        }
     }
 
     let status = runtime.block_on(async {
@@ -286,6 +296,7 @@ fn run_backend(
 
 /// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
 /// the running binary, else the slot build output.
+#[cfg(feature = "in-guest")]
 fn find_preload() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
         let p = PathBuf::from(p);
