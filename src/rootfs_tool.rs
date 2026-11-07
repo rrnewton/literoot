@@ -51,7 +51,7 @@ pub struct LiterootConfig {
 }
 
 impl LiterootConfig {
-    fn to_root_config(&self) -> RootConfig {
+    pub(crate) fn to_root_config(&self) -> RootConfig {
         let mut c = RootConfig::new(
             PathBuf::from(&self.rootfs),
             self.binds

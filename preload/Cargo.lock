@@ -557,6 +557,7 @@ dependencies = [
  "reverie-core",
  "reverie-inguest",
  "reverie-liteinst",
+ "reverie-rpc-transport",
  "serde",
 ]
 
@@ -847,6 +848,7 @@ dependencies = [
  "reverie-rpc-transport",
  "reverie-syscalls",
  "serde",
+ "sha2",
  "syscalls",
  "tempfile",
  "tokio",

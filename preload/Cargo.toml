@@ -18,11 +18,22 @@ liteinst = ["dep:reverie-liteinst"]
 # reverie-inguest's own preload-constructor out (this crate has its
 # own .init_array entry).
 inguest-trap = ["dep:reverie-inguest"]
+# Compile-time B4 step-3 successor consumer seam (no entry point
+# constructs it yet): pulls the native-exec injection surface so
+# RootfsSuccessorConsumer type-checks against the real trait.
+successor = [
+    "liteinst",
+    "dep:reverie-inguest",
+    "dep:reverie-rpc-transport",
+    "reverie-liteinst/exec-native-injection",
+    "reverie-inguest/exec-native-injection",
+]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7" }
 reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["liteinst"], optional = true }
 reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
+reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
