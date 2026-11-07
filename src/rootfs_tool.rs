@@ -30,6 +30,7 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::exec_state::{ExecState, ExecStateError};
 use crate::translate::{Bind, RootConfig};
 
 /// Serializable launch config (GlobalTool::Config).
@@ -100,49 +101,52 @@ impl GlobalTool for LiterootGlobal {
 }
 
 /// Per-process replicated state (design §6).
+/// Fields are `pub(crate)` so `crate::exec_state` can snapshot and
+/// restore the exec-continuity subset (B4) without a second copy
+/// of the layout living in two modules.
 #[derive(Debug)]
-struct ProcState {
-    cwd: PathBuf,
+pub(crate) struct ProcState {
+    pub(crate) cwd: PathBuf,
     /// fd → guest path it denotes (for *at resolution, §4.3).
-    fds: HashMap<i32, PathBuf>,
+    pub(crate) fds: HashMap<i32, PathBuf>,
     /// False until the initial (launcher-issued) execve has passed:
     /// its path is already a host path and must not be translated.
-    bootstrapped: bool,
+    pub(crate) bootstrapped: bool,
     /// Emulated chroot: host directory acting as the new root.
-    root_override: Option<PathBuf>,
+    pub(crate) root_override: Option<PathBuf>,
     /// Guest scratch page (injected mmap) for execve path
     /// staging: guest-stack staging corrupts the execve
     /// caller's frame in interp-route processes (measured
     /// EFAULT on second execve, test-execve-eacces-enoexec).
-    scratch: Option<usize>,
+    pub(crate) scratch: Option<usize>,
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
-    exe_guest: PathBuf,
+    pub(crate) exe_guest: PathBuf,
     /// Fds opened on virtual bind-prefix dirs:
     /// guest dir -> entries already emitted.
-    virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
+    pub(crate) virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
     /// Synthetic dirents pending for real dir fds with bind
     /// children (merged listings).
-    dirent_pending: std::collections::HashMap<i32, Vec<u8>>,
+    pub(crate) dirent_pending: std::collections::HashMap<i32, Vec<u8>>,
     /// Names the kernel already returned per dir fd (dedupe).
-    dirent_seen: std::collections::HashMap<i32, std::collections::HashSet<String>>,
+    pub(crate) dirent_seen: std::collections::HashMap<i32, std::collections::HashSet<String>>,
     /// As-exec'd argv of the current image (cmdline synthesis).
-    argv: Vec<Vec<u8>>,
+    pub(crate) argv: Vec<Vec<u8>>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
     /// setres* must be observable via getres* afterwards.
-    fake: Option<[u32; 6]>,
+    pub(crate) fake: Option<[u32; 6]>,
     /// Per-dispatch translation memo (stat-gap fix): one syscall
     /// dispatch translates the same (dirfd, path) through several
     /// helpers; memoize within the dispatch only, keyed by the
     /// dispatch counter below. Never lives across dispatches, so no
     /// cross-syscall staleness is possible.
-    dispatch_seq: u64,
-    translate_memo: Vec<((u64, i32, PathBuf, bool), PathBuf)>,
+    pub(crate) dispatch_seq: u64,
+    pub(crate) translate_memo: Vec<((u64, i32, PathBuf, bool), PathBuf)>,
     /// RootConfig built for the current dispatch (same keying: a
     /// RootConfig rebuild re-canonicalizes every bind prefix, which
     /// probes the host filesystem; several helpers per dispatch ask
     /// for the config).
-    config_memo: Option<(u64, Option<PathBuf>, RootConfig)>,
+    pub(crate) config_memo: Option<(u64, Option<PathBuf>, RootConfig)>,
 }
 
 /// The literoot Tool: one instance per guest process.
@@ -178,6 +182,68 @@ impl Default for RootfsTool {
     }
 }
 
+/// Per-thread carrier for one pending exec snapshot (B4). Its
+/// only job is to hold the snapshot taken just before the final
+/// exec inject until `handle_post_exec` (same Tool under ptrace,
+/// sealed successor state on the native route) consumes it.
+/// `None` on every non-exec path, so the common case is inert.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootfsThreadState {
+    pub pending: Option<ExecState>,
+}
+
+impl RootfsTool {
+    /// Reconstruct a Tool from a predecessor snapshot. The
+    /// successor consumer seam (B4 step 3) builds on this; B4-1
+    /// ships it behind unit tests only — no successor transport
+    /// calls it yet.
+    #[allow(dead_code)]
+    pub fn from_exec_state(
+        state: ExecState,
+        cfg: &RootConfig,
+    ) -> Result<Self, ExecStateError> {
+        let tool = Self::default();
+        {
+            let mut st = tool.state.lock().unwrap();
+            state.apply_to(&mut st, cfg)?;
+        }
+        Ok(tool)
+    }
+
+    /// Snapshot continuity state into the pending slot, called
+    /// immediately before each final exec inject (direct,
+    /// `exec_via_interp`, `exec_script`), after the handler has
+    /// written the successor's `exe_guest`/argv. Capture failure
+    /// (over the size cap) refuses the exec by name before
+    /// injection rather than completing it with degraded state.
+    fn stage_exec_snapshot<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        let snapshot = {
+            let st = self.state.lock().unwrap();
+            ExecState::capture(&st, guest.config())
+        };
+        // Prove the canonical bytes fit the cap now, while refusal
+        // is still possible; the bytes themselves are discarded
+        // (the pending slot carries the value).
+        snapshot.encode().map_err(|e| match e {
+            ExecStateError::TooLarge => reverie::syscalls::Errno::E2BIG,
+            _ => reverie::syscalls::Errno::EIO,
+        })?;
+        guest.thread_state_mut().pending = Some(snapshot);
+        Ok(())
+    }
+
+    /// Drop a staged snapshot after a failed exec inject. A
+    /// successful inject never returns, so every return path past
+    /// staging is a failure; the next exec re-stages from live
+    /// state, so clearing here is belt-and-braces made explicit.
+    fn clear_exec_snapshot<T: Guest<Self>>(&self, guest: &mut T) {
+        guest.thread_state_mut().pending = None;
+    }
+}
+
 // Reverie's ptrace guest-stack arena is ~896 bytes total; stage at
 // most 768 bytes of translated path (POC limit — the in-guest
 // backend uses Tool-region scratch instead, design §6).
@@ -196,7 +262,7 @@ fn guest_stack_pointer(regs: &libc::user_regs_struct) -> u64 {
 #[reverie::tool]
 impl Tool for RootfsTool {
     type GlobalState = LiterootGlobal;
-    type ThreadState = ();
+    type ThreadState = RootfsThreadState;
 
     fn subscriptions(_cfg: &LiterootConfig) -> Subscription {
         let mut subs = Subscription::none();
@@ -280,6 +346,27 @@ impl Tool for RootfsTool {
     ) -> Result<(), reverie::syscalls::Errno> {
         if std::env::var_os("LITEROOT_NO_POSTEXEC").is_some() {
             return Ok(());
+        }
+        // B4 restore: a pending exec snapshot (staged by the
+        // predecessor image at its final inject) is applied before
+        // anything else observes state, so the scratch realloc,
+        // fake set-id transition, comm restore and auxv patch
+        // below compose on top of predecessor state. Validate
+        // against the launch config (not a config already folded
+        // with an override). A bad snapshot is a fatal admission
+        // error — never fall back to launch-config seeding, which
+        // is exactly the state loss B4 exists to remove.
+        if let Some(state) = guest.thread_state_mut().pending.take() {
+            let cfg = guest.config().to_root_config();
+            {
+                let mut st = self.state.lock().unwrap();
+                state
+                    .apply_to(&mut st, &cfg)
+                    .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+            }
+            // Backward compatibility for the ptrace-era guard: a
+            // restored process is never the initial image.
+            LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         // New image: any previous scratch mapping is gone.
         self.state.lock().unwrap().scratch = None;
@@ -508,7 +595,7 @@ impl Tool for RootfsTool {
                     Err(e) if e == reverie::syscalls::Errno::ENOENT => {
                         let abs = {
                             let st = self.state.lock().unwrap();
-                            self.guest_abs(&st, openat.dirfd(), &guest_path)
+                            self.guest_abs(guest, &st, openat.dirfd(), &guest_path)
                         };
                         if self.is_virtual_bind_dir(guest, &abs) {
                             match self.open_virtual_dir(guest, openat, &abs).await? {
@@ -542,7 +629,7 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     // Record fd → guest path for future *at calls.
                     let mut st = self.state.lock().unwrap();
-                    let abs = self.guest_abs(&st, openat.dirfd(), &guest_path);
+                    let abs = self.guest_abs(guest, &st, openat.dirfd(), &guest_path);
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -571,7 +658,7 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(rewritten).await?;
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
-                    let abs = self.guest_abs(&st, libc::AT_FDCWD, &guest_path);
+                    let abs = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -649,7 +736,7 @@ impl Tool for RootfsTool {
                     .await?;
                 let abs = {
                     let st = self.state.lock().unwrap();
-                    self.guest_abs(&st, stat.dirfd(), &guest_path)
+                    self.guest_abs(guest, &st, stat.dirfd(), &guest_path)
                 };
                 let first = guest.inject(rewritten).await;
                 let first = match first {
@@ -707,7 +794,7 @@ impl Tool for RootfsTool {
                     .await?;
                 let abs = {
                     let st = self.state.lock().unwrap();
-                    self.guest_abs(&st, stat.dirfd(), &guest_path)
+                    self.guest_abs(guest, &st, stat.dirfd(), &guest_path)
                 };
                 let first = guest.inject(rewritten).await;
                 let first = match first {
@@ -1231,7 +1318,7 @@ impl Tool for RootfsTool {
                     Err(e) if e == reverie::syscalls::Errno::ENOENT => {
                         let abs = {
                             let st = self.state.lock().unwrap();
-                            self.guest_abs(&st, sx.dirfd(), &g)
+                            self.guest_abs(guest, &st, sx.dirfd(), &g)
                         };
                         if self.is_virtual_bind_dir(guest, &abs) {
                             self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STATX_MODE_OFF);
@@ -1335,7 +1422,7 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(rewritten).await?;
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
-                    let abs = self.guest_abs(&st, oa.dirfd(), &guest_path);
+                    let abs = self.guest_abs(guest, &st, oa.dirfd(), &guest_path);
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -1525,7 +1612,7 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
                     let mut st = self.state.lock().unwrap();
-                    st.cwd = self.guest_abs(&st, libc::AT_FDCWD, &guest_path);
+                    st.cwd = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
                 }
                 Ok(ret)
             }
@@ -1651,7 +1738,7 @@ impl Tool for RootfsTool {
                 {
                     let abs = {
                         let st = self.state.lock().unwrap();
-                        self.guest_abs(&st, libc::AT_FDCWD, &guest_path)
+                        self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path)
                     };
                     let canon = self.canonical_exe(guest, &abs);
                     pid_exe_map()
@@ -1699,12 +1786,21 @@ impl Tool for RootfsTool {
                         .and_then(|img| parse_shebang(&img))
                 };
                 if let Some((script_interp, optarg)) = shebang {
+                    // A successful inject never returns; any return
+                    // is a failed exec, so drop the staged snapshot
+                    // (the next exec re-stages from live state).
                     match self
                         .exec_script(guest, execve, &guest_path, &script_interp, optarg.as_deref())
                         .await
                     {
-                        Ok(never) => return never,
-                        Err(e) => return Err(e),
+                        Ok(res) => {
+                            self.clear_exec_snapshot(guest);
+                            return res;
+                        }
+                        Err(e) => {
+                            self.clear_exec_snapshot(guest);
+                            return Err(e);
+                        }
                     }
                 }
                 let interp = if is_fd_path {
@@ -1719,8 +1815,14 @@ impl Tool for RootfsTool {
                         .exec_via_interp(guest, execve, &guest_path, &interp_guest)
                         .await
                     {
-                        Ok(never) => return never,
-                        Err(e) => return Err(e),
+                        Ok(res) => {
+                            self.clear_exec_snapshot(guest);
+                            return res;
+                        }
+                        Err(e) => {
+                            self.clear_exec_snapshot(guest);
+                            return Err(e);
+                        }
                     }
                 }
                 // Stage the path in the scratch page, not on
@@ -1733,8 +1835,12 @@ impl Tool for RootfsTool {
                 let rewritten = execve.with_path(PathPtr::from_ptr(
                     scratch as *const libc::c_char,
                 ));
+                if let Err(e) = self.stage_exec_snapshot(guest) {
+                    return Err(e.into());
+                }
                 // Success does not return; mirror strace-tool shape.
                 let e = guest.inject(rewritten).await.unwrap_err();
+                self.clear_exec_snapshot(guest);
                 Err(e.into())
             }
             // ---- identity (fake-root / -i, design §4.4) ----
@@ -2127,6 +2233,9 @@ impl RootfsTool {
             .with_path(PathPtr::from_ptr(interp_ptr as *const libc::c_char))
             .with_argv(Option::<CArrayPtr<CStrPtr>>::from_raw(argv_ptr))
             .with_envp(Option::<CArrayPtr<CStrPtr>>::from_raw(envp_raw));
+        if let Err(e) = self.stage_exec_snapshot(guest) {
+            return Ok(Err(e.into()));
+        }
         let e = guest.inject(rewritten).await.unwrap_err();
         Ok(Err(e.into()))
     }
@@ -2247,6 +2356,12 @@ impl RootfsTool {
             .with_path(PathPtr::from_ptr(exec_ptr as *const libc::c_char))
             .with_argv(Option::<CArrayPtr<CStrPtr>>::from_raw(argv_ptr))
             .with_envp(Option::<CArrayPtr<CStrPtr>>::from_raw(envp_raw));
+        // exec_script already rewrote state.argv to the kernel
+        // binfmt argv above, so staging here captures the
+        // successor's own argv as B4 requires.
+        if let Err(e) = self.stage_exec_snapshot(guest) {
+            return Ok(Err(e.into()));
+        }
         let e = guest.inject(rewritten).await.unwrap_err();
         Ok(Err(e.into()))
     }
@@ -2353,9 +2468,8 @@ impl RootfsTool {
         new_g: &Path,
     ) {
         let mut st = self.state.lock().unwrap();
-        let old_abs = self.guest_abs(&st, old_dirfd, old_g);
-        let new_abs = self.guest_abs(&st, new_dirfd, new_g);
-        let _ = guest;
+        let old_abs = self.guest_abs(guest, &st, old_dirfd, old_g);
+        let new_abs = self.guest_abs(guest, &st, new_dirfd, new_g);
         if let Ok(suffix) = st.cwd.clone().strip_prefix(&old_abs).map(|s| s.to_path_buf()) {
             let mut p = new_abs;
             if !suffix.as_os_str().is_empty() {
@@ -2889,15 +3003,18 @@ impl RootfsTool {
         }
     }
 
-    fn guest_abs(&self, st: &ProcState, dirfd: i32, path: &Path) -> PathBuf {
+    fn guest_abs<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        st: &ProcState,
+        dirfd: i32,
+        path: &Path,
+    ) -> PathBuf {
+        // Launch cwd from the guest handle, authoritative on every
+        // backend. The previous CONFIG process-global fallback only
+        // worked when every Tool lived in the tracer process (B4).
         let cfg_cwd = if st.cwd == Path::new("/__literoot_unset__") {
-            CONFIG
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|c| PathBuf::from(&c.cwd))
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| PathBuf::from("/"))
+            self.seed_cwd(guest)
         } else {
             st.cwd.clone()
         };
@@ -3506,4 +3623,40 @@ fn pid_exe_map() -> &'static Mutex<std::collections::HashMap<i32, PathBuf>> {
 /// from `init_global_state`; under ptrace, by the launcher.
 pub fn set_config(cfg: LiterootConfig) {
     *CONFIG.lock().unwrap() = Some(cfg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec_state::ExecState;
+
+    /// B4-1 wiring witness without any successor transport: a Tool
+    /// rebuilt from a snapshot observes the predecessor's cwd, fd
+    /// map and fake identity, with `bootstrapped` forced on and
+    /// scratch left for `handle_post_exec` to reallocate.
+    #[test]
+    fn from_exec_state_restores_continuity() {
+        let cfg = RootConfig::new(PathBuf::from("/"), Vec::new());
+        let state = ExecState {
+            cwd: b"/work".to_vec(),
+            fds: vec![(5, b"/work".to_vec())],
+            fake: Some([1000, 0, 0, 100, 0, 100]),
+            exe_guest: b"/bin/sh".to_vec(),
+            argv: vec![b"sh".to_vec()],
+            ..Default::default()
+        };
+        let tool = RootfsTool::from_exec_state(state, &cfg).expect("restore");
+        let st = tool.state.lock().unwrap();
+        assert_eq!(st.cwd, PathBuf::from("/work"));
+        assert_eq!(st.fds.get(&5), Some(&PathBuf::from("/work")));
+        assert_eq!(st.fake, Some([1000, 0, 0, 100, 0, 100]));
+        assert_eq!(st.exe_guest, PathBuf::from("/bin/sh"));
+        assert!(st.bootstrapped);
+        assert_eq!(st.scratch, None);
+    }
+
+    #[test]
+    fn thread_state_default_is_inert() {
+        assert_eq!(RootfsThreadState::default().pending, None);
+    }
 }
