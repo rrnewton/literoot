@@ -30,10 +30,10 @@ successor = [
 ]
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "5c0f2bf192a5b3f891fd39bc12a61d368dafd726" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "5c0f2bf192a5b3f891fd39bc12a61d368dafd726", default-features = false, features = ["liteinst"], optional = true }
-reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "5c0f2bf192a5b3f891fd39bc12a61d368dafd726", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
-reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "5c0f2bf192a5b3f891fd39bc12a61d368dafd726", optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", default-features = false, features = ["liteinst"], optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
+reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
