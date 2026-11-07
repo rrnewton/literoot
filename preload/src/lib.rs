@@ -13,6 +13,8 @@
 
 #[path = "../../src/arch.rs"]
 mod arch;
+#[path = "../../src/exec_state.rs"]
+mod exec_state;
 #[path = "../../src/translate.rs"]
 mod translate;
 #[path = "../../src/rootfs_tool.rs"]
