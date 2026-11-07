@@ -9,11 +9,20 @@ description = "In-guest preload hosting the literoot RootfsTool (Reverie liteins
 name = "literoot_preload"
 crate-type = ["cdylib"]
 
-# Slot-local path pins (design docs/design.md §10): reverie git
-# fc15d6c5e3066a3b9fce8b04be4fece1e2374564.
+# Pinned Reverie rev: e8216dc32780fa8f47683400f124145b56f3cf16 (musearm1/arm-trap-pin-20261107).
+[features]
+default = ["liteinst"]
+liteinst = ["dep:reverie-liteinst"]
+# Trap-only in-guest via Reverie's TrapHost API: no reverie-ptrace
+# and no reverie-liteinst. default-features=false keeps
+# reverie-inguest's own preload-constructor out (this crate has its
+# own .init_array entry).
+inguest-trap = ["dep:reverie-inguest"]
+
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "fc15d6c5e3066a3b9fce8b04be4fece1e2374564" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "fc15d6c5e3066a3b9fce8b04be4fece1e2374564", default-features = false, features = ["liteinst"] }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16", default-features = false, optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
@@ -23,3 +32,5 @@ serde = { version = "1.0.219", features = ["derive"] }
 
 [patch.crates-io]
 liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }
+
+[workspace]

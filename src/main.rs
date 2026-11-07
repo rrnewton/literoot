@@ -9,11 +9,11 @@
 //! Tool once the preload packaging lands (design §3, §10).
 
 mod arch;
-mod translate;
-#[cfg(feature = "run")]
+#[cfg(feature = "tool")]
 mod rootfs_tool;
-#[cfg(feature = "run")]
+#[cfg(feature = "tool")]
 mod tool;
+mod translate;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,7 +36,11 @@ fn default_binds() -> Vec<Bind> {
     // proot -R recommended bindings (host == guest).
     ["/dev", "/proc", "/sys"]
         .iter()
-        .map(|p| Bind { guest: PathBuf::from(p), host: PathBuf::from(p), no_follow: false })
+        .map(|p| Bind {
+            guest: PathBuf::from(p),
+            host: PathBuf::from(p),
+            no_follow: false,
+        })
         .collect()
 }
 
@@ -82,7 +86,11 @@ fn parse_bind(spec: &str) -> Result<Bind, String> {
         }),
         None => {
             let a = absolutize(Path::new(spec));
-            Ok(Bind { guest: a.clone(), host: a, no_follow })
+            Ok(Bind {
+                guest: a.clone(),
+                host: a,
+                no_follow,
+            })
         }
     }
 }
@@ -109,14 +117,19 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         let a = &args[i];
         let mut take = |i: &mut usize, flag: &str| -> Result<String, String> {
             *i += 1;
-            args.get(*i).cloned().ok_or_else(|| format!("literoot: {flag} requires a value"))
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("literoot: {flag} requires a value"))
         };
         match a.as_str() {
             "--" => {
                 command.extend(args[i + 1..].iter().cloned());
                 break;
             }
-            "-r" | "--rootfs" => { saw_explicit_rootfs = true; rootfs = Some(PathBuf::from(take(&mut i, "-r")?)); }
+            "-r" | "--rootfs" => {
+                saw_explicit_rootfs = true;
+                rootfs = Some(PathBuf::from(take(&mut i, "-r")?));
+            }
             "-R" => {
                 rootfs = Some(PathBuf::from(take(&mut i, "-R")?));
                 binds.extend(default_binds());
@@ -128,8 +141,14 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 }
                 binds.push(b);
             }
-            "-w" | "--cwd" | "-c" => { cwd_explicit = true; cwd_guest = PathBuf::from(take(&mut i, "-w")?) }
-            "-0" | "--root-id" => { fake_root = true; fake_ids = Some((0, 0)); }
+            "-w" | "--cwd" | "-c" => {
+                cwd_explicit = true;
+                cwd_guest = PathBuf::from(take(&mut i, "-w")?)
+            }
+            "-0" | "--root-id" => {
+                fake_root = true;
+                fake_ids = Some((0, 0));
+            }
             "-i" | "--identity" => {
                 let v = take(&mut i, "-i")?;
                 let (u, g) = v
@@ -154,9 +173,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                             verbose = level > 0;
                             i += 1;
                         }
-                        Err(_) => {
-                            return Err("literoot: -v requires a level argument".into())
-                        }
+                        Err(_) => return Err("literoot: -v requires a level argument".into()),
                     },
                     _ => return Err("literoot: -v requires a level argument".into()),
                 }
@@ -177,7 +194,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             "--version" => {
                 println!("{VERSION_LINE}");
-                println!("backend: reverie-ptrace (POC reference); in-guest liteinst: design §3");
+                println!(
+                    "backend: reverie-ptrace (POC reference); in-guest liteinst/trap: design §3"
+                );
                 std::process::exit(0);
             }
             s if s.starts_with('-') && s.len() > 1 => {
@@ -237,7 +256,14 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     config.fake_root = fake_root;
     config.fake_ids = fake_ids.or(if fake_root { Some((0, 0)) } else { None });
     config.kernel_release = kernel_release;
-    Ok(Cli { config, cwd_guest, backend, verbose, check_paths, command })
+    Ok(Cli {
+        config,
+        cwd_guest,
+        backend,
+        verbose,
+        check_paths,
+        command,
+    })
 }
 
 fn print_usage() {
@@ -263,7 +289,7 @@ fn main() -> ExitCode {
     // proot's tracer survives SIGTERM sent by the guest to its
     // TracerPid (test-kill-tracer-pid); ignore it in the
     // launcher (guests keep their own disposition via exec).
-    #[cfg(feature = "run")]
+    #[cfg(feature = "tool")]
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
@@ -309,16 +335,16 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    #[cfg(not(feature = "run"))]
+    #[cfg(not(feature = "tool"))]
     {
         let _ = &cli;
         eprintln!(
-            "literoot: built without the `run` feature — translation engine only. \
-             Rebuild with default features to execute guests (POC: --backend ptrace)."
+            "literoot: built without a backend feature — translation engine only. \
+             Rebuild with default features to execute guests."
         );
         ExitCode::from(125)
     }
-    #[cfg(feature = "run")]
+    #[cfg(feature = "tool")]
     {
         match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command) {
             Ok(code) => ExitCode::from(code),
