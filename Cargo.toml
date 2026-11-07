@@ -31,7 +31,7 @@ run = ["dep:reverie", "dep:reverie-ptrace", "dep:reverie-liteinst", "dep:libc", 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", optional = true }
 reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", optional = true }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false, optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false, features = ["liteinst"], optional = true }
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }

@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 # af3be1e3ca893356a7388d20f4a8c33cb55a8c83.
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false, features = ["liteinst"] }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
