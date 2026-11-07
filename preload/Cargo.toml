@@ -21,7 +21,7 @@ inguest-trap = ["dep:reverie-inguest"]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["liteinst"], optional = true }
 reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }

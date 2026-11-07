@@ -602,6 +602,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "liteinst"
+version = "0.2.0"
+source = "git+https://github.com/rrnewton/liteinst2?rev=34901a29a0070f30398f237839a567720c739af5#34901a29a0070f30398f237839a567720c739af5"
+dependencies = [
+ "iced-x86",
+ "libc",
+ "liteinst-x86",
+ "memmap2",
+ "nix 0.31.3",
+]
+
+[[package]]
+name = "liteinst-x86"
+version = "0.2.0"
+source = "git+https://github.com/rrnewton/liteinst2?rev=34901a29a0070f30398f237839a567720c739af5#34901a29a0070f30398f237839a567720c739af5"
+dependencies = [
+ "iced-x86",
+]
+
+[[package]]
 name = "literoot"
 version = "0.0.1"
 dependencies = [
@@ -700,6 +720,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -926,7 +958,7 @@ dependencies = [
  "linked-hash-map",
  "memmap2",
  "never-say-never",
- "nix",
+ "nix 0.30.1",
  "object 0.40.0",
  "perf-event-open-sys",
  "procfs",
@@ -963,7 +995,9 @@ version = "0.5.4"
 source = "git+https://github.com/rrnewton/reverie?rev=d8527112bbdd59ac83892f69e2e29656e1401ef7#d8527112bbdd59ac83892f69e2e29656e1401ef7"
 dependencies = [
  "bincode",
+ "iced-x86",
  "libc",
+ "liteinst",
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",
@@ -991,7 +1025,7 @@ dependencies = [
  "colored",
  "futures 0.3.34",
  "libc",
- "nix",
+ "nix 0.30.1",
  "serde",
  "syscalls",
  "thiserror",
@@ -1012,7 +1046,7 @@ dependencies = [
  "goblin",
  "iced-x86",
  "libc",
- "nix",
+ "nix 0.30.1",
  "num-traits",
  "paste",
  "perf-event-open-sys",
@@ -1054,7 +1088,7 @@ dependencies = [
  "derive_more",
  "libc",
  "linux-raw-sys",
- "nix",
+ "nix 0.30.1",
  "paste",
  "reverie-memory",
  "serde",
@@ -1112,7 +1146,7 @@ dependencies = [
  "bitflags 2.13.2",
  "futures 0.3.34",
  "libc",
- "nix",
+ "nix 0.30.1",
  "parking_lot",
  "reverie-memory",
  "reverie-process",
@@ -1824,8 +1858,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "liteinst"
-version = "0.2.0"
-source = "git+https://github.com/rrnewton/liteinst2?rev=34901a29a0070f30398f237839a567720c739af5#34901a29a0070f30398f237839a567720c739af5"
