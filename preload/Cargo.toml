@@ -10,10 +10,10 @@ name = "literoot_preload"
 crate-type = ["cdylib"]
 
 # Slot-local path pins (design docs/design.md §10): reverie git
-# 61e519de891a2963e5d76bd5282f233c6318c82e.
+# fc15d6c5e3066a3b9fce8b04be4fece1e2374564.
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "61e519de891a2963e5d76bd5282f233c6318c82e" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "61e519de891a2963e5d76bd5282f233c6318c82e", default-features = false, features = ["liteinst"] }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "fc15d6c5e3066a3b9fce8b04be4fece1e2374564" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "fc15d6c5e3066a3b9fce8b04be4fece1e2374564", default-features = false, features = ["liteinst"] }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
