@@ -9,7 +9,7 @@ description = "In-guest preload hosting the literoot RootfsTool (Reverie liteins
 name = "literoot_preload"
 crate-type = ["cdylib"]
 
-# Pinned Reverie rev: e8216dc32780fa8f47683400f124145b56f3cf16 (musearm1/arm-trap-pin-20261107).
+# Pinned Reverie rev: 9013ab74153d30d023cd648928bf10c1d15bd716 (musearm1/arm-trap-pin-20261107).
 [features]
 default = ["liteinst"]
 liteinst = ["dep:reverie-liteinst"]
@@ -20,9 +20,9 @@ liteinst = ["dep:reverie-liteinst"]
 inguest-trap = ["dep:reverie-inguest"]
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16", default-features = false, optional = true }
-reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "e8216dc32780fa8f47683400f124145b56f3cf16", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "9013ab74153d30d023cd648928bf10c1d15bd716" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "9013ab74153d30d023cd648928bf10c1d15bd716", default-features = false, optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "9013ab74153d30d023cd648928bf10c1d15bd716", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 

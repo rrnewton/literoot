@@ -1,0 +1,5 @@
+# The el9 sysroot static glibc objects reference libgcc outline-atomics
+# helpers (__aarch64_cas*/__aarch64_swp*); link the static libgcc that
+# provides them. Harmless where libc is linked dynamically.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-l:libgcc.a"]
