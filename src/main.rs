@@ -8,6 +8,7 @@
 //! harness) — the in-guest liteinst fast path runs the identical
 //! Tool once the preload packaging lands (design §3, §10).
 
+mod arch;
 mod translate;
 #[cfg(feature = "run")]
 mod rootfs_tool;

@@ -569,7 +569,7 @@ impl Tool for RootfsTool {
                     .await?;
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
@@ -588,7 +588,7 @@ impl Tool for RootfsTool {
                     .await?;
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
@@ -654,13 +654,13 @@ impl Tool for RootfsTool {
                         if e == reverie::syscalls::Errno::ENOENT
                             && self.is_virtual_bind_dir(guest, &abs) =>
                     {
-                        self.write_virtual_dir_stat(guest, buf_raw, 24);
+                        self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STAT_MODE_OFF);
                         0
                     }
                     Err(e) => return Err(e.into()),
                 };
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
@@ -712,13 +712,13 @@ impl Tool for RootfsTool {
                         if e == reverie::syscalls::Errno::ENOENT
                             && self.is_virtual_bind_dir(guest, &abs) =>
                     {
-                        self.write_virtual_dir_stat(guest, buf_raw, 24);
+                        self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STAT_MODE_OFF);
                         0
                     }
                     Err(e) => return Err(e.into()),
                 };
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
@@ -1212,7 +1212,7 @@ impl Tool for RootfsTool {
                             self.guest_abs(&st, sx.dirfd(), &g)
                         };
                         if self.is_virtual_bind_dir(guest, &abs) {
-                            self.write_virtual_dir_stat(guest, buf_raw, 28);
+                            self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STATX_MODE_OFF);
                             0
                         } else {
                             return Err(e.into());
@@ -1221,7 +1221,7 @@ impl Tool for RootfsTool {
                     Err(e) => return Err(e.into()),
                 };
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 20, 24);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STATX_UID_OFF, crate::arch::STATX_GID_OFF);
                 }
                 Ok(ret)
             }

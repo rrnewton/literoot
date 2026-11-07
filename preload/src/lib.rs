@@ -6,6 +6,8 @@
 //! launcher via `REVERIE_LITEINST_SITE_PATCHING` (1=patched,
 //! 0=trap-only).
 
+#[path = "../../src/arch.rs"]
+mod arch;
 #[path = "../../src/translate.rs"]
 mod translate;
 #[path = "../../src/rootfs_tool.rs"]
