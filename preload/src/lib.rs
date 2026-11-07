@@ -347,6 +347,31 @@ mod successor_tests {
     }
 
     #[test]
+    fn complete_refuses_unsupported_and_never_acks() {
+        let config = launched_config();
+        let mut consumer = RootfsSuccessorConsumer::new(config.clone());
+        let rpc = reverie_liteinst::rpc::CoordinatorRpc::<
+            rootfs_tool::LiterootGlobal,
+        >::from_native_local_configuration(std::sync::Arc::new(config));
+        let binding = reverie_inguest::guest::exec_private::SuccessorBinding {
+            generation: 1,
+            ticket: [1; 32],
+            state: [2; 32],
+            config: [3; 32],
+        };
+
+        let err = consumer
+            .complete(&rpc, binding)
+            .expect_err("complete must fail closed and never fabricate an ACK");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            err.to_string().contains("not wired: no CompleteNativeExec message"),
+            "unexpected complete refusal: {err}"
+        );
+    }
+
+    #[test]
     fn decode_refuses_garbage_by_name() {
         let cfg = launched_config();
         assert!(decode_successor_state(&cfg, b"not an exec state").is_err());
