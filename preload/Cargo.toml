@@ -10,13 +10,16 @@ name = "literoot_preload"
 crate-type = ["cdylib"]
 
 # Slot-local path pins (design docs/design.md §10): reverie git
-# 778a446cd3283ecd1c220792071a84b27c14db56.
+# af3be1e3ca893356a7388d20f4a8c33cb55a8c83.
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/facebookexperimental/reverie", rev = "778a446cd3283ecd1c220792071a84b27c14db56" }
-reverie-liteinst = { git = "https://github.com/facebookexperimental/reverie", rev = "778a446cd3283ecd1c220792071a84b27c14db56", default-features = false }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false }
 libc = "0.2.186"
 serde = { version = "1.0.219", features = ["derive"] }
 
 
 
 
+
+[patch.crates-io]
+liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }

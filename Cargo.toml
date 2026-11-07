@@ -22,16 +22,16 @@ path = "src/main.rs"
 # placeholder commit (no dependencies); POC pins below are git revs
 # (design docs/design.md §10) expressed as local path deps in the
 # dev-hermit slot so the POC builds offline:
-#   reverie  git 778a446cd3283ecd1c220792071a84b27c14db56
+#   reverie  git af3be1e3ca893356a7388d20f4a8c33cb55a8c83
 #   liteinst crates.io 0.2.0 (via reverie-liteinst)
 # Flip each edge to a crates.io version as releases land.
 default = ["run"]
 run = ["dep:reverie", "dep:reverie-ptrace", "dep:reverie-liteinst", "dep:libc", "dep:serde", "dep:tokio"]
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/facebookexperimental/reverie", rev = "778a446cd3283ecd1c220792071a84b27c14db56", optional = true }
-reverie-ptrace = { git = "https://github.com/facebookexperimental/reverie", rev = "778a446cd3283ecd1c220792071a84b27c14db56", optional = true }
-reverie-liteinst = { git = "https://github.com/facebookexperimental/reverie", rev = "778a446cd3283ecd1c220792071a84b27c14db56", default-features = false, optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", optional = true }
+reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "af3be1e3ca893356a7388d20f4a8c33cb55a8c83", default-features = false, optional = true }
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
@@ -40,3 +40,6 @@ tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
 lto = "thin"
 codegen-units = 1
 
+
+[patch.crates-io]
+liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }
