@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use crate::rootfs_tool::{LiterootConfig, RootfsTool, set_config};
 use crate::translate::RootConfig;
 
-
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
 /// requested backend. Returns the guest exit code.
 pub fn run_guest(
@@ -48,12 +47,11 @@ pub fn run_guest(
         };
         &cwd_owned
     };
-    let cwd_effective: &Path =
-        if config.translate(cwd_guest, Path::new("/"), None).is_dir() {
-            cwd_guest
-        } else {
-            Path::new("/")
-        };
+    let cwd_effective: &Path = if config.translate(cwd_guest, Path::new("/"), None).is_dir() {
+        cwd_guest
+    } else {
+        Path::new("/")
+    };
     let cwd_guest = cwd_effective;
     let cfg = LiterootConfig {
         rootfs: config.rootfs.to_string_lossy().into_owned(),
@@ -84,22 +82,21 @@ pub fn run_guest(
     let guest_prog = command.first().cloned().unwrap_or_else(|| "/bin/sh".into());
     // `guest_found` is the guest path of the program (what the
     // rootfs loader must open); `guest_prog` remains argv[0].
-    let (host_prog, guest_found) = if Path::new(&guest_prog).components().count() > 1
-        || guest_prog.starts_with('/')
-    {
-        // Absolute or slash-containing (e.g. ./prog): resolve
-        // through the rootfs against the guest cwd.
-        (
-            resolve_in_rootfs(config, cwd_guest, Path::new(&guest_prog)),
-            guest_prog.clone(),
-        )
-    } else {
-        // PATH lookup inside the rootfs (guest PATH dirs).
-        let found = find_guest_in_path(config, cwd_guest, &guest_prog)
-            .ok_or_else(|| format!("literoot: {guest_prog}: not found in rootfs PATH"))?;
-        let host = resolve_in_rootfs(config, cwd_guest, Path::new(&found));
-        (host, found)
-    };
+    let (host_prog, guest_found) =
+        if Path::new(&guest_prog).components().count() > 1 || guest_prog.starts_with('/') {
+            // Absolute or slash-containing (e.g. ./prog): resolve
+            // through the rootfs against the guest cwd.
+            (
+                resolve_in_rootfs(config, cwd_guest, Path::new(&guest_prog)),
+                guest_prog.clone(),
+            )
+        } else {
+            // PATH lookup inside the rootfs (guest PATH dirs).
+            let found = find_guest_in_path(config, cwd_guest, &guest_prog)
+                .ok_or_else(|| format!("literoot: {guest_prog}: not found in rootfs PATH"))?;
+            let host = resolve_in_rootfs(config, cwd_guest, Path::new(&found));
+            (host, found)
+        };
     cfg.initial_exe = guest_found.clone();
     cfg.initial_argv = command.to_vec();
     set_config(cfg.clone());
@@ -110,10 +107,10 @@ pub fn run_guest(
         use std::os::unix::fs::PermissionsExt as _;
         match std::fs::metadata(&host_prog) {
             Ok(md) if md.is_dir() => {
-                return Err(format!("literoot: {guest_prog}: Permission denied"))
+                return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
             Ok(md) if md.permissions().mode() & 0o111 == 0 => {
-                return Err(format!("literoot: {guest_prog}: Permission denied"))
+                return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
             Ok(_) => {}
             Err(e) => return Err(format!("literoot: {guest_prog}: {e}")),
@@ -128,16 +125,11 @@ pub fn run_guest(
         .and_then(|img| parse_shebang_pub(&img));
     if let Some((script_interp, script_opt)) = shebang {
         // Self-referential shebang: the kernel would ELOOP.
-        if resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp))
-            == host_prog
-        {
-            eprintln!(
-                "literoot: {guest_prog}: Too many levels of symbolic links"
-            );
+        if resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp)) == host_prog {
+            eprintln!("literoot: {guest_prog}: Too many levels of symbolic links");
             return Err("Too many levels of symbolic links".into());
         }
-        let interp_host =
-            resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp));
+        let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp));
         let interp_interp = std::fs::read(&interp_host)
             .ok()
             .and_then(|img| crate::translate::elf_interp(&img));
@@ -167,7 +159,11 @@ pub fn run_guest(
             cmd.arg(a);
         }
         let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
-        let host_cwd = if host_cwd.is_dir() { host_cwd } else { config.rootfs.clone() };
+        let host_cwd = if host_cwd.is_dir() {
+            host_cwd
+        } else {
+            config.rootfs.clone()
+        };
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
         return run_backend(cmd, cfg, backend, in_guest);
@@ -186,8 +182,7 @@ pub fn run_guest(
         .filter(|interp| !in_guest || !Path::new(interp).exists());
     let mut cmd = match &interp_guest {
         Some(interp) => {
-            let interp_host =
-                resolve_in_rootfs(config, cwd_guest, Path::new(interp));
+            let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(interp));
             let mut c = reverie::process::Command::new(&interp_host);
             c.arg0(interp);
             c.arg(&guest_found);
@@ -241,51 +236,107 @@ fn run_backend(
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     if in_guest {
-        // Same Tool, hosted in-guest via the literoot preload.
-        cmd.env(
-            reverie_liteinst::SITE_PATCHING_ENV,
-            if backend == "trap" { "0" } else { "1" },
-        );
-        let preload = find_preload().ok_or(
-            "literoot preload not found (libliteroot_preload.so beside the \
-             literoot binary, or LITEROOT_PRELOAD=<path>). Build it with: \
-             cargo build --release --manifest-path literoot/preload/Cargo.toml",
-        )?;
-        let (output, _global) = runtime.block_on(async {
-            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
-                cmd,
-                cfg,
-                preload,
-                b"literoot".to_vec(),
-            )
-            .await
-            .map_err(|e| format!("in-guest ({backend}) run: {e}"))
-        })?;
-        std::io::stdout().write_all(&output.stdout).ok();
-        std::io::stderr().write_all(&output.stderr).ok();
-        use std::os::unix::process::ExitStatusExt;
-        let status = output.status;
-        return Ok(status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8);
+        // Same Tool, hosted in-guest via the literoot preload. The
+        // trap backend prefers Reverie's TrapHost launcher when this
+        // build has it (inguest-trap): zero ptrace, no site patching.
+        // Without it, trap falls back to the liteinst preload with
+        // site patching off, exactly as before.
+        #[cfg(feature = "inguest-trap")]
+        if backend == "trap" {
+            let preload = find_preload().ok_or(
+                "literoot preload not found (libliteroot_preload.so beside the \
+                 literoot binary, or LITEROOT_PRELOAD=<path>). Build it with: \
+                 cargo build --release --manifest-path literoot/preload/Cargo.toml \
+                 --no-default-features --features inguest-trap",
+            )?;
+            let (output, _global) = runtime.block_on(async {
+                reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
+                    RootfsTool,
+                >(cmd, cfg, preload, b"literoot".to_vec())
+                .await
+                .map_err(|e| format!("in-guest ({backend}) run: {e}"))
+            })?;
+            std::io::stdout().write_all(&output.stdout).ok();
+            std::io::stderr().write_all(&output.stderr).ok();
+            use std::os::unix::process::ExitStatusExt;
+            let status = output.status;
+            return Ok(status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                as u8);
+        }
+        #[cfg(not(feature = "in-guest"))]
+        {
+            return Err(format!(
+                "backend {backend:?} unavailable: in-guest backends compiled out \
+                 (ptrace-only build; rebuild with default features)"
+            ));
+        }
+        #[cfg(feature = "in-guest")]
+        {
+            cmd.env(
+                reverie_liteinst::SITE_PATCHING_ENV,
+                if backend == "trap" { "0" } else { "1" },
+            );
+            let preload = find_preload().ok_or(
+                "literoot preload not found (libliteroot_preload.so beside the \
+                 literoot binary, or LITEROOT_PRELOAD=<path>). Build it with: \
+                 cargo build --release --manifest-path literoot/preload/Cargo.toml",
+            )?;
+            let (output, _global) = runtime.block_on(async {
+                reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
+                    cmd,
+                    cfg,
+                    preload,
+                    b"literoot".to_vec(),
+                )
+                .await
+                .map_err(|e| format!("in-guest ({backend}) run: {e}"))
+            })?;
+            std::io::stdout().write_all(&output.stdout).ok();
+            std::io::stderr().write_all(&output.stderr).ok();
+            use std::os::unix::process::ExitStatusExt;
+            let status = output.status;
+            return Ok(status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                as u8);
+        }
     }
 
+    #[cfg(not(feature = "run"))]
+    {
+        return Err(
+            "backend \"ptrace\" unavailable: ptrace backend compiled out \
+             (inguest-trap build; rebuild with --features ptrace-only)"
+                .into(),
+        );
+    }
+    #[cfg(feature = "run")]
     let status = runtime.block_on(async {
         let tracer = reverie_ptrace::TracerBuilder::<RootfsTool>::new(cmd)
             .config(cfg)
             .spawn()
             .await
             .map_err(|e| format!("tracer spawn: {e}"))?;
-        let (status, _global) =
-            tracer.wait().await.map_err(|e| format!("tracer wait: {e}"))?;
+        let (status, _global) = tracer
+            .wait()
+            .await
+            .map_err(|e| format!("tracer wait: {e}"))?;
         Ok::<_, String>(status)
     })?;
-    use std::os::unix::process::ExitStatusExt;
-    Ok(status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8)
+    #[cfg(feature = "run")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8)
+    }
 }
 
 /// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
 /// the running binary, else the slot build output.
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
 fn find_preload() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
         let p = PathBuf::from(p);
@@ -328,11 +379,7 @@ fn resolve_in_rootfs(config: &RootConfig, cwd_guest: &Path, guest: &Path) -> Pat
     config.translate(&guest, cwd_guest, None)
 }
 
-fn find_guest_in_path(
-    config: &RootConfig,
-    cwd_guest: &Path,
-    prog: &str,
-) -> Option<String> {
+fn find_guest_in_path(config: &RootConfig, cwd_guest: &Path, prog: &str) -> Option<String> {
     // Guest PATH from the environment (proot semantics: empty
     // PATH finds nothing; unset uses the execvp default).
     // Unset PATH: proot performs no search (test-path-search).
@@ -358,7 +405,10 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
     // Kernel reads at most BINPRM_BUF_SIZE (256) bytes for the
     // shebang line; longer lines truncate mid-token.
     let image = &image[..image.len().min(256)];
-    let line_end = image.iter().position(|&c| c == b'\n').unwrap_or(image.len());
+    let line_end = image
+        .iter()
+        .position(|&c| c == b'\n')
+        .unwrap_or(image.len());
     let line = std::str::from_utf8(&image[2..line_end]).ok()?.trim();
     let mut parts = line.splitn(2, |c: char| c.is_whitespace());
     let interp = parts.next()?.trim().to_string();
@@ -366,6 +416,9 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
         return None;
     }
     // The kernel passes the remainder as ONE argument.
-    let opt = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let opt = parts
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     Some((interp, opt))
 }

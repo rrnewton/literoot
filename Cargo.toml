@@ -25,13 +25,24 @@ path = "src/main.rs"
 #   reverie  git d8527112bbdd59ac83892f69e2e29656e1401ef7
 #   liteinst crates.io 0.2.0 (via reverie-liteinst)
 # Flip each edge to a crates.io version as releases land.
-default = ["run"]
-run = ["dep:reverie", "dep:reverie-ptrace", "dep:reverie-liteinst", "dep:libc", "dep:serde", "dep:tokio"]
+default = ["run", "in-guest"]
+# `tool` is the backend-neutral RootfsTool + launcher scaffolding.
+tool = ["dep:reverie", "dep:libc", "dep:serde", "dep:tokio"]
+# `run` alone is the ptrace-only build: no in-guest backend crates
+# (reverie-liteinst / reverie-inguest / liteinst) are compiled, so it
+# builds on architectures the in-guest stack does not serve yet.
+run = ["tool", "dep:reverie-ptrace"]
+in-guest = ["dep:reverie-liteinst"]
+# Trap-only in-guest: Reverie's TrapHost API, zero ptrace, and no
+# reverie-ptrace or reverie-liteinst anywhere in the graph.
+inguest-trap = ["tool", "dep:reverie-inguest"]
+ptrace-only = ["run"]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", optional = true }
 reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", optional = true }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["liteinst"], optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "d8527112bbdd59ac83892f69e2e29656e1401ef7", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
@@ -43,3 +54,5 @@ codegen-units = 1
 
 [patch.crates-io]
 liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }
+
+[workspace]

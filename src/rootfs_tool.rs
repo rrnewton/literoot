@@ -183,6 +183,16 @@ impl Default for RootfsTool {
 // backend uses Tool-region scratch instead, design §6).
 const PATH_BUF: usize = 768;
 
+
+#[cfg(target_arch = "x86_64")]
+fn guest_stack_pointer(regs: &libc::user_regs_struct) -> u64 {
+    regs.rsp
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn guest_stack_pointer(regs: &libc::user_regs_struct) -> u64 {
+    regs.sp
+}
+
 #[reverie::tool]
 impl Tool for RootfsTool {
     type GlobalState = LiterootGlobal;
@@ -192,13 +202,7 @@ impl Tool for RootfsTool {
         let mut subs = Subscription::none();
         subs.syscalls([
             Sysno::openat,
-            Sysno::open,
-            Sysno::stat,
-            Sysno::lstat,
-            Sysno::access,
-            Sysno::newfstatat,
             Sysno::readlinkat,
-            Sysno::readlink,
             Sysno::fchdir,
             Sysno::execve,
             Sysno::chdir,
@@ -210,12 +214,6 @@ impl Tool for RootfsTool {
             Sysno::renameat2,
             Sysno::linkat,
             Sysno::symlinkat,
-            Sysno::rename,
-            Sysno::link,
-            Sysno::symlink,
-            Sysno::rmdir,
-            Sysno::unlink,
-            Sysno::mkdir,
             Sysno::mknodat,
             Sysno::fchownat,
             Sysno::fchmodat,
@@ -249,10 +247,30 @@ impl Tool for RootfsTool {
             Sysno::bind,
             Sysno::connect,
             Sysno::getsockname,
+        ]);
+        // Legacy non-*at syscalls exist only in the x86-64 table; the
+        // aarch64 generic table carries the *at forms subscribed above
+        // (plus fstatat for stat/lstat/newfstatat).
+        #[cfg(target_arch = "x86_64")]
+        subs.syscalls([
+            Sysno::open,
+            Sysno::stat,
+            Sysno::lstat,
+            Sysno::access,
+            Sysno::newfstatat,
+            Sysno::readlink,
+            Sysno::rename,
+            Sysno::link,
+            Sysno::symlink,
+            Sysno::rmdir,
+            Sysno::unlink,
+            Sysno::mkdir,
             Sysno::chmod,
             Sysno::chown,
             Sysno::lchown,
         ]);
+        #[cfg(target_arch = "aarch64")]
+        subs.syscalls([Sysno::fstatat]);
         subs
     }
 
@@ -367,9 +385,9 @@ impl Tool for RootfsTool {
                     mem.read(a, &mut b).ok()?;
                     Some(u64::from_ne_bytes(b))
                 };
-                if let Some(argc) = read64(&mem, regs.rsp) {
+                if let Some(argc) = read64(&mem, guest_stack_pointer(&regs)) {
                     // stack: argc, argv[argc+1], envp[n+1], auxv pairs
-                    let mut p = regs.rsp + 8 + (argc + 1) * 8;
+                    let mut p = guest_stack_pointer(&regs) + 8 + (argc + 1) * 8;
                     for _ in 0..4096 {
                         match read64(&mem, p) {
                             Some(0) => {
@@ -529,6 +547,7 @@ impl Tool for RootfsTool {
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Open(open) => {
                 // Legacy open(2): musl ld.so uses it (measured:
                 // without this arm, musl guests loaded host files).
@@ -557,6 +576,7 @@ impl Tool for RootfsTool {
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Stat(stat) => {
                 let Some(path_ptr) = stat.path() else {
                     return Ok(guest.inject(stat).await?);
@@ -571,10 +591,11 @@ impl Tool for RootfsTool {
                     .await?;
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lstat(stat) => {
                 let Some(path_ptr) = stat.path() else {
                     return Ok(guest.inject(stat).await?);
@@ -589,10 +610,11 @@ impl Tool for RootfsTool {
                     .await?;
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Access(acc) => {
                 let Some(path_ptr) = acc.path() else {
                     return Ok(guest.inject(acc).await?);
@@ -606,6 +628,7 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Newfstatat(stat) => {
                 let Some(path_ptr) = stat.path() else {
                     return Ok(guest.inject(stat).await?);
@@ -653,13 +676,71 @@ impl Tool for RootfsTool {
                         if e == reverie::syscalls::Errno::ENOENT
                             && self.is_virtual_bind_dir(guest, &abs) =>
                     {
-                        self.write_virtual_dir_stat(guest, buf_raw, 24);
+                        self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STAT_MODE_OFF);
                         0
                     }
                     Err(e) => return Err(e.into()),
                 };
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 28, 32);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
+                }
+                Ok(ret)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Syscall::Fstatat(stat) => {
+                let Some(path_ptr) = stat.path() else {
+                    return Ok(guest.inject(stat).await?);
+                };
+                let guest_path = path_ptr.read(&guest.memory())?;
+                if guest_path.as_os_str().is_empty() {
+                    return Ok(guest.inject(stat).await?);
+                }
+                if self.dirfd_passthrough(guest, stat.dirfd(), &guest_path) {
+                    return Ok(guest.inject(stat).await?);
+                }
+                let host = self.translate_for(guest, stat.dirfd(), &guest_path);
+                let buf_raw = stat.stat().map(|p| p.0.as_raw());
+                let (_guard, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| {
+                        stat.with_path(PathPtr::from_ptr(ptr))
+                    })
+                    .await?;
+                let abs = {
+                    let st = self.state.lock().unwrap();
+                    self.guest_abs(&st, stat.dirfd(), &guest_path)
+                };
+                let first = guest.inject(rewritten).await;
+                let first = match first {
+                    Err(e)
+                        if e == reverie::syscalls::Errno::EACCES
+                            && self.fake_ids(guest) == Some((0, 0)) =>
+                    {
+                        drop(_guard);
+                        let saved = self.chmod_ancestors(&host);
+                        let (_g2, rewritten2) = self
+                            .with_guest_path(guest, &host, |ptr| {
+                                stat.with_path(PathPtr::from_ptr(ptr))
+                            })
+                            .await?;
+                        let r2 = guest.inject(rewritten2).await;
+                        self.restore_ancestors(saved);
+                        r2
+                    }
+                    other => other,
+                };
+                let ret = match first {
+                    Ok(r) => r,
+                    Err(e)
+                        if e == reverie::syscalls::Errno::ENOENT
+                            && self.is_virtual_bind_dir(guest, &abs) =>
+                    {
+                        self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STAT_MODE_OFF);
+                        0
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if ret == 0 {
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STAT_UID_OFF, crate::arch::STAT_GID_OFF);
                 }
                 Ok(ret)
             }
@@ -682,6 +763,7 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(rewritten).await?;
                 Ok(self.detranslate_into(guest, &host, &guest_path, buf, buf_len, ret))
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(link) => {
                 let Some(path_ptr) = link.path() else {
                     return Ok(guest.inject(link).await?);
@@ -858,6 +940,7 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Rename(rn) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (rn.oldpath(), rn.newpath()) else {
@@ -885,6 +968,7 @@ impl Tool for RootfsTool {
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Link(ln) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
@@ -902,6 +986,7 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Symlink(sl) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let Some(lp) = sl.linkpath() else {
@@ -916,6 +1001,7 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Rmdir(rd) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = rd.path() else {
@@ -949,6 +1035,7 @@ impl Tool for RootfsTool {
                     Err(e) => Err(e.into()),
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Unlink(un) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = un.path() else {
@@ -982,6 +1069,7 @@ impl Tool for RootfsTool {
                     Err(e) => Err(e.into()),
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(md) => {
                 let _probe_bump = ProbeBumpOnDrop;
                 let Some(pp) = md.path() else {
@@ -1146,7 +1234,7 @@ impl Tool for RootfsTool {
                             self.guest_abs(&st, sx.dirfd(), &g)
                         };
                         if self.is_virtual_bind_dir(guest, &abs) {
-                            self.write_virtual_dir_stat(guest, buf_raw, 28);
+                            self.write_virtual_dir_stat(guest, buf_raw, crate::arch::STATX_MODE_OFF);
                             0
                         } else {
                             return Err(e.into());
@@ -1155,10 +1243,11 @@ impl Tool for RootfsTool {
                     Err(e) => return Err(e.into()),
                 };
                 if ret == 0 {
-                    self.spoof_stat_ids(guest, buf_raw, 20, 24);
+                    self.spoof_stat_ids(guest, buf_raw, crate::arch::STATX_UID_OFF, crate::arch::STATX_GID_OFF);
                 }
                 Ok(ret)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Chmod(cm) => {
                 let Some(pp) = cm.path() else {
                     return Ok(guest.inject(cm).await?);
@@ -1191,6 +1280,7 @@ impl Tool for RootfsTool {
                     Err(e) => Err(e.into()),
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Chown(co) => {
                 if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     return Ok(0);
@@ -1207,6 +1297,7 @@ impl Tool for RootfsTool {
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lchown(co) => {
                 if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     return Ok(0);

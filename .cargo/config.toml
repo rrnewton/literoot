@@ -1,0 +1,6 @@
+# Keep the host shared libc ahead of the el9 sysroot in link search order:
+# the sysroot carries only static glibc archives, and pulling those into a
+# dynamically linked binary breaks at startup. The sysroot still supplies
+# libunwind-ptrace via pkg-config -L later in the search.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-L", "native=/usr/lib64"]
