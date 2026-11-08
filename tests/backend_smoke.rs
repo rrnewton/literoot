@@ -94,3 +94,113 @@ fn liteinst_true_guest_exits_zero() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(target_arch = "aarch64")]
+const BRK_AFTER_EXEC_C: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static volatile unsigned char sink;
+
+__attribute__((noinline)) static void dive(size_t remaining) {
+    volatile unsigned char frame[65536];
+    frame[0] = 1;
+    frame[65535] = 2;
+    if (remaining > sizeof(frame)) {
+        dive(remaining - sizeof(frame));
+    }
+    sink = (unsigned char)(sink + frame[0] + frame[65535]);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc == 1) {
+        struct rlimit rl;
+        char *const next[] = {"test", "stage2", NULL};
+        if (getrlimit(RLIMIT_STACK, &rl) != 0) return 10;
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_STACK, &rl) != 0) return 11;
+        execv(argv[0], next);
+        return 12;
+    }
+
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) != 0) return 14;
+    long brk1 = syscall(SYS_brk, 0);
+    long brk2 = syscall(SYS_brk, brk1 + 1024 * 1024);
+    printf("rlim_cur=%llu rlim_max=%llu delta=%ld\n",
+           (unsigned long long)rl.rlim_cur,
+           (unsigned long long)rl.rlim_max, brk2 - brk1);
+    if (rl.rlim_cur != rl.rlim_max || rl.rlim_max != RLIM_INFINITY) return 15;
+    if (brk2 - brk1 != 1024 * 1024) return 13;
+
+    const char *stack_env = getenv("BRK_STACK_BYTES");
+    size_t stack_bytes = stack_env ? (size_t)atoll(stack_env) : 0;
+    if (stack_bytes != 0) {
+        dive(stack_bytes);
+        printf("stack_touched=%zu sink=%u\n", stack_bytes, sink);
+    }
+    return 0;
+}
+"#;
+
+/// A successor image reached through the rootfs dynamic loader must
+/// keep both a growable break and the guest's exact stack limit.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("brk_after_exec.c");
+    let guest = dir.join("brk_after_exec");
+    std::fs::write(&source, BRK_AFTER_EXEC_C).unwrap();
+    let cc = Command::new("cc")
+        .args(["-std=gnu11", "-O2", "-fno-pie", "-no-pie", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("compile brk-after-exec guest");
+    assert!(
+        cc.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+
+    let work = dir.to_string_lossy().into_owned();
+    let guest_arg = guest.to_string_lossy().into_owned();
+    let native = Command::new(&guest)
+        .env("BRK_STACK_BYTES", "134217728")
+        .output()
+        .expect("run native brk-after-exec guest");
+    assert!(
+        native.status.success(),
+        "native brk-after-exec guest failed: {native:?}"
+    );
+    let expected = "rlim_cur=18446744073709551615 \
+                    rlim_max=18446744073709551615 delta=1048576";
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        native_stdout.contains(expected) && native_stdout.contains("stack_touched=134217728"),
+        "native brk-after-exec output: {native:?}"
+    );
+
+    let traced = Command::new(literoot_bin())
+        .args(["--backend", "ptrace", "-r", "/", "-w", &work, &guest_arg])
+        .env("BRK_STACK_BYTES", "134217728")
+        .output()
+        .expect("run literoot ptrace brk-after-exec guest");
+    let traced_stdout = String::from_utf8_lossy(&traced.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        traced.status.success(),
+        "literoot ptrace brk-after-exec guest failed: {traced:?}"
+    );
+    assert!(
+        traced_stdout.contains(expected) && traced_stdout.contains("stack_touched=134217728"),
+        "literoot ptrace brk-after-exec output: {traced:?}"
+    );
+}

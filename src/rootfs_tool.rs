@@ -193,6 +193,11 @@ impl Default for RootfsTool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootfsThreadState {
     pub pending: Option<ExecState>,
+    /// Original `(soft, hard)` RLIMIT_STACK values to restore in
+    /// `handle_post_exec` after a through-interpreter exec ran with a
+    /// temporarily finite soft limit.
+    #[serde(default)]
+    pub pending_stack_limit: Option<(u64, u64)>,
 }
 
 fn refusal_label(category: RefusalCategory) -> &'static str {
@@ -444,6 +449,83 @@ impl RootfsTool {
         guest.thread_state_mut().pending = None;
     }
 
+    /// Read (and optionally replace) the guest's stack resource limit.
+    async fn prlimit_stack<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        new_limit: Option<(u64, u64)>,
+    ) -> Result<(u64, u64), reverie::syscalls::Errno> {
+        use reverie::Stack as _;
+
+        let mut stack = guest.stack().await;
+        let old_ptr = stack.reserve::<libc::rlimit64>();
+        let new_ptr = new_limit.map(|(rlim_cur, rlim_max)| {
+            stack.push(libc::rlimit64 {
+                rlim_cur,
+                rlim_max,
+            })
+        });
+        let _guard = stack.commit()?;
+        let call = reverie::syscalls::Prlimit64::new()
+            .with_pid(0)
+            .with_resource(libc::RLIMIT_STACK as u32)
+            .with_new_rlim(new_ptr)
+            .with_old_rlim(Some(old_ptr));
+        guest.inject(call).await?;
+        let addr: reverie::syscalls::Addr<u8> =
+            unsafe { reverie::syscalls::Addr::from_raw_unchecked(old_ptr.as_raw()) };
+        let mut bytes = [0u8; 16];
+        guest.memory().read(addr, &mut bytes)?;
+        Ok((
+            u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+        ))
+    }
+
+    /// Temporarily make an unlimited stack limit finite for one
+    /// through-interpreter exec. On AArch64, `RLIM_INFINITY` selects
+    /// the kernel's legacy bottom-up mmap layout; an ET_DYN loader
+    /// image then starts at TASK_UNMAPPED_BASE with [vvar] directly
+    /// above its last segment, so no heap can grow from its break.
+    /// `RLIM_INFINITY - 1` is the least finite deviation: the kernel
+    /// clamps its stack gap to MAX_GAP (STACK_TOP / 6 * 5; about
+    /// 213 TiB with this host's 48-bit stack top), and the exact
+    /// original limit is restored in `handle_post_exec` before the
+    /// new image runs. Other architectures do not use the generic
+    /// `RLIM_INFINITY`-implies-legacy rule (x86 measured unaffected),
+    /// so this is a no-op there.
+    async fn begin_interp_exec_stack_limit<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let old = self.prlimit_stack(guest, None).await?;
+            if old.0 == libc::RLIM64_INFINITY {
+                let capped = (libc::RLIM64_INFINITY - 1, old.1);
+                let previous = self.prlimit_stack(guest, Some(capped)).await?;
+                guest.thread_state_mut().pending_stack_limit = Some(previous);
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = guest;
+        Ok(())
+    }
+
+    /// Restore a stack limit capped by
+    /// `begin_interp_exec_stack_limit`, if one is pending.
+    async fn restore_pending_stack_limit<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        let Some(limits) = guest.thread_state().pending_stack_limit else {
+            return Ok(());
+        };
+        self.prlimit_stack(guest, Some(limits)).await?;
+        guest.thread_state_mut().pending_stack_limit = None;
+        Ok(())
+    }
+
     /// Apply a pending snapshot staged by the predecessor image
     /// (exec) or parent process (fork), if any. Validation runs
     /// against the launch config (not a config already folded
@@ -682,6 +764,7 @@ impl Tool for RootfsTool {
         match parent {
             Some((_, parent)) => RootfsThreadState {
                 pending: parent.pending.clone(),
+                pending_stack_limit: None,
             },
             None => RootfsThreadState::default(),
         }
@@ -709,6 +792,9 @@ impl Tool for RootfsTool {
         &self,
         guest: &mut T,
     ) -> Result<(), reverie::syscalls::Errno> {
+        // This restore is part of the exec itself, not optional
+        // post-exec work: it must run even under LITEROOT_NO_POSTEXEC.
+        self.restore_pending_stack_limit(guest).await?;
         if std::env::var_os("LITEROOT_NO_POSTEXEC").is_some() {
             return Ok(());
         }
@@ -2652,7 +2738,13 @@ impl RootfsTool {
         if let Err(e) = self.stage_snapshot(guest) {
             return Ok(Err(e.into()));
         }
+        if let Err(e) = self.begin_interp_exec_stack_limit(guest).await {
+            return Ok(Err(e.into()));
+        }
         let e = guest.inject(rewritten).await.unwrap_err();
+        if let Err(restore) = self.restore_pending_stack_limit(guest).await {
+            return Ok(Err(restore.into()));
+        }
         Ok(Err(e.into()))
     }
 
@@ -4134,6 +4226,7 @@ mod tests {
         };
         let staged = RootfsThreadState {
             pending: Some(snap.clone()),
+            pending_stack_limit: None,
         };
         let child = tool.init_thread_state(
             reverie::Tid::from_raw(4243),
