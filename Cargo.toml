@@ -39,10 +39,10 @@ inguest-trap = ["tool", "dep:reverie-inguest"]
 ptrace-only = ["run"]
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", optional = true }
-reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", optional = true }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", default-features = false, features = ["liteinst"], optional = true }
-reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "fe86a78b678b792689185fb8b7c0f4e11d6e7a60", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", optional = true }
+reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", default-features = false, features = ["liteinst"], optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
