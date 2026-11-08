@@ -27,7 +27,7 @@ fn make_rootfs(dir: &Path) {
     for bin in ["sh", "ls", "cat", "true"] {
         std::fs::copy(format!("/bin/{bin}"), dir.join("bin").join(bin)).unwrap();
     }
-    for bin in ["readlink", "ln", "mknod"] {
+    for bin in ["readlink", "mknod"] {
         let src = format!("/bin/{bin}");
         if Path::new(&src).exists() {
             std::fs::copy(&src, dir.join("bin").join(bin)).unwrap();
@@ -213,17 +213,34 @@ fn oracle_cases_match_reference() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
+fn require_fixture_tool(path: &Path) -> &Path {
+    assert!(
+        path.is_file(),
+        "missing required fixture tool {}: install coreutils before running this test",
+        path.display()
+    );
+    path
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[should_panic(expected = "missing required fixture tool /definitely/missing/readlink")]
+fn missing_fixture_tool_fails_loudly() {
+    require_fixture_tool(Path::new("/definitely/missing/readlink"));
+}
+
 /// Task-B named cases (aarch64 suite flips at integration tip
 /// 269f9fe; pinned here so x86 cannot regress them silently):
-/// single-file bind, absolute/relative readlink de-translation,
-/// and mknod requiring fake root. Literoot-only assertions
-/// (the suite scripts remain the cross-runner oracle).
+/// single-file bind, readlink path translation and
+/// de-translation, and mknod requiring fake root. The fixture's
+/// loader is x86-64-only today, so this stays x86_64-only; the
+/// aarch64 `Readlinkat` path is covered by the proot suite.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn task_b_named_cases() {
-    if !Path::new("/bin/readlink").exists() || !Path::new("/bin/mknod").exists() {
-        eprintln!("task-b: host readlink/mknod unavailable — skipping");
-        return;
-    }
+    require_fixture_tool(Path::new("/bin/readlink"));
+    require_fixture_tool(Path::new("/bin/mknod"));
     let tmp = std::env::temp_dir().join(format!("literoot-taskb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -252,18 +269,34 @@ fn task_b_named_cases() {
         "bind must be a view, not a copy into the rootfs"
     );
 
-    // test-readlink-abs-rel-symlink: absolute guest symlink
-    // targets de-translate to the host-visible path; relative
-    // targets pass through unchanged.
+    // test-readlink-abs-rel-symlink has two distinct halves:
+    // an external host-absolute target is returned unchanged
+    // (path argument translated, stored target not mangled),
+    // while a target stored under the host rootfs path must
+    // de-translate back to the guest path. Relative targets
+    // pass through unchanged.
     let host_true = std::fs::canonicalize("/bin/true").unwrap();
+    std::fs::write(rootfs.join("work/hello"), "hello\n").unwrap();
     std::os::unix::fs::symlink(&host_true, rootfs.join("bin/abs-true")).unwrap();
+    std::os::unix::fs::symlink(
+        rootfs.join("work/hello"),
+        rootfs.join("bin/rootfs-hello"),
+    )
+    .unwrap();
     std::os::unix::fs::symlink("./true", rootfs.join("bin/rel-true")).unwrap();
     let out = run(&[], &["/bin/readlink", "/bin/abs-true"]);
     assert_eq!(out.status.code(), Some(0), "readlink abs: {out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         host_true.display().to_string(),
-        "absolute symlink must de-translate to the host path"
+        "external absolute symlink target must pass through unchanged"
+    );
+    let out = run(&[], &["/bin/readlink", "/bin/rootfs-hello"]);
+    assert_eq!(out.status.code(), Some(0), "readlink rootfs: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "/work/hello",
+        "rootfs-prefixed symlink target must de-translate to the guest path"
     );
     let out = run(&[], &["/bin/readlink", "/bin/rel-true"]);
     assert_eq!(out.status.code(), Some(0), "readlink rel: {out:?}");
@@ -272,9 +305,27 @@ fn task_b_named_cases() {
     // test-mknod-requires-fake-root: block-device mknod must
     // fail without fake root and succeed with -0.
     let out = run(&[], &["/bin/mknod", "/work/dev0", "b", "1", "1"]);
-    assert_ne!(out.status.code(), Some(0), "mknod without -0 must fail");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "mknod without -0 must exit 1: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Operation not permitted") || stderr.contains("EPERM"),
+        "mknod without -0 must report EPERM, got stderr: {stderr}"
+    );
+    assert!(
+        !rootfs.join("work/dev0").exists(),
+        "failed mknod must not leave a guest file behind"
+    );
     let out = run(&["-0"], &["/bin/mknod", "/work/dev0", "b", "1", "1"]);
     assert_eq!(out.status.code(), Some(0), "mknod with -0: {out:?}");
+    assert!(
+        rootfs.join("work/dev0").exists(),
+        "mknod with -0 must create /work/dev0 in the rootfs"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
