@@ -298,6 +298,30 @@ fn task_b_named_cases() {
         "/work/hello",
         "rootfs-prefixed symlink target must de-translate to the guest path"
     );
+    // Long rootfs-prefixed target: its stored host form
+    // outgrows the guest reader's initial readlink buffer at
+    // any temp-dir depth (coreutils starts at 64 bytes and
+    // doubles while the buffer fills), so de-translation
+    // must start from the complete stored target rather
+    // than the buffer-truncated host prefix. Regression
+    // pin: this returned a truncated guest path whenever a
+    // buffer-size step landed between the host rootfs
+    // prefix and the full host target.
+    let long_name = "h".repeat(64);
+    std::fs::write(rootfs.join("work").join(&long_name), "hello\n").unwrap();
+    std::os::unix::fs::symlink(
+        rootfs.join("work").join(&long_name),
+        rootfs.join("bin/rootfs-long"),
+    )
+    .unwrap();
+    let out = run(&[], &["/bin/readlink", "/bin/rootfs-long"]);
+    assert_eq!(out.status.code(), Some(0), "readlink rootfs long: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("/work/{long_name}"),
+        "long rootfs-prefixed target must de-translate in full, \
+         not truncate at a guest readlink buffer step"
+    );
     let out = run(&[], &["/bin/readlink", "/bin/rel-true"]);
     assert_eq!(out.status.code(), Some(0), "readlink rel: {out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "./true");

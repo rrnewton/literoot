@@ -3727,6 +3727,25 @@ impl RootfsTool {
         if mem.read(addr, &mut stored).is_err() {
             return ret;
         }
+        // A full buffer (ret == buf_len) may hold a truncated
+        // host-form target. De-translating the truncated bytes
+        // would return a short guest length, which a caller
+        // growing its buffer while readlink fills it (gnulib
+        // areadlink starts at 64 and doubles) reads as the
+        // complete target. Re-read the link Tool-side so
+        // de-translation starts from the complete stored
+        // target; the write below truncates to buf_len exactly
+        // as the kernel does, preserving the fill-signals-
+        // growth protocol in guest-visible terms. On any
+        // re-read failure the kernel-written bytes stand.
+        if ret as usize >= buf_len {
+            use std::os::unix::ffi::OsStrExt as _;
+            if let Ok(full) =
+                std::fs::read_link(host_for_tool_read(link_host, guest.pid().as_raw()))
+            {
+                stored = full.as_os_str().as_bytes().to_vec();
+            }
+        }
         let cfg = self.config(guest);
         // /proc/self/exe and /proc/self/root are synthesized from
         // replicated state, not de-translated: the kernel values
