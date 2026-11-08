@@ -561,10 +561,13 @@ fn build_fork_hop(dir: &std::path::Path) -> PathBuf {
 /// kill-on-exit action, which literoot now refuses by
 /// name (rc2 flag-on, rc125 flag-off). The body stays
 /// strict — 12 runs, each exactly 7, never accepting the
-/// named rc2 refusal — and can be run explicitly with
-/// --ignored until the Reverie fix lands.
+/// named rc2 refusal — until the Reverie fix lands.
+/// The quarantine also hides a second class seen under
+/// the same issue: "SIGTRAP with code 1541" refusals.
+/// Reproduce with --include-ignored (the full suite in
+/// parallel); standalone --ignored did not reproduce.
 #[test]
-#[ignore = "known failure: Reverie fork-hop ESRCH race, https://github.com/rrnewton/reverie/issues/1377"]
+#[ignore = "known failure: Reverie fork-hop ESRCH race + SIGTRAP-1541 class, https://github.com/rrnewton/reverie/issues/1377 (repro: --include-ignored)"]
 fn ptrace_kill_on_exit_fork_hop_clean_status() {
     let dir = own_dir("ptrace-fork-hop");
     let bin = build_fork_hop(&dir);
@@ -607,6 +610,7 @@ fn ptrace_kill_on_exit_fork_hop_clean_status() {
 /// does not depend on the Reverie ESRCH race
 /// (https://github.com/rrnewton/reverie/issues/1377).
 #[test]
+#[cfg(debug_assertions)]
 fn ptrace_kill_on_exit_waits_for_delayed_root_status_record() {
     let dir = own_dir("ptrace-daemon-delayed-status");
     let bin = build_setsid_daemon7(&dir);
@@ -645,6 +649,7 @@ fn ptrace_kill_on_exit_waits_for_delayed_root_status_record() {
 /// daemon's 5 s write. Turning the bounded refusal off
 /// (mutant e) returns rc7 after the daemon writes instead.
 #[test]
+#[cfg(debug_assertions)]
 fn ptrace_kill_on_exit_bounded_refusal_without_root_status() {
     let dir = own_dir("ptrace-daemon-bounded-refusal");
     let bin = build_setsid_daemon7(&dir);
@@ -679,6 +684,46 @@ fn ptrace_kill_on_exit_bounded_refusal_without_root_status() {
     let contents = std::fs::read_to_string(&file).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(contents, "", "bounded-refusal daemon writer survived");
+}
+
+/// Release builds compile the delay hook out entirely
+/// (cfg(debug_assertions) at the read site), so setting
+/// the variable must be a no-op: the root status is
+/// recorded immediately, the sweep fires at once, and
+/// the run returns the guest's exact 7 fast with no
+/// daemon write. This is the committed check that the
+/// hook can never silently disable kill-on-exit in
+/// production.
+#[test]
+#[cfg(not(debug_assertions))]
+fn ptrace_kill_on_exit_delay_hook_noop_in_release() {
+    let dir = own_dir("ptrace-daemon-release-hook-noop");
+    let bin = build_setsid_daemon7(&dir);
+    let file = dir.join("out.txt");
+    std::fs::write(&file, "").unwrap();
+    let start = Instant::now();
+    let out = Command::new(literoot_bin())
+        .args(["--backend", "ptrace", "--kill-on-exit"])
+        .arg(&bin)
+        .arg(&file)
+        .arg("1500")
+        .env("LITEROOT_TEST_DELAY_ROOT_STATUS_MS", "10000")
+        .output()
+        .expect("spawn literoot");
+    let elapsed = start.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "release hook must be a no-op preserving exit 7 exactly: {out:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "release hook must not delay the sweep ({elapsed:?})"
+    );
+    std::thread::sleep(Duration::from_millis(1800));
+    let contents = std::fs::read_to_string(&file).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(contents, "", "release-hook-noop daemon writer survived");
 }
 
 #[test]

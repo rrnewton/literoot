@@ -353,3 +353,43 @@ fn task_b_named_cases() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+
+/// /proc/self/root/ must name the guest rootfs root, not
+/// the host root: literoot does not chroot, so the Tool's
+/// root link ("/") is spliced and re-rooted. Passing the
+/// magic link through unspliced listed host entries (the
+/// koe9 regression). The marker file exists only in the
+/// rootfs; "home" exists only on the host root.
+#[test]
+fn proc_self_root_lists_rootfs_root() {
+    if !Path::new("/bin/ls").exists() || !Path::new("/lib64/libc.so.6").exists() {
+        eprintln!("oracle: host fixture binaries unavailable — skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "literoot-proc-self-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    make_rootfs(&dir);
+    std::fs::write(dir.join("ROOTFS_MARKER"), "marker\n").unwrap();
+    let out = Command::new(literoot_bin())
+        .args(["-b", "/proc", "-r", dir.to_str().unwrap(), "-w", "/work"])
+        .args(["/bin/ls", "/proc/self/root/"])
+        .output()
+        .expect("spawn literoot");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "ls /proc/self/root/ must succeed: {out:?}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim() == "ROOTFS_MARKER"),
+        "ls /proc/self/root/ must list the rootfs marker, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|l| l.trim() == "home"),
+        "ls /proc/self/root/ leaked the host root, got: {stdout:?}"
+    );
+}

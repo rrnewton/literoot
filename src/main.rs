@@ -289,7 +289,7 @@ fn print_usage() {
          \x20 -w, --cwd <dir>        initial guest cwd (default / or PROOT_CWD)\n\
          \x20 -0, --root-id          fake uid/gid 0\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
-         \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3)\n\
+         \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3); guest ptrace is refused on in-guest backends\n\
          \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
          \x20                        kill-on-exit refusals exit 2 (a guest may also exit 2; the literoot: kill-on-exit: stderr prefix distinguishes)\n\
          \x20 --check <guest-path>   print translation and exit (repeatable)\n\

@@ -155,6 +155,7 @@ pub fn run_guest(
         fake_gid: config.fake_ids.map(|(_, g)| g),
         kernel_release: config.kernel_release.clone(),
         kill_on_exit,
+        refuse_guest_ptrace: in_guest,
         initial_exe: String::new(),
         initial_argv: Vec::new(),
         initial_stack_limit: None,
@@ -1283,7 +1284,9 @@ mod kill_wait_acceptance_tests {
         // mentions superseded/ENOENT, and a full-text
         // classification mutant survives these tests. The
         // strings below pin only that a primary with no
-        // trigger text is refused.
+        // trigger text is refused. Tracking issue for a
+        // Reverie test constructor:
+        // https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-d1lza.md
         for primary_only in [
             "cleanup deadline exceeded",
             "-1 EPERM (Operation not permitted)",

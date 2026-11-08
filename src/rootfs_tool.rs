@@ -51,6 +51,14 @@ pub struct LiterootConfig {
     /// initial guest process exits (proot semantics).
     #[serde(default)]
     pub kill_on_exit: bool,
+    /// Refuse guest ptrace with EPERM (in-guest backends
+    /// only, set by the launcher). Under the ptrace
+    /// backend this is false and guest ptrace passes
+    /// through to the kernel, which serves it subject to
+    /// literoot's own tracer slot (TRACEME/tree targets
+    /// EPERM, outside-pid SEIZE etc. work).
+    #[serde(default)]
+    pub refuse_guest_ptrace: bool,
     /// Guest path of the initial program (argv-resolved).
     pub initial_exe: String,
     /// Full initial argv as spelled on the literoot command
@@ -171,12 +179,14 @@ pub(crate) struct ProcState {
     /// This process has been registered for --kill-on-exit
     /// in the pid registry (creation-time registration).
     pub(crate) kill_registered: bool,
-    /// This process's PTRACE_TRACEME was refused (guest
-    /// ptrace refusal in the Ptrace arm). Guests that
-    /// ignore the TRACEME result and self-SIGSTOP anyway
-    /// would stop untraced with nobody to continue them;
-    /// the Kill arm swallows exactly that one self-stop.
-    pub(crate) traceme_refused: bool,
+    /// Armed by a refused PTRACE_TRACEME for exactly the
+    /// next syscall dispatch: guests that ignore the
+    /// TRACEME result and immediately self-SIGSTOP would
+    /// stop untraced with nobody to continue them, so the
+    /// Kill arm swallows that one self-stop. Taken
+    /// (cleared) at every dispatch entry and on exec, so
+    /// it can never swallow a later legitimate self-stop.
+    pub(crate) swallow_next_self_stop: bool,
 }
 
 /// The literoot Tool: one instance per guest process.
@@ -204,7 +214,7 @@ impl Default for RootfsTool {
                 translate_memo: Vec::new(),
                 config_memo: None,
                 kill_registered: false,
-                traceme_refused: false,
+                swallow_next_self_stop: false,
                 argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
                 dirent_pending: std::collections::HashMap::new(),
@@ -952,6 +962,8 @@ impl Tool for RootfsTool {
             st.bootstrapped = true;
             // New image: any previous scratch mapping is gone.
             st.scratch = None;
+            // A pending self-stop swallow does not survive exec.
+            st.swallow_next_self_stop = false;
         }
         // Pre-allocate the execve scratch page here: injecting
         // an mmap between a guest's two execve calls was
@@ -1111,12 +1123,16 @@ impl Tool for RootfsTool {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         // New dispatch: per-dispatch translation memo is keyed by this
-        // counter and never consulted across dispatches.
-        {
+        // counter and never consulted across dispatches. The
+        // self-stop swallow is likewise taken here: it is armed
+        // for exactly this one dispatch and cleared by any
+        // other syscall.
+        let swallow_armed = {
             let mut st = self.state.lock().unwrap();
             st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
             st.translate_memo.clear();
-        }
+            std::mem::take(&mut st.swallow_next_self_stop)
+        };
         self.note_process_for_kill_on_exit(guest);
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
             eprintln!("literoot-tool: syscall {:?}", syscall.number());
@@ -2046,25 +2062,35 @@ impl Tool for RootfsTool {
                 Err(reverie::syscalls::Errno::EOPNOTSUPP.into())
             }
             Syscall::Ptrace(pt) => {
-                // Guest ptrace is refused by name (EPERM, the
-                // errno a tracee gets when it is already traced).
-                // Under the ptrace backend the guest is already
-                // traced by literoot, so the kernel refuses the
-                // same way. Under in-guest backends, forwarding
-                // it livelocks: the child's every syscall raises
-                // seccomp SIGSYS for the trap runtime, and a
-                // guest tracer that continues it suppressing
-                // that SIGSYS makes the child re-trap forever
-                // while the parent spins in wait (measured:
-                // test-ptrace-setoptions hangs >60 s, both
-                // guest processes running, launcher idle in
-                // epoll). Real guest-ptrace support needs
-                // Reverie trap/ptrace coexistence design;
-                // until then fail fast instead of hanging.
-                if pt.request() == libc::PTRACE_TRACEME as u32 {
-                    self.state.lock().unwrap().traceme_refused = true;
+                // Guest ptrace scope: on in-guest backends it
+                // is refused by name (EPERM). Forwarding it
+                // there livelocks: the child's every syscall
+                // raises seccomp SIGSYS for the trap runtime,
+                // and a guest tracer that continues it
+                // suppressing that SIGSYS makes the child
+                // re-trap forever while the parent spins in
+                // wait (measured: test-ptrace-setoptions
+                // hangs >60 s, both guest processes running,
+                // launcher idle in epoll). Real guest-ptrace
+                // support needs Reverie trap/ptrace
+                // coexistence design; until then fail fast
+                // instead of hanging.
+                // On the ptrace backend (refuse_guest_ptrace
+                // false) guest ptrace passes through to the
+                // kernel, which does NOT refuse it wholesale:
+                // TRACEME and targets inside literoot's traced
+                // tree get EPERM from the occupied tracer
+                // slot, but operations on outside pids
+                // (SEIZE/INTERRUPT/PEEKUSER/DETACH) are
+                // kernel-served, as at base.
+                if guest.config().refuse_guest_ptrace {
+                    if pt.request() == libc::PTRACE_TRACEME as u32 {
+                        self.state.lock().unwrap().swallow_next_self_stop = true;
+                    }
+                    Err(reverie::syscalls::Errno::EPERM.into())
+                } else {
+                    Ok(guest.inject(pt).await?)
                 }
-                Err(reverie::syscalls::Errno::EPERM.into())
             }
             Syscall::Kill(k) => {
                 // Companion to the TRACEME refusal above:
@@ -2073,20 +2099,18 @@ impl Tool for RootfsTool {
                 // untraced with nobody to continue them
                 // (measured: test-gdb-ptrace hangs in the
                 // parent's wait). Swallow exactly that one
-                // self-stop, once, so the guest fails fast
-                // on its next check instead of hanging.
-                let swallow_self_stop = {
-                    let mut st = self.state.lock().unwrap();
-                    if st.traceme_refused
-                        && k.pid() == guest.pid().as_raw()
-                        && k.sig() == libc::SIGSTOP
-                    {
-                        st.traceme_refused = false;
-                        true
-                    } else {
-                        false
-                    }
-                };
+                // self-stop when it is the syscall
+                // immediately after the refused TRACEME
+                // (swallow_armed was taken at dispatch entry
+                // and is cleared by any other syscall and on
+                // exec), so the guest fails fast on its next
+                // check instead of hanging. This is the one
+                // place kill() reports success without
+                // delivering the signal; scope is exactly
+                // that provenance window.
+                let swallow_self_stop = swallow_armed
+                    && k.pid() == guest.pid().as_raw()
+                    && k.sig() == libc::SIGSTOP;
                 if swallow_self_stop {
                     Ok(0)
                 } else {
@@ -4256,15 +4280,19 @@ fn is_magic_proc_path(path: &Path) -> bool {
             _ => None,
         })
         .collect();
-    if comps.len() < 3 || comps[0] != "proc" {
+    if comps.len() < 4 || comps[0] != "proc" {
         return false;
     }
     let magic = ["fd", "exe", "root", "cwd", "map_files"];
-    // /proc/<pid-or-self>/<magic>[/...] — the magic link
-    // itself counts too: with a trailing slash (lstat on
-    // /proc/self/cwd/) canonicalizing it would splice the
-    // Tool's own link target instead of the guest's.
-    magic.contains(&comps[2].as_str())
+    // /proc/<pid-or-self>/<magic>/... — only paths *under*
+    // a magic link bypass canonicalization. The exact
+    // magic link itself is canonicalized normally, with
+    // translate.rs refusing to splice it (except "root",
+    // which must splice to name the guest root, since
+    // literoot does not chroot). Classifying the raw path
+    // here is only sound for absolute paths, matching the
+    // comps[0]=="proc" check after RootDir filtering.
+    magic.contains(&comps[2].as_str()) && comps.len() > 3
 }
 
 /// Parse /proc/<pid>/exe (any pid) after lexical normalization.
@@ -4805,6 +4833,23 @@ mod exec_watch_gate_tests {
     fn unknown_selector_refused_by_name() {
         let err = exec_watch_for_selector("bogus").unwrap_err();
         assert!(err.contains("unknown tool selector"), "got: {err}");
+    }
+
+    #[test]
+    fn magic_proc_classification_stays_narrow() {
+        use std::path::Path;
+        // Only paths *under* a magic link bypass
+        // canonicalization. The exact magic link and
+        // relative shapes classify through canonicalize
+        // (resolved against cwd/dirfd), never raw: a
+        // re-widening to >=3 components made relative
+        // proc/self/cwd/ escape to the host /proc.
+        assert!(super::is_magic_proc_path(Path::new("/proc/self/cwd/passwd")));
+        assert!(super::is_magic_proc_path(Path::new("/proc/self/fd/0")));
+        assert!(!super::is_magic_proc_path(Path::new("/proc/self/cwd")));
+        assert!(!super::is_magic_proc_path(Path::new("/proc/self/cwd/")));
+        assert!(!super::is_magic_proc_path(Path::new("proc/self/cwd/")));
+        assert!(!super::is_magic_proc_path(Path::new("./proc/self/cwd/")));
     }
 }
 

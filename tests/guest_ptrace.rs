@@ -33,6 +33,7 @@ fn literoot_bin() -> PathBuf {
 }
 
 const GUEST_C: &str = r#"
+#include <errno.h>
 #include <sys/ptrace.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -49,14 +50,23 @@ int main(void) {
     case -1:
         perror("fork");
         exit(EXIT_FAILURE);
-    case 0:
+    case 0: {
+        /* Ignore the TRACEME result and proceed to the
+           self-stop regardless (upstream gdb-ptrace-test
+           shape). This is the guest that hung before the
+           self-stop swallow: with TRACEME refused it would
+           stop untraced with nobody to continue it. The
+           kill must be the syscall right after ptrace, so
+           errno is saved across it and reported after. */
         status = ptrace(PTRACE_TRACEME, 0, 0, 0);
-        if (status < 0) {
-            perror("ptrace(PTRACE_TRACEME)");
-            exit(EXIT_FAILURE);
-        }
+        int traceme_errno = errno;
         kill(getpid(), SIGSTOP);
+        if (status < 0) {
+            errno = traceme_errno;
+            perror("ptrace(PTRACE_TRACEME)");
+        }
         exit(EXIT_SUCCESS);
+    }
     default:
         break;
     }
@@ -131,19 +141,89 @@ fn run_bounded(mut cmd: Command, what: &str) -> Output {
 }
 
 fn build_guest(dir: &std::path::Path) -> Option<PathBuf> {
-    std::fs::write(dir.join("setoptions.c"), GUEST_C).unwrap();
-    let bin = dir.join("setoptions");
+    build_guest_src(dir, GUEST_C, "setoptions")
+}
+
+fn build_guest_src(dir: &std::path::Path, src: &str, name: &str) -> Option<PathBuf> {
+    std::fs::write(dir.join(format!("{name}.c")), src).unwrap();
+    let bin = dir.join(name);
     let cc = Command::new("cc")
         .args(["-O2", "-o"])
         .arg(&bin)
-        .arg(dir.join("setoptions.c"))
+        .arg(dir.join(format!("{name}.c")))
         .output()
-        .expect("cc is required to build the setoptions guest");
+        .expect("cc is required to build the guest");
     if !cc.status.success() {
         eprintln!("guest-ptrace: cc unavailable — skipping: {cc:?}");
         return None;
     }
     Some(bin)
+}
+
+/// Scope probe: ptrace on a pid that cannot exist. The
+/// kernel answers ESRCH; a Tool that refuses guest ptrace
+/// answers EPERM. Exit codes pin which one served it:
+/// 42 = ESRCH (kernel passthrough), 43 = EPERM (refused).
+const SCOPE_GUEST_C: &str = r#"
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+int main(void) {
+    errno = 0;
+    long r = ptrace(PTRACE_ATTACH, INT_MAX, 0, 0);
+    int e = errno;
+    if (r == 0) return 44;
+    errno = e;
+    perror("ptrace(PTRACE_ATTACH)");
+    if (e == ESRCH) return 42;
+    if (e == EPERM) return 43;
+    return 44;
+}
+"#;
+
+/// Run a guest binary under the trap backend in a scratch
+/// rootfs. `None` (with a loud notice, or a panic when
+/// LITEROOT_REQUIRE_PRELOAD is set) when the preload has
+/// not been built: in that case the trap arm did NOT run
+/// and must not be read as a pass of it. Note the default
+/// build's "trap" backend is the liteinst preload with
+/// site patching off; the TrapHost flavour shares the
+/// same RootfsTool refusal and is covered by the row
+/// binaries in the lane evidence.
+fn run_trap_guest(src_bin: &std::path::Path, guest_name: &str) -> Option<Output> {
+    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("preload/target/release/libliteroot_preload.so");
+    if !preload.exists() {
+        assert!(
+            std::env::var_os("LITEROOT_REQUIRE_PRELOAD").is_none(),
+            "guest-ptrace: LITEROOT_REQUIRE_PRELOAD is set but the preload is not built"
+        );
+        eprintln!("guest-ptrace: SKIP (not a pass): preload not built, trap arm not run");
+        return None;
+    }
+    let dir = std::env::temp_dir()
+        .join(format!("literoot-guestptrace-trap-{}-{guest_name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["bin", "lib64"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::copy(src_bin, dir.join("bin").join(guest_name)).unwrap();
+    for lib in ["libc.so.6", "ld-linux-x86-64.so.2"] {
+        let src = PathBuf::from(format!("/lib64/{lib}"));
+        if src.exists() {
+            std::fs::copy(&src, dir.join("lib64").join(lib)).unwrap();
+        }
+    }
+    let root = dir.to_string_lossy().to_string();
+    let mut cmd = Command::new(literoot_bin());
+    cmd.args(["--backend", "trap", "-r", &root])
+        .arg(format!("/bin/{guest_name}"))
+        .env("LITEROOT_PRELOAD", &preload);
+    let out = run_bounded(cmd, "trap backend");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(out)
 }
 
 fn assert_fast_traceme_refusal(out: &Output, backend: &str) {
@@ -173,30 +253,54 @@ fn guest_ptrace_refused_fast_ptrace_backend() {
 
 #[test]
 fn guest_ptrace_refused_fast_trap_backend() {
-    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("preload/target/release/libliteroot_preload.so");
-    if !preload.exists() {
-        eprintln!("guest-ptrace: preload not built — skipping trap arm");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("literoot-guestptrace-trap-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("literoot-guestptrace-src-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["bin", "lib64", "src"] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-    let Some(bin) = build_guest(&dir.join("src")) else { return };
-    std::fs::copy(&bin, dir.join("bin/setoptions")).unwrap();
-    for lib in ["libc.so.6", "ld-linux-x86-64.so.2"] {
-        let src = PathBuf::from(format!("/lib64/{lib}"));
-        if src.exists() {
-            std::fs::copy(&src, dir.join("lib64").join(lib)).unwrap();
-        }
-    }
-    let root = dir.to_string_lossy().to_string();
-    let mut cmd = Command::new(literoot_bin());
-    cmd.args(["--backend", "trap", "-r", &root, "/bin/setoptions"])
-        .env("LITEROOT_PRELOAD", &preload);
-    let out = run_bounded(cmd, "trap backend");
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(bin) = build_guest(&dir) else { return };
+    let out = run_trap_guest(&bin, "setoptions");
     let _ = std::fs::remove_dir_all(&dir);
+    let Some(out) = out else { return };
     assert_fast_traceme_refusal(&out, "trap");
+}
+
+/// Scope pin, ptrace backend: guest ptrace passes through
+/// to the kernel, so ATTACH on a pid that cannot exist
+/// gets the kernel's ESRCH (guest exit 42), not a Tool
+/// EPERM. Refusing every request on this backend (the
+/// pre-koe10 behaviour) fails this test.
+#[test]
+fn guest_ptrace_scope_ptrace_backend_kernel_served() {
+    let dir = std::env::temp_dir().join(format!("literoot-guestptrace-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(bin) = build_guest_src(&dir, SCOPE_GUEST_C, "scope") else { return };
+    let mut cmd = Command::new(literoot_bin());
+    cmd.args(["--backend", "ptrace"]).arg(&bin);
+    let out = run_bounded(cmd, "ptrace backend scope");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "ptrace backend must pass guest ptrace to the kernel (ESRCH): {out:?}"
+    );
+}
+
+/// Scope pin, trap backend: every guest ptrace request is
+/// refused by the Tool with EPERM (guest exit 43), not
+/// just TRACEME. Refusing only TRACEME (mutant m4) lets
+/// the kernel answer ESRCH here and fails this test.
+#[test]
+fn guest_ptrace_scope_trap_backend_refused() {
+    let dir = std::env::temp_dir().join(format!("literoot-guestptrace-scope-src-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(bin) = build_guest_src(&dir, SCOPE_GUEST_C, "scope") else { return };
+    let out = run_trap_guest(&bin, "scope");
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(out) = out else { return };
+    assert_eq!(
+        out.status.code(),
+        Some(43),
+        "trap backend must refuse every guest ptrace request (EPERM): {out:?}"
+    );
 }

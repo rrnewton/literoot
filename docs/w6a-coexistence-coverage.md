@@ -1,6 +1,13 @@
 # L5 record: W6a ptrace re-bootstrap coverage of the 11 coexistence failures
 
 Status: RECORD ONLY (2026-11-06, museport/W1). No implementation.
+Update (koe10): until W6a lands, in-guest backends refuse guest ptrace
+by name (EPERM; RootfsTool refuse_guest_ptrace) because seccomp
+SIGSYS interposition livelocks with a guest tracer; the ptrace
+backend stays kernel-served (TRACEME/tree targets EPERM from the
+occupied tracer slot, outside-pid operations work). When the W6a
+watched-exec route frees the tracer slot, flip refuse_guest_ptrace
+off for watched in-guest launches and re-measure this coverage.
 Implementation stays deferred until W6a S-B (stage-1b in-guest
 successor arming, docs/stage1b-scope.md) lands. "Covered" below means:
 once the backend no longer occupies the guest's single ptrace slot,

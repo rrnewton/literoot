@@ -400,12 +400,18 @@ impl RootConfig {
                     }
                     // Never splice /proc/self (or /proc/<pid>)
                     // itself, or the magic link under it
-                    // (fd/exe/root/cwd/map_files): resolving
-                    // either from the Tool process would name
-                    // the wrong task (measured: guest read
-                    // the tracer's /proc/self/status; lstat on
+                    // (fd/exe/cwd/map_files): resolving either
+                    // from the Tool process would name the
+                    // wrong task (measured: guest read the
+                    // tracer's /proc/self/status; lstat on
                     // /proc/self/cwd/ spliced the launcher's
                     // own cwd under the rootfs -> ENOENT).
+                    // "root" is deliberately excluded: literoot
+                    // does not chroot, so splicing the Tool's
+                    // /proc/self/root ("/") and re-rooting it
+                    // under the rootfs names the guest root,
+                    // while passing it through would leak the
+                    // host root to the guest.
                     let proc_head = stack
                         .first()
                         .map(|c| c.as_os_str() == "proc")
@@ -414,7 +420,7 @@ impl RootConfig {
                             || (stack.len() == 3
                                 && matches!(
                                     stack[2].as_os_str().to_str(),
-                                    Some("fd" | "exe" | "root" | "cwd" | "map_files")
+                                    Some("fd" | "exe" | "cwd" | "map_files")
                                 )));
                     // A just-crossed binding is terminal: do not
                     // splice the bound host root itself (e.g.
@@ -893,13 +899,31 @@ mod tests {
             "/proc/self/cwd/",
             "/proc/self/cwd",
             "/proc/self/exe",
-            "/proc/self/root/",
             "/proc/1234/cwd/",
         ] {
             assert_eq!(
                 c.translate(Path::new(p), Path::new("/"), None),
                 PathBuf::from(p),
                 "{p} must pass through via the /proc bind, unspliced"
+            );
+        }
+        // /proc/self/root is the exception: literoot does
+        // not chroot, so splicing the Tool's root link ("/")
+        // and re-rooting it names the guest rootfs root.
+        // Passing it through would leak the host root.
+        assert_eq!(
+            c.translate(Path::new("/proc/self/root/"), Path::new("/"), None),
+            PathBuf::from("/srv/rootfs/"),
+            "/proc/self/root/ must name the rootfs root, not the host root"
+        );
+        // Relative proc/... paths classify on the resolved
+        // guest path: from cwd /home they are ordinary
+        // rootfs paths under /home, never the host /proc.
+        for p in ["proc/self/cwd/", "./proc/self/cwd/"] {
+            assert_eq!(
+                c.translate(Path::new(p), Path::new("/home"), None),
+                PathBuf::from("/srv/rootfs/home/proc/self/cwd"),
+                "relative {p} from /home must stay inside the rootfs"
             );
         }
     }

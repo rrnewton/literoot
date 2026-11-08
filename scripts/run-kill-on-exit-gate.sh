@@ -5,10 +5,11 @@
 # loops internally (10 launcher runs). The strict unpaced
 # fork-hop test (12 runs, each exactly 7) is quarantined
 # with #[ignore] as a known failure on the Reverie
-# fork-hop ESRCH race,
-# https://github.com/rrnewton/reverie/issues/1377 — run it
-# explicitly with --ignored; it is never weakened to
-# accept the named rc2 refusal. No trap preload is built
+# fork-hop ESRCH race (plus a SIGTRAP-1541 class),
+# https://github.com/rrnewton/reverie/issues/1377 —
+# reproduce with --include-ignored (standalone --ignored
+# did not reproduce); it is never weakened to accept the
+# named rc2 refusal. No trap preload is built
 # here: in-guest --kill-on-exit refuses before spawn by
 # design, so the default-feature test binary covers the
 # refusal case.
