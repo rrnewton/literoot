@@ -837,6 +837,7 @@ impl Tool for RootfsTool {
             Sysno::openat2,
             Sysno::name_to_handle_at,
             Sysno::open_by_handle_at,
+            Sysno::ptrace,
             Sysno::capset,
             Sysno::setxattr,
             Sysno::lsetxattr,
@@ -2035,6 +2036,24 @@ impl Tool for RootfsTool {
                 // cannot reverse-translate soundly; refuse by
                 // name instead of passing through (design S4.1).
                 Err(reverie::syscalls::Errno::EOPNOTSUPP.into())
+            }
+            Syscall::Ptrace(_pt) => {
+                // Guest ptrace is refused by name (EPERM, the
+                // errno a tracee gets when it is already traced).
+                // Under the ptrace backend the guest is already
+                // traced by literoot, so the kernel refuses the
+                // same way. Under in-guest backends, forwarding
+                // it livelocks: the child's every syscall raises
+                // seccomp SIGSYS for the trap runtime, and a
+                // guest tracer that continues it suppressing
+                // that SIGSYS makes the child re-trap forever
+                // while the parent spins in wait (measured:
+                // test-ptrace-setoptions hangs >60 s, both
+                // guest processes running, launcher idle in
+                // epoll). Real guest-ptrace support needs
+                // Reverie trap/ptrace coexistence design;
+                // until then fail fast instead of hanging.
+                Err(reverie::syscalls::Errno::EPERM.into())
             }
             Syscall::Getdents64(gd) => {
                 let virt = {
@@ -4199,12 +4218,15 @@ fn is_magic_proc_path(path: &Path) -> bool {
             _ => None,
         })
         .collect();
-    if comps.len() < 4 || comps[0] != "proc" {
+    if comps.len() < 3 || comps[0] != "proc" {
         return false;
     }
     let magic = ["fd", "exe", "root", "cwd", "map_files"];
-    // /proc/<pid-or-self>/<magic>/...
-    magic.contains(&comps[2].as_str()) && comps.len() > 3
+    // /proc/<pid-or-self>/<magic>[/...] — the magic link
+    // itself counts too: with a trailing slash (lstat on
+    // /proc/self/cwd/) canonicalizing it would splice the
+    // Tool's own link target instead of the guest's.
+    magic.contains(&comps[2].as_str())
 }
 
 /// Parse /proc/<pid>/exe (any pid) after lexical normalization.

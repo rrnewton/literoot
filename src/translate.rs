@@ -399,14 +399,23 @@ impl RootConfig {
                         }
                     }
                     // Never splice /proc/self (or /proc/<pid>)
-                    // itself: resolving it from the Tool process
-                    // would name the wrong task (measured:
-                    // guest read the tracer's /proc/self/status).
-                    let proc_head = stack.len() <= 2
-                        && stack
-                            .first()
-                            .map(|c| c.as_os_str() == "proc")
-                            .unwrap_or(false);
+                    // itself, or the magic link under it
+                    // (fd/exe/root/cwd/map_files): resolving
+                    // either from the Tool process would name
+                    // the wrong task (measured: guest read
+                    // the tracer's /proc/self/status; lstat on
+                    // /proc/self/cwd/ spliced the launcher's
+                    // own cwd under the rootfs -> ENOENT).
+                    let proc_head = stack
+                        .first()
+                        .map(|c| c.as_os_str() == "proc")
+                        .unwrap_or(false)
+                        && (stack.len() <= 2
+                            || (stack.len() == 3
+                                && matches!(
+                                    stack[2].as_os_str().to_str(),
+                                    Some("fd" | "exe" | "root" | "cwd" | "map_files")
+                                )));
                     // A just-crossed binding is terminal: do not
                     // splice the bound host root itself (e.g.
                     // /bin -> usr/bin would leave the binding).
@@ -861,6 +870,38 @@ mod tests {
             c.translate(Path::new("/etc/os-release"), Path::new("/"), None),
             PathBuf::from("/srv/rootfs/etc/os-release")
         );
+    }
+
+    #[test]
+    fn proc_self_magic_link_not_spliced_from_tool_cwd() {
+        // Regression (test-lstat-trailing-slash-symlink,
+        // dynamic guests): lstat("/proc/self/cwd/") must
+        // reach the kernel as the guest's own magic link.
+        // Canonicalizing it here spliced the symlink target
+        // read from the *Tool's* /proc/self/cwd (the
+        // launcher's host cwd) and re-rooted that absolute
+        // host path under the rootfs, yielding ENOENT.
+        let c = RootConfig::new(
+            PathBuf::from("/srv/rootfs"),
+            vec![Bind {
+                guest: PathBuf::from("/proc"),
+                host: PathBuf::from("/proc"),
+                no_follow: false,
+            }],
+        );
+        for p in [
+            "/proc/self/cwd/",
+            "/proc/self/cwd",
+            "/proc/self/exe",
+            "/proc/self/root/",
+            "/proc/1234/cwd/",
+        ] {
+            assert_eq!(
+                c.translate(Path::new(p), Path::new("/"), None),
+                PathBuf::from(p),
+                "{p} must pass through via the /proc bind, unspliced"
+            );
+        }
     }
 
     #[test]
