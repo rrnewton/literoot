@@ -636,6 +636,7 @@ mod tests {
             pending_stack_limit: None,
             initial_stack_limit_consumed: false,
             kill_registered: false,
+            traceme_refused: false,
         }
     }
 

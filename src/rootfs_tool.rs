@@ -171,6 +171,12 @@ pub(crate) struct ProcState {
     /// This process has been registered for --kill-on-exit
     /// in the pid registry (creation-time registration).
     pub(crate) kill_registered: bool,
+    /// This process's PTRACE_TRACEME was refused (guest
+    /// ptrace refusal in the Ptrace arm). Guests that
+    /// ignore the TRACEME result and self-SIGSTOP anyway
+    /// would stop untraced with nobody to continue them;
+    /// the Kill arm swallows exactly that one self-stop.
+    pub(crate) traceme_refused: bool,
 }
 
 /// The literoot Tool: one instance per guest process.
@@ -198,6 +204,7 @@ impl Default for RootfsTool {
                 translate_memo: Vec::new(),
                 config_memo: None,
                 kill_registered: false,
+                traceme_refused: false,
                 argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
                 dirent_pending: std::collections::HashMap::new(),
@@ -838,6 +845,7 @@ impl Tool for RootfsTool {
             Sysno::name_to_handle_at,
             Sysno::open_by_handle_at,
             Sysno::ptrace,
+            Sysno::kill,
             Sysno::capset,
             Sysno::setxattr,
             Sysno::lsetxattr,
@@ -2037,7 +2045,7 @@ impl Tool for RootfsTool {
                 // name instead of passing through (design S4.1).
                 Err(reverie::syscalls::Errno::EOPNOTSUPP.into())
             }
-            Syscall::Ptrace(_pt) => {
+            Syscall::Ptrace(pt) => {
                 // Guest ptrace is refused by name (EPERM, the
                 // errno a tracee gets when it is already traced).
                 // Under the ptrace backend the guest is already
@@ -2053,7 +2061,37 @@ impl Tool for RootfsTool {
                 // epoll). Real guest-ptrace support needs
                 // Reverie trap/ptrace coexistence design;
                 // until then fail fast instead of hanging.
+                if pt.request() == libc::PTRACE_TRACEME as u32 {
+                    self.state.lock().unwrap().traceme_refused = true;
+                }
                 Err(reverie::syscalls::Errno::EPERM.into())
+            }
+            Syscall::Kill(k) => {
+                // Companion to the TRACEME refusal above:
+                // guests that ignore the refusal and kill
+                // themselves SIGSTOP anyway would stop
+                // untraced with nobody to continue them
+                // (measured: test-gdb-ptrace hangs in the
+                // parent's wait). Swallow exactly that one
+                // self-stop, once, so the guest fails fast
+                // on its next check instead of hanging.
+                let swallow_self_stop = {
+                    let mut st = self.state.lock().unwrap();
+                    if st.traceme_refused
+                        && k.pid() == guest.pid().as_raw()
+                        && k.sig() == libc::SIGSTOP
+                    {
+                        st.traceme_refused = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if swallow_self_stop {
+                    Ok(0)
+                } else {
+                    Ok(guest.inject(k).await?)
+                }
             }
             Syscall::Getdents64(gd) => {
                 let virt = {
