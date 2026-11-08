@@ -9,10 +9,13 @@
 //! SIGSYS suppressed makes the child re-trap forever and
 //! the parent spins in wait — measured as a >60 s hang
 //! with both guest processes running. Literoot therefore
-//! refuses the guest ptrace syscall itself (EPERM, the
-//! same errno the kernel gives a tracee that is already
-//! traced under the ptrace backend): TRACEME fails in the
-//! child, the parent reports it, and both exit promptly.
+//! refuses guest ptrace on in-guest backends (EPERM):
+//! TRACEME fails in the child, the parent reports it, and
+//! both exit promptly. On the ptrace backend guest
+//! ptrace passes through to the kernel (TRACEME still
+//! gets EPERM there from literoot's own tracer slot, but
+//! outside-pid operations are kernel-served — pinned by
+//! the scope tests below).
 //!
 //! Both arms are bounded by a harness timeout that kills
 //! the whole process group, so a regression to the hang
@@ -55,9 +58,11 @@ int main(void) {
            self-stop regardless (upstream gdb-ptrace-test
            shape). This is the guest that hung before the
            self-stop swallow: with TRACEME refused it would
-           stop untraced with nobody to continue it. The
-           kill must be the syscall right after ptrace, so
-           errno is saved across it and reported after. */
+           stop untraced with nobody to continue it. No
+           intercepted syscall may run between ptrace and
+           kill (getpid inside kill() is unsubscribed and
+           does not clear the swallow), so errno is saved
+           across the kill and reported after. */
         status = ptrace(PTRACE_TRACEME, 0, 0, 0);
         int traceme_errno = errno;
         kill(getpid(), SIGSTOP);
@@ -302,5 +307,67 @@ fn guest_ptrace_scope_trap_backend_refused() {
         out.status.code(),
         Some(43),
         "trap backend must refuse every guest ptrace request (EPERM): {out:?}"
+    );
+}
+
+/// Swallow-window guest: child ignores the TRACEME
+/// result, runs an *intercepted* syscall (getuid is
+/// subscribed), then self-SIGSTOPs. The parent
+/// waitpid(WUNTRACED) must observe the stop: the swallow
+/// armed by the refused TRACEME was cleared by the
+/// getuid dispatch. Exit 0 = stop honoured; exit 1 =
+/// child exited without stopping (stop swallowed).
+const GETUID_BETWEEN_GUEST_C: &str = r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {
+        (void)ptrace(PTRACE_TRACEME, 0, 0, 0);
+        (void)getuid();
+        kill(getpid(), SIGSTOP);
+        _exit(42);
+    }
+    int status;
+    pid_t w = waitpid(pid, &status, WUNTRACED);
+    if (w < 0) { perror("waitpid"); return 1; }
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP) {
+        fprintf(stderr, "STOP-HONOURED\n");
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+        return 0;
+    }
+    fprintf(stderr, "STOP-SWALLOWED status=%d\n", status);
+    return 1;
+}
+"#;
+
+/// The self-SIGSTOP swallow must last only until the next
+/// intercepted syscall or exec. With an intercepted
+/// getuid() between the refused TRACEME and the self-stop,
+/// the stop must be honoured. The persistent window
+/// (mutant m7: swallow armed until it fires) swallows
+/// this stop, the child exits 42, and this test fails.
+#[test]
+fn guest_ptrace_swallow_cleared_by_intercepted_syscall() {
+    let dir = std::env::temp_dir()
+        .join(format!("literoot-guestptrace-between-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(bin) = build_guest_src(&dir, GETUID_BETWEEN_GUEST_C, "between") else { return };
+    let out = run_trap_guest(&bin, "between");
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some(out) = out else { return };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.contains("STOP-HONOURED"),
+        "self-stop after an intercepted syscall must be honoured, not swallowed: {out:?}"
     );
 }

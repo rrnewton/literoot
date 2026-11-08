@@ -179,13 +179,18 @@ pub(crate) struct ProcState {
     /// This process has been registered for --kill-on-exit
     /// in the pid registry (creation-time registration).
     pub(crate) kill_registered: bool,
-    /// Armed by a refused PTRACE_TRACEME for exactly the
-    /// next syscall dispatch: guests that ignore the
-    /// TRACEME result and immediately self-SIGSTOP would
-    /// stop untraced with nobody to continue them, so the
-    /// Kill arm swallows that one self-stop. Taken
-    /// (cleared) at every dispatch entry and on exec, so
-    /// it can never swallow a later legitimate self-stop.
+    /// Armed by a refused PTRACE_TRACEME until the next
+    /// intercepted (subscribed) syscall dispatch or exec:
+    /// guests that ignore the TRACEME result and
+    /// immediately self-SIGSTOP would stop untraced with
+    /// nobody to continue them, so the Kill arm swallows
+    /// that one self-stop. Taken (cleared) at every
+    /// dispatch entry and on exec. It is NOT cleared by
+    /// unsubscribed syscalls (read/write/getpid/... never
+    /// reach this Tool), so a later legitimate self-stop
+    /// after only unsubscribed syscalls is still
+    /// swallowed — the accepted leftover window tracked at
+    /// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-e4jcb.md
     pub(crate) swallow_next_self_stop: bool,
 }
 
@@ -1125,8 +1130,8 @@ impl Tool for RootfsTool {
         // New dispatch: per-dispatch translation memo is keyed by this
         // counter and never consulted across dispatches. The
         // self-stop swallow is likewise taken here: it is armed
-        // for exactly this one dispatch and cleared by any
-        // other syscall.
+        // until this next intercepted dispatch; unsubscribed
+        // syscalls never reach here and do not clear it.
         let swallow_armed = {
             let mut st = self.state.lock().unwrap();
             st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
@@ -2098,16 +2103,17 @@ impl Tool for RootfsTool {
                 // themselves SIGSTOP anyway would stop
                 // untraced with nobody to continue them
                 // (measured: test-gdb-ptrace hangs in the
-                // parent's wait). Swallow exactly that one
-                // self-stop when it is the syscall
-                // immediately after the refused TRACEME
-                // (swallow_armed was taken at dispatch entry
-                // and is cleared by any other syscall and on
-                // exec), so the guest fails fast on its next
-                // check instead of hanging. This is the one
-                // place kill() reports success without
-                // delivering the signal; scope is exactly
-                // that provenance window.
+                // parent's wait). Swallow that self-stop
+                // while the refusal is still armed:
+                // swallow_armed was taken at dispatch entry
+                // and is cleared by any other *intercepted*
+                // syscall and on exec — unsubscribed
+                // syscalls (getpid, write, nanosleep, ...)
+                // do not clear it, which is the accepted
+                // leftover window tracked at
+                // https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-e4jcb.md
+                // This is the one place kill() reports
+                // success without delivering the signal.
                 let swallow_self_stop = swallow_armed
                     && k.pid() == guest.pid().as_raw()
                     && k.sig() == libc::SIGSTOP;
@@ -4292,7 +4298,7 @@ fn is_magic_proc_path(path: &Path) -> bool {
     // literoot does not chroot). Classifying the raw path
     // here is only sound for absolute paths, matching the
     // comps[0]=="proc" check after RootDir filtering.
-    magic.contains(&comps[2].as_str()) && comps.len() > 3
+    magic.contains(&comps[2].as_str())
 }
 
 /// Parse /proc/<pid>/exe (any pid) after lexical normalization.
