@@ -59,7 +59,7 @@ fn manifests_request_liteinst_feature() {
 fn liteinst_true_guest_exits_zero() {
     let preload = preload_path();
     if !preload.exists() {
-        if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
+        if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
             eprintln!("backend_smoke: preload not built — skipping (opt-in)");
             return;
         }

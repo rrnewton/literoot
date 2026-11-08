@@ -69,7 +69,7 @@ fn inguest_first_execve_takes_translated_route() {
         // A silent skip here would let the suite count this test
         // as passed without running it: fail loudly unless a human
         // explicitly opted in, as in probe_coherence.
-        if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
+        if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
             eprintln!("inguest-exec: preload not built — skipping (opt-in)");
             return;
         }

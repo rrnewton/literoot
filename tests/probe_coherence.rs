@@ -169,7 +169,7 @@ fn in_guest_cross_process_swap_shared_vs_mutant() {
         // A silent skip here once hid a preload compile break:
         // fail loudly unless a human explicitly opted in.
         // Integration gates never set LITEROOT_ALLOW_SKIP_PRELOAD.
-        if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
+        if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
             eprintln!("coherence-ig: preload not built — skipping (opt-in)");
             return;
         }
