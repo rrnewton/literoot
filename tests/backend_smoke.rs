@@ -98,6 +98,8 @@ fn liteinst_true_guest_exits_zero() {
 #[cfg(target_arch = "aarch64")]
 const BRK_AFTER_EXEC_C: &str = r#"
 #define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/resource.h>
@@ -105,6 +107,11 @@ const BRK_AFTER_EXEC_C: &str = r#"
 #include <unistd.h>
 
 static volatile unsigned char sink;
+
+static void *thread_main(void *arg) {
+    (void)arg;
+    return (void *)7;
+}
 
 __attribute__((noinline)) static void dive(size_t remaining) {
     volatile unsigned char frame[65536];
@@ -117,12 +124,31 @@ __attribute__((noinline)) static void dive(size_t remaining) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc == 1) {
+    if (argc == 1 && !getenv("BRK_INITIAL_ONLY")) {
         struct rlimit rl;
         char *const next[] = {"test", "stage2", NULL};
         if (getrlimit(RLIMIT_STACK, &rl) != 0) return 10;
         rl.rlim_cur = rl.rlim_max;
         if (setrlimit(RLIMIT_STACK, &rl) != 0) return 11;
+        const char *script = getenv("BRK_SCRIPT_PATH");
+        if (script) {
+            char *const script_argv[] = {(char *)script, NULL};
+            execv(script, script_argv);
+            return 12;
+        }
+        if (getenv("BRK_FAIL_ENV")) {
+            errno = 0;
+            syscall(SYS_execve, argv[0], next, (char *const *)1);
+            int exec_errno = errno;
+            if (getrlimit(RLIMIT_STACK, &rl) != 0) return 14;
+            printf("exec_errno=%d rlim_cur=%llu rlim_max=%llu\n",
+                   exec_errno, (unsigned long long)rl.rlim_cur,
+                   (unsigned long long)rl.rlim_max);
+            return exec_errno == EFAULT && rl.rlim_cur == rl.rlim_max &&
+                           rl.rlim_max == RLIM_INFINITY
+                       ? 0
+                       : 16;
+        }
         execv(argv[0], next);
         return 12;
     }
@@ -136,6 +162,13 @@ int main(int argc, char *argv[]) {
            (unsigned long long)rl.rlim_max, brk2 - brk1);
     if (rl.rlim_cur != rl.rlim_max || rl.rlim_max != RLIM_INFINITY) return 15;
     if (brk2 - brk1 != 1024 * 1024) return 13;
+
+    pthread_t thread;
+    void *thread_result = NULL;
+    if (pthread_create(&thread, NULL, thread_main, NULL) != 0) return 17;
+    if (pthread_join(thread, &thread_result) != 0 || thread_result != (void *)7)
+        return 18;
+    printf("pthread=ok\n");
 
     const char *stack_env = getenv("BRK_STACK_BYTES");
     size_t stack_bytes = stack_env ? (size_t)atoll(stack_env) : 0;
@@ -159,7 +192,7 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
     let guest = dir.join("brk_after_exec");
     std::fs::write(&source, BRK_AFTER_EXEC_C).unwrap();
     let cc = Command::new("cc")
-        .args(["-std=gnu11", "-O2", "-fno-pie", "-no-pie", "-o"])
+        .args(["-std=gnu11", "-O2", "-fno-pie", "-no-pie", "-pthread", "-o"])
         .arg(&guest)
         .arg(&source)
         .output()
@@ -184,7 +217,9 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
                     rlim_max=18446744073709551615 delta=1048576";
     let native_stdout = String::from_utf8_lossy(&native.stdout);
     assert!(
-        native_stdout.contains(expected) && native_stdout.contains("stack_touched=134217728"),
+        native_stdout.contains(expected)
+            && native_stdout.contains("pthread=ok")
+            && native_stdout.contains("stack_touched=134217728"),
         "native brk-after-exec output: {native:?}"
     );
 
@@ -194,13 +229,78 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
         .output()
         .expect("run literoot ptrace brk-after-exec guest");
     let traced_stdout = String::from_utf8_lossy(&traced.stdout).into_owned();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         traced.status.success(),
         "literoot ptrace brk-after-exec guest failed: {traced:?}"
     );
     assert!(
-        traced_stdout.contains(expected) && traced_stdout.contains("stack_touched=134217728"),
+        traced_stdout.contains(expected)
+            && traced_stdout.contains("pthread=ok")
+            && traced_stdout.contains("stack_touched=134217728"),
         "literoot ptrace brk-after-exec output: {traced:?}"
     );
+
+    let failed = Command::new(literoot_bin())
+        .args(["--backend", "ptrace", "-r", "/", "-w", &work, &guest_arg])
+        .env("BRK_FAIL_ENV", "1")
+        .output()
+        .expect("run literoot ptrace failed-exec guest");
+    assert!(
+        failed.status.success()
+            && String::from_utf8_lossy(&failed.stdout).contains(
+                "exec_errno=14 rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615",
+            ),
+        "literoot ptrace failed-exec restore output: {failed:?}"
+    );
+
+    let script = dir.join("brk-script");
+    std::fs::write(&script, format!("#!{}\n", guest.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    let script_arg = script.to_string_lossy().into_owned();
+    let script_traced = Command::new(literoot_bin())
+        .args(["--backend", "ptrace", "-r", "/", "-w", &work, &guest_arg])
+        .env("BRK_SCRIPT_PATH", &script_arg)
+        .env("BRK_STACK_BYTES", "134217728")
+        .output()
+        .expect("run literoot ptrace brk-after-script guest");
+    assert!(
+        script_traced.status.success()
+            && String::from_utf8_lossy(&script_traced.stdout).contains(expected)
+            && String::from_utf8_lossy(&script_traced.stdout).contains("pthread=ok"),
+        "literoot ptrace brk-after-script output: {script_traced:?}"
+    );
+
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let initial = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &guest_arg,
+        ])
+        .env("BRK_INITIAL_ONLY", "1")
+        .env("BRK_STACK_BYTES", "134217728")
+        .output()
+        .expect("run literoot ptrace initial-loader guest");
+    assert!(
+        initial.status.success()
+            && String::from_utf8_lossy(&initial.stdout).contains(expected)
+            && String::from_utf8_lossy(&initial.stdout).contains("pthread=ok"),
+        "literoot ptrace initial-loader output: {initial:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

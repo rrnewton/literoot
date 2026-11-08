@@ -289,6 +289,7 @@ mod successor_tests {
             kernel_release: Some("6.0-literoot".to_string()),
             initial_exe: "/bin/sh".to_string(),
             initial_argv: vec!["sh".to_string()],
+            initial_stack_limit: None,
         }
     }
 

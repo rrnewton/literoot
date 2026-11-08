@@ -8,6 +8,78 @@ use std::path::{Path, PathBuf};
 use crate::rootfs_tool::{LiterootConfig, RootfsTool, set_config};
 use crate::translate::RootConfig;
 
+/// Cap this launcher process's soft stack limit for one initial
+/// loader-as-main spawn, recording the exact original pair in the
+/// Tool config for post-exec restore in the guest. AArch64-only
+/// for the stack-limit legacy-layout trigger; see
+/// `begin_interp_exec_stack_limit`.
+fn cap_initial_stack_limit(
+    cfg: &mut LiterootConfig,
+) -> Result<Option<(u64, u64)>, String> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut old: libc::rlimit64 = unsafe { std::mem::zeroed() };
+        let get = unsafe {
+            libc::prlimit64(0, libc::RLIMIT_STACK, std::ptr::null(), &mut old)
+        };
+        if get != 0 {
+            return Err(format!(
+                "literoot: read initial RLIMIT_STACK: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if old.rlim_cur != libc::RLIM64_INFINITY {
+            return Ok(None);
+        }
+        let original = (old.rlim_cur, old.rlim_max);
+        cfg.initial_stack_limit = Some(original);
+        set_config(cfg.clone());
+        let capped = libc::rlimit64 {
+            rlim_cur: libc::RLIM64_INFINITY - 1,
+            rlim_max: old.rlim_max,
+        };
+        let set = unsafe {
+            libc::prlimit64(0, libc::RLIMIT_STACK, &capped, std::ptr::null_mut())
+        };
+        if set != 0 {
+            cfg.initial_stack_limit = None;
+            set_config(cfg.clone());
+            return Err(format!(
+                "literoot: cap initial RLIMIT_STACK: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        return Ok(Some(original));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = cfg;
+        Ok(None)
+    }
+}
+
+/// Restore this launcher process's own stack limit after the
+/// capped initial spawn has completed. The guest's copy is
+/// restored separately by `RootfsTool` at post-exec.
+fn restore_launcher_stack_limit(limits: Option<(u64, u64)>) -> Result<(), String> {
+    #[cfg(target_arch = "aarch64")]
+    if let Some((rlim_cur, rlim_max)) = limits {
+        let limit = libc::rlimit64 { rlim_cur, rlim_max };
+        let set = unsafe {
+            libc::prlimit64(0, libc::RLIMIT_STACK, &limit, std::ptr::null_mut())
+        };
+        if set != 0 {
+            return Err(format!(
+                "literoot: restore launcher RLIMIT_STACK: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = limits;
+    Ok(())
+}
+
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
 /// requested backend. Returns the guest exit code.
 pub fn run_guest(
@@ -73,6 +145,7 @@ pub fn run_guest(
         kernel_release: config.kernel_release.clone(),
         initial_exe: String::new(),
         initial_argv: Vec::new(),
+        initial_stack_limit: None,
     };
     let mut cfg = cfg;
     set_config(cfg.clone());
@@ -133,6 +206,7 @@ pub fn run_guest(
         let interp_interp = std::fs::read(&interp_host)
             .ok()
             .and_then(|img| crate::translate::elf_interp(&img));
+        let has_loader = interp_interp.is_some();
         let mut cmd = match interp_interp {
             Some(ld) => {
                 let ld_host = resolve_in_rootfs(config, cwd_guest, Path::new(&ld));
@@ -166,7 +240,14 @@ pub fn run_guest(
         };
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-        return run_backend(cmd, cfg, backend, in_guest);
+        let initial_restore = if has_loader {
+            cap_initial_stack_limit(&mut cfg)?
+        } else {
+            None
+        };
+        let result = run_backend(cmd, cfg, backend, in_guest);
+        restore_launcher_stack_limit(initial_restore)?;
+        return result;
     }
     // PT_INTERP: run the program through the rootfs's dynamic
     // linker (design §4.7) — the kernel would otherwise open the
@@ -213,8 +294,14 @@ pub fn run_guest(
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
     // agrees — test-bind-cwd-bash-pwd).
     cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-
-    run_backend(cmd, cfg, backend, in_guest)
+    let initial_restore = if interp_guest.is_some() {
+        cap_initial_stack_limit(&mut cfg)?
+    } else {
+        None
+    };
+    let result = run_backend(cmd, cfg, backend, in_guest);
+    restore_launcher_stack_limit(initial_restore)?;
+    result
 }
 
 /// Run a fully-built command on the selected backend.

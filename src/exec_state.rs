@@ -270,6 +270,7 @@ impl ExecState {
             })
             .collect();
         st.bootstrapped = true;
+        st.initial_stack_limit_consumed = true;
         Ok(())
     }
 
@@ -632,6 +633,8 @@ mod tests {
             dispatch_seq: 7,
             translate_memo: Vec::new(),
             config_memo: None,
+            pending_stack_limit: None,
+            initial_stack_limit_consumed: false,
         }
     }
 
