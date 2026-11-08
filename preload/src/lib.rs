@@ -15,6 +15,9 @@
 mod arch;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
+#[path = "../../src/shared_record.rs"]
+#[allow(dead_code)] // Future shared-record transports are the first production callers.
+mod shared_record;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
 #[path = "../../src/translate.rs"]

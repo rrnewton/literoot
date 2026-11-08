@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +175,40 @@ impl ExecState {
             dirent_pending,
             dirent_seen,
         }
+    }
+
+    /// Capture the seed for a fork child that has not exec'd.
+    ///
+    /// Unlike an exec-boundary capture, the caller has not just
+    /// staged a successor image into `st`: the seed describes the
+    /// parent's *current* image. That image is not recomputed
+    /// here. The caller supplies the values returned by its own
+    /// current-image accessors (`RootfsTool::exe_guest` for
+    /// `current_exe`, and the same materialized-argv value its
+    /// `/proc/self/cmdline` path uses for `current_argv`), so
+    /// launch-cwd-relative resolution, translation/reverse
+    /// normalization, and the empty-`initial_exe` fallback stay
+    /// in exactly one place. This function never resolves an
+    /// exe against `st.cwd`, `cfg.cwd`, or `cfg.initial_exe`.
+    ///
+    /// `apply_to` forces `bootstrapped = true`, so fork wiring
+    /// must stage this seed only for a bootstrapped parent (or
+    /// first extend the restore contract); capturing does not
+    /// record that bit. Fake state is copied exactly by
+    /// `capture` and is not initialized or altered here. The
+    /// result uses the unchanged LRx1 wire format; fork and
+    /// exec do not get separate state encodings.
+    #[allow(dead_code)] // Fork wiring is the first production caller.
+    pub fn capture_fork_seed(
+        st: &ProcState,
+        cfg: &LiterootConfig,
+        current_exe: &Path,
+        current_argv: &[Vec<u8>],
+    ) -> Self {
+        let mut seed = Self::capture(st, cfg);
+        seed.exe_guest = current_exe.as_os_str().as_bytes().to_vec();
+        seed.argv = current_argv.to_vec();
+        seed
     }
 
     /// Apply this snapshot to a fresh `ProcState`. Validates
@@ -803,6 +837,92 @@ mod tests {
         st.exe_guest = PathBuf::from("/bin/bash");
         let s = ExecState::capture(&st, &c);
         assert_eq!(s.exe_guest, b"/bin/bash");
+    }
+
+    #[test]
+    fn fork_seed_records_accessor_values_for_unseeded_state() {
+        let mut st = proc_state();
+        st.exe_guest = PathBuf::new();
+        st.argv.clear();
+        let mut c = cfg("/work/dir");
+        c.initial_exe = "/bin/sh".to_string();
+        c.initial_argv = vec!["sh".to_string(), "-i".to_string()];
+        // These are the values RootfsTool's current-image
+        // accessors return for this state; the seed records
+        // them rather than deriving a second materialization.
+        let current_argv = vec![b"sh".to_vec(), b"-i".to_vec()];
+        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/bin/sh"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/bin/sh");
+        assert_eq!(seed.argv, current_argv);
+        assert!(seed.encode().is_ok());
+    }
+
+    #[test]
+    fn fork_seed_does_not_re_resolve_accessor_exe_against_current_cwd() {
+        let mut st = proc_state();
+        st.cwd = PathBuf::from("/current/elsewhere");
+        st.exe_guest = PathBuf::new();
+        st.argv.clear();
+        let fake_before = st.fake;
+        let current_argv = vec![b"prog".to_vec()];
+        let mut c = cfg("/work/dir");
+        c.initial_argv = vec!["prog".to_string()];
+
+        // Each supplied exe is the output RootfsTool::exe_guest
+        // produces for the adjacent initial_exe spelling. The
+        // seed must preserve it byte-for-byte instead of joining
+        // the spelling onto st.cwd (the pre-fix behavior).
+        c.initial_exe = "./prog".to_string();
+        let seed =
+            ExecState::capture_fork_seed(&st, &c, Path::new("/work/dir/prog"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/work/dir/prog");
+
+        c.initial_exe = "../x/prog".to_string();
+        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/work/x/prog"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/work/x/prog");
+
+        c.initial_exe = String::new();
+        let seed =
+            ExecState::capture_fork_seed(&st, &c, Path::new("/proc/self/exe"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/proc/self/exe");
+        assert_eq!(seed.fake, fake_before);
+
+        c.cwd = String::new();
+        c.initial_exe = "./prog".to_string();
+        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/prog"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/prog");
+        assert_eq!(seed.fake, fake_before);
+    }
+
+    #[test]
+    fn fork_seed_preserves_materialized_current_image() {
+        let mut st = proc_state();
+        st.exe_guest = PathBuf::from("/bin/bash");
+        st.argv = vec![b"bash".to_vec()];
+        let fake_before = st.fake;
+        let mut c = cfg("/work/dir");
+        c.initial_exe = "/bin/sh".to_string();
+        c.initial_argv = vec!["sh".to_string()];
+        let current_argv = vec![b"bash".to_vec()];
+        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/bin/bash"), &current_argv);
+        assert_eq!(seed.exe_guest, b"/bin/bash");
+        assert_eq!(seed.argv, current_argv);
+        assert_eq!(seed.fake, fake_before);
+    }
+
+    #[test]
+    fn fork_seed_prefers_current_argv_over_state_and_initial_argv() {
+        let mut st = proc_state();
+        st.fake = Some([9, 8, 7, 6, 5, 4]);
+        st.argv = vec![b"state-argv".to_vec()];
+        let mut c = cfg("/work/dir");
+        c.initial_exe = "./prog".to_string();
+        c.initial_argv = vec!["initial-argv".to_string()];
+        let current_argv = vec![b"current-argv".to_vec(), b"-x".to_vec()];
+        let seed =
+            ExecState::capture_fork_seed(&st, &c, Path::new("/work/dir/prog"), &current_argv);
+        assert_eq!(seed.argv, current_argv);
+        assert_eq!(seed.fake, Some([9, 8, 7, 6, 5, 4]));
     }
 
     #[test]

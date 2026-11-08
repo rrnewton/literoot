@@ -14,6 +14,9 @@ mod exec_state;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
 #[cfg(feature = "tool")]
+#[allow(dead_code)] // Future shared-record transports are the first production callers.
+mod shared_record;
+#[cfg(feature = "tool")]
 mod tool;
 mod translate;
 
