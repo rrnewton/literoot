@@ -19,8 +19,9 @@
 //! itself then succeeds is the backend's successor machinery,
 //! not this test's claim.)
 //!
-//! Skips with a notice when the preload has not been built
-//! (same convention as probe_coherence's in-guest test):
+//! Fails when the preload has not been built (same convention
+//! as probe_coherence's in-guest test; only an explicit
+//! LITEROOT_ALLOW_SKIP_PRELOAD opt-in skips):
 //!   cargo build --release --manifest-path preload/Cargo.toml
 
 use std::path::PathBuf;
@@ -28,6 +29,24 @@ use std::process::Command;
 
 fn literoot_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
+}
+
+// Resolution follows tool.rs's convention: $LITEROOT_PRELOAD wins,
+// then $CARGO_TARGET_DIR/release, then the preload-local target.
+fn preload_path() -> PathBuf {
+    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
+        return PathBuf::from(p);
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let td = PathBuf::from(td);
+        let td = if td.is_absolute() { td } else { root.join(td) };
+        let cand = td.join("release/libliteroot_preload.so");
+        if cand.exists() {
+            return cand;
+        }
+    }
+    root.join("preload/target/release/libliteroot_preload.so")
 }
 
 const GUEST_C: &str = r#"
@@ -45,11 +64,21 @@ int main(void) {
 
 #[test]
 fn inguest_first_execve_takes_translated_route() {
-    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("preload/target/release/libliteroot_preload.so");
+    let preload = preload_path();
     if !preload.exists() {
-        eprintln!("inguest-exec: preload not built — skipping");
-        return;
+        // A silent skip here would let the suite count this test
+        // as passed without running it: fail loudly unless a human
+        // explicitly opted in, as in probe_coherence.
+        if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
+            eprintln!("inguest-exec: preload not built — skipping (opt-in)");
+            return;
+        }
+        panic!(
+            "inguest-exec: preload not built at {} — build the preload \
+             (cargo build -p literoot-preload --release) or set \
+             LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
+            preload.display()
+        );
     }
     let dir = std::env::temp_dir().join(format!("literoot-igexec-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -13,6 +13,24 @@ fn literoot_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
 }
 
+// Resolution follows tool.rs's convention: $LITEROOT_PRELOAD wins,
+// then $CARGO_TARGET_DIR/release, then the preload-local target.
+fn preload_path() -> PathBuf {
+    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
+        return PathBuf::from(p);
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let td = PathBuf::from(td);
+        let td = if td.is_absolute() { td } else { root.join(td) };
+        let cand = td.join("release/libliteroot_preload.so");
+        if cand.exists() {
+            return cand;
+        }
+    }
+    root.join("preload/target/release/libliteroot_preload.so")
+}
+
 fn sh(rootfs: &str, script: &str) -> std::process::Output {
     Command::new(literoot_bin())
         .args(["-r", rootfs, "-b", "/dev:/dev", "/bin/sh", "-c", script])
@@ -146,8 +164,7 @@ fn in_guest_cross_process_swap_shared_vs_mutant() {
         eprintln!("coherence-ig: cc unavailable — skipping");
         return;
     }
-    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("preload/target/release/libliteroot_preload.so");
+    let preload = preload_path();
     if !preload.exists() {
         // A silent skip here once hid a preload compile break:
         // fail loudly unless a human explicitly opted in.

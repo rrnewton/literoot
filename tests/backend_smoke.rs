@@ -13,6 +13,24 @@ fn literoot_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
 }
 
+// Resolution follows tool.rs's convention: $LITEROOT_PRELOAD wins,
+// then $CARGO_TARGET_DIR/release, then the preload-local target.
+fn preload_path() -> PathBuf {
+    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
+        return PathBuf::from(p);
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let td = PathBuf::from(td);
+        let td = if td.is_absolute() { td } else { root.join(td) };
+        let cand = td.join("release/libliteroot_preload.so");
+        if cand.exists() {
+            return cand;
+        }
+    }
+    root.join("preload/target/release/libliteroot_preload.so")
+}
+
 /// Cheap static tripwire: both manifests must request
 /// reverie-liteinst's `liteinst` feature, or site patching is
 /// compiled out and the liteinst backend is dead on arrival.
@@ -39,8 +57,7 @@ fn manifests_request_liteinst_feature() {
 /// the manifest, matching probe_coherence's convention.
 #[test]
 fn liteinst_true_guest_exits_zero() {
-    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("preload/target/release/libliteroot_preload.so");
+    let preload = preload_path();
     if !preload.exists() {
         if std::env::var_os("LITEROOT_ALLOW_SKIP_PRELOAD").is_some() {
             eprintln!("backend_smoke: preload not built — skipping (opt-in)");
