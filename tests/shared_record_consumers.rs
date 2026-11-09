@@ -185,24 +185,28 @@ static int capfill(void) {
     int ready[2];
     int go[2];
     if (pipe(ready) != 0 || pipe(go) != 0) return 402;
-    pid_t victim = fork();
-    if (victim < 0) return 403;
-    if (victim == 0) {
-        close(ready[0]);
-        close(go[1]);
-        if (write_byte(ready[1], 'R') != 0) _exit(411);
-        if (read_byte(go[0]) != 0) _exit(412);
-        char fd_text[32];
-        snprintf(fd_text, sizeof(fd_text), "%d", ready[1]);
-        setenv("SR_READY_FD", fd_text, 1);
-        setenv("SR_CHILD_IMAGE", "1", 1);
-        char *argv[] = {(char *)"BIGEXEC", victim_arg, NULL};
-        execve("/bin/h", argv, environ);
-        _exit(413);
+    pid_t victims[2];
+    for (int i = 0; i < 2; i++) {
+        pid_t victim = fork();
+        if (victim < 0) return 403;
+        if (victim == 0) {
+            close(ready[0]);
+            close(go[1]);
+            if (write_byte(ready[1], 'R') != 0) _exit(411);
+            if (read_byte(go[0]) != 0) _exit(412);
+            char fd_text[32];
+            snprintf(fd_text, sizeof(fd_text), "%d", ready[1]);
+            setenv("SR_READY_FD", fd_text, 1);
+            setenv("SR_CHILD_IMAGE", "1", 1);
+            char *argv[] = {(char *)"BIGEXEC", victim_arg, NULL};
+            execve("/bin/h", argv, environ);
+            _exit(413);
+        }
+        victims[i] = victim;
     }
     close(ready[1]);
     close(go[0]);
-    if (read_byte(ready[0]) != 0) return 404;
+    if (read_byte(ready[0]) != 0 || read_byte(ready[0]) != 0) return 404;
 
     for (int i = 0; i < 10; i++) {
         int rc = run_filler(100000);
@@ -214,18 +218,22 @@ static int capfill(void) {
     if (rc != 0) return rc;
 
     if (sethostname("second-longer-name", 18) != 0) return 406;
+    if (setdomainname("second-longer-domain", 20) != 0) return 415;
     struct utsname uts;
     if (uname(&uts) != 0) return 407;
-    printf("uts=%s\n", uts.nodename);
+    printf("uts=%s|%s\n", uts.nodename, uts.domainname);
     fflush(stdout);
 
-    if (write_byte(go[1], 'G') != 0) return 408;
-    if (read_byte(ready[0]) != 0) return 409;
-    print_observed(victim);
-    kill(victim, SIGKILL);
-    int status = 0;
-    if (waitpid(victim, &status, 0) < 0) return 410;
-    return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 414;
+    if (write_byte(go[1], 'G') != 0 || write_byte(go[1], 'G') != 0) return 408;
+    if (read_byte(ready[0]) != 0 || read_byte(ready[0]) != 0) return 409;
+    for (int i = 0; i < 2; i++) {
+        print_observed(victims[i]);
+        kill(victims[i], SIGKILL);
+        int status = 0;
+        if (waitpid(victims[i], &status, 0) < 0) return 410;
+        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) return 414;
+    }
+    return 0;
 }
 
 int main(void) {
@@ -510,6 +518,10 @@ fn overlong_uts_names_return_einval_and_leave_both_fields_unchanged() {
             ),
             "{name}: overlong UTS write was not EINVAL/unchanged: stdout={stdout:?} stderr={stderr:?}"
         );
+        assert!(
+            !stderr.contains("shared record"),
+            "{name}: EINVAL must precede any shared-store write: stderr={stderr:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -529,9 +541,9 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
     make_root(&root, &guest);
 
     // Leave exactly two payload bytes of headroom. Parent and
-    // pre-exec victim rows are each /bin/sr with one argv item;
-    // each filler row is /bin/f with argv ["f", <bytes>]. The
-    // first UTS field is the five-byte string "first".
+    // both pre-exec victim rows are each /bin/sr with one argv
+    // item; each filler row is /bin/f with argv ["f", <bytes>].
+    // The first UTS field is the five-byte string "first".
     const MAX_ENCODED_BYTES: usize = 1024 * 1024;
     let header_and_first_uts = 8 + (4 + 5) + 4;
     let parent_row = snapshot_row_len("/bin/sr".len(), &["/bin/sr".len()]);
@@ -540,7 +552,7 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
     let final_len = MAX_ENCODED_BYTES
         - 2
         - header_and_first_uts
-        - (2 * parent_row)
+        - (3 * parent_row)
         - (10 * big_filler_row)
         - final_filler_overhead;
     assert!(
@@ -565,21 +577,33 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
         "status={status} stdout={stdout:?} stderr={stderr:?}"
     );
     assert!(
-        stdout.contains("uts=second-longer-name"),
-        "refused UTS write left a stale shared field: stdout={stdout:?} stderr={stderr:?}"
+        stdout.contains("uts=second-longer-name|second-longer-domain"),
+        "refused UTS writes left a stale shared field: stdout={stdout:?} stderr={stderr:?}"
     );
     let expected_victim = format!("observed exe=/bin/h cmdline=BIGEXEC|{}|", "V".repeat(128));
-    assert!(
-        stdout.contains(&expected_victim),
-        "refused exec publish left a stale shared row: stdout={stdout:?} stderr={stderr:?}"
+    assert_eq!(
+        stdout.matches(&expected_victim).count(),
+        2,
+        "refused exec publishes left a stale shared row: stdout={stdout:?} stderr={stderr:?}"
     );
-    assert!(
-        stderr.contains("shared record UTS nodename write refused"),
-        "UTS refusal not reported: stderr={stderr:?}"
+    assert_eq!(
+        stderr
+            .matches("shared record UTS nodename write refused")
+            .count(),
+        1,
+        "UTS refusal must be reported exactly once: stderr={stderr:?}"
     );
-    assert!(
-        stderr.contains("shared record publish refused"),
-        "publish refusal not reported: stderr={stderr:?}"
+    assert_eq!(
+        stderr
+            .matches("shared record UTS domainname write refused")
+            .count(),
+        1,
+        "domainname refusal must be reported exactly once: stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches("shared record publish refused").count(),
+        1,
+        "two refused publishes across exec must print one line: stderr={stderr:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

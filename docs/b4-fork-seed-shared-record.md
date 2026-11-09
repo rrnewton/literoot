@@ -99,7 +99,7 @@ sets close-on-exec and exports neither the descriptor nor
 the env var to the guest. The file holds one whole
 length-framed snapshot, not an in-place shared-memory
 layout. The snapshot payload cap is `MAX_ENCODED_BYTES` =
-1 MiB (plus the 8-byte frame header, so a 1,048,584-byte
+1 MiB (plus the 40-byte frame header, so a 1,048,616-byte
 file at most), with at most 4096 process rows. Each
 operation reopens `/proc/self/fd/<fd>` so it locks a
 distinct open file description with a non-blocking Linux
@@ -108,12 +108,18 @@ while holding that lock. Contention retries with a yield
 and bounded exponential sleep for at most five seconds,
 rather than parking in `F_OFD_SETLKW`. After that a read
 fails closed to the caller's local fallback. A timed-out
-write records a per-process pending repair (remove its
-row or clear its UTS field): this process's consumers
-overlay that repair immediately, and it is persisted at
-the next successful write or opportunistically acquired
-lock on a later read. Another process can still see the
-previous shared value until that repair is persisted.
+write records a per-process pending repair guarded by the
+exact stale row/field value this handle last saw: this
+process's consumers overlay that repair immediately, and
+it is persisted at the next successful write or
+opportunistically acquired lock on a later read only if
+the snapshot still holds that exact stale value. A newer
+write by another process (or by a parent after a fork
+child inherited the repair) therefore supersedes and
+drops the repair instead of being erased by it. Another
+process can still see the previous shared value until a
+guarded repair is persisted, and a repair is lost if its
+owning process execs or exits before persisting it.
 The exact 1 MiB payload is stored; a whole-record replace
 one byte over refuses without replacing the previous
 snapshot.
@@ -162,11 +168,15 @@ and the shared fields; a refused shared UTS write clears
 that shared field (or records the pending clear on a lock
 timeout), reports the refusal, and the uname reader then
 retains the field's existing static. Refusal reports are
-rate-limited per category in each Tool-host process: the
-first and every hundredth print, with intermediate counts
-suppressed. Under ptrace they go to the tracer's stderr;
-in-guest they go to the guest process's own fd 2. There is
-intentionally
+rate-limited per category for the whole guest session:
+the frame header carries the three refusal counts, so the
+first and every hundredth print even across in-guest
+fork/exec program images, with intermediate counts
+suppressed. If that header cannot be updated (for example
+the lock is still contended), a per-process limiter is
+the fallback. Under ptrace reports go to the tracer's
+stderr; in-guest they go to the guest process's own fd 2.
+There is intentionally
 no process-exit reaping hook in this slice: qualified
 identities make stale rows non-aliasing, while removal, a
 sealed/atomic in-place layout, and permission hardening are

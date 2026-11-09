@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::exec_state::{ExecState, ExecStateError};
 use crate::shared_record::{
-    ProcessId, ProcessRecord, shared_record_file, MAX_UTS_BYTES,
+    shared_record_file, ProcessId, ProcessRecord, RefusalCategory, SharedRecordFile, MAX_UTS_BYTES,
 };
 use crate::translate::{Bind, RootConfig};
 
@@ -195,20 +195,11 @@ pub struct RootfsThreadState {
     pub pending: Option<ExecState>,
 }
 
-#[derive(Clone, Copy)]
-enum RefusalCategory {
-    Publish,
-    UtsNodename,
-    UtsDomainname,
-}
-
-impl RefusalCategory {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Publish => "publish",
-            Self::UtsNodename => "UTS nodename write",
-            Self::UtsDomainname => "UTS domainname write",
-        }
+fn refusal_label(category: RefusalCategory) -> &'static str {
+    match category {
+        RefusalCategory::Publish => "publish",
+        RefusalCategory::UtsNodename => "UTS nodename write",
+        RefusalCategory::UtsDomainname => "UTS domainname write",
     }
 }
 
@@ -232,35 +223,53 @@ impl RefusalReporter {
         }
     }
 
+    // `is_multiple_of` needs Rust 1.87; the package MSRV is 1.85.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn message_for_count(category: RefusalCategory, count: u64, detail: &str) -> Option<String> {
+        if count == 1 {
+            Some(format!(
+                "literoot: shared record {} refused: {detail}",
+                refusal_label(category)
+            ))
+        } else if count % 100 == 0 {
+            Some(format!(
+                "literoot: shared record {} refused: {detail} \
+                 ({count} refusals so far; intermediate reports suppressed)",
+                refusal_label(category)
+            ))
+        } else {
+            None
+        }
+    }
+
     fn message(&self, category: RefusalCategory, detail: &str) -> Option<String> {
         let counter = match category {
             RefusalCategory::Publish => &self.publish,
             RefusalCategory::UtsNodename => &self.nodename,
             RefusalCategory::UtsDomainname => &self.domainname,
         };
-        let before = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if before == 0 {
-            Some(format!(
-                "literoot: shared record {} refused: {detail}",
-                category.label()
-            ))
-        } else if before % 100 == 99 {
-            Some(format!(
-                "literoot: shared record {} refused: {detail} \
-                 ({} refusals so far; intermediate reports suppressed)",
-                category.label(),
-                before + 1
-            ))
-        } else {
-            None
-        }
+        let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Self::message_for_count(category, count, detail)
     }
 }
 
 static SHARED_RECORD_REFUSALS: RefusalReporter = RefusalReporter::new();
 
-fn report_shared_record_refusal(category: RefusalCategory, detail: String) {
-    if let Some(message) = SHARED_RECORD_REFUSALS.message(category, &detail) {
+fn report_shared_record_refusal(
+    store: &SharedRecordFile,
+    category: RefusalCategory,
+    detail: String,
+) {
+    // The frame header carries the count for the whole
+    // guest session, across fork and exec. If that header
+    // cannot be updated right now (lock contended or the
+    // descriptor is gone), fall back to this process's
+    // limiter rather than losing the first report entirely.
+    let message = match store.note_refusal(category).ok().flatten() {
+        Some(count) => RefusalReporter::message_for_count(category, count, &detail),
+        None => SHARED_RECORD_REFUSALS.message(category, &detail),
+    };
+    if let Some(message) = message {
         eprintln!("{message}");
     }
 }
@@ -354,6 +363,7 @@ impl RootfsTool {
         };
         if let Err(err) = store.publish(row) {
             report_shared_record_refusal(
+                store,
                 RefusalCategory::Publish,
                 format!("for pid {}: {err}", id.pid),
             );
@@ -368,10 +378,7 @@ impl RootfsTool {
     fn set_shared_uts_nodename(name: Vec<u8>) {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_nodename(Some(name)) {
-                report_shared_record_refusal(
-                    RefusalCategory::UtsNodename,
-                    err.to_string(),
-                );
+                report_shared_record_refusal(store, RefusalCategory::UtsNodename, err.to_string());
             }
         }
     }
@@ -380,6 +387,7 @@ impl RootfsTool {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_domainname(Some(name)) {
                 report_shared_record_refusal(
+                    store,
                     RefusalCategory::UtsDomainname,
                     err.to_string(),
                 );
@@ -2420,10 +2428,10 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Sethostname(sh) => {
-                if sh.len() > MAX_UTS_BYTES {
-                    return Err(reverie::syscalls::Errno::EINVAL.into());
-                }
                 if self.fake_ids(guest).is_some() {
+                    if sh.len() > MAX_UTS_BYTES {
+                        return Err(reverie::syscalls::Errno::EINVAL.into());
+                    }
                     if let Some(name) = sh.name() {
                         let mut v = vec![0u8; sh.len()];
                         let mem = guest.memory();
@@ -2442,10 +2450,10 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setdomainname(sd) => {
-                if sd.len() > MAX_UTS_BYTES {
-                    return Err(reverie::syscalls::Errno::EINVAL.into());
-                }
                 if self.fake_ids(guest).is_some() {
+                    if sd.len() > MAX_UTS_BYTES {
+                        return Err(reverie::syscalls::Errno::EINVAL.into());
+                    }
                     if let Some(name) = sd.name() {
                         let mut v = vec![0u8; sd.len()];
                         let mem = guest.memory();
