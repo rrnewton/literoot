@@ -138,6 +138,60 @@ impl std::fmt::Display for SharedRecordError {
 
 impl std::error::Error for SharedRecordError {}
 
+/// Error from a file-backed shared-record write. When the
+/// refusal was counted in the shared frame header while the
+/// write held the exclusive lock, `refusal_count` carries
+/// that session-wide count back to the reporting call site.
+#[derive(Debug)]
+pub struct StoreError {
+    source: std::io::Error,
+    refusal_count: Option<u64>,
+}
+
+impl StoreError {
+    fn new(source: std::io::Error) -> Self {
+        Self {
+            source,
+            refusal_count: None,
+        }
+    }
+
+    fn with_refusal_count(source: std::io::Error, refusal_count: u64) -> Self {
+        Self {
+            source,
+            refusal_count: Some(refusal_count),
+        }
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.source.kind()
+    }
+
+    pub fn refusal_count(&self) -> Option<u64> {
+        self.refusal_count
+    }
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(source: std::io::Error) -> Self {
+        Self::new(source)
+    }
+}
+
+pub type StoreResult<T> = Result<T, StoreError>;
+
 impl SharedRecord {
     pub fn new() -> Self {
         Self::default()
@@ -1054,29 +1108,6 @@ impl SharedRecordFile {
         Ok(snapshot)
     }
 
-    /// Increment this session's refusal count for `category`
-    /// in the frame header and return the new count. This is
-    /// deliberately a single non-blocking try: reporting must
-    /// not park for five seconds behind the lock holder that
-    /// caused a timeout refusal. `Ok(None)` means the lock was
-    /// contended and the caller should use its process-local
-    /// limiter as a fallback.
-    pub fn note_refusal(&self, category: RefusalCategory) -> std::io::Result<Option<u64>> {
-        let Some(locked) = self.open_locked_try(true)? else {
-            return Ok(None);
-        };
-        let frame = locked.read_frame()?;
-        self.remember_snapshot(&frame.record);
-        let mut meta = frame.meta;
-        let count = meta.increment(category);
-        if frame.header_len == FRAME_HEADER_BYTES {
-            locked.write_meta(meta, frame.payload_len)?;
-        } else {
-            locked.write_frame(&frame.record, meta)?;
-        }
-        Ok(Some(count))
-    }
-
     pub fn replace(&self, record: &SharedRecord) -> std::io::Result<()> {
         let locked = self.open_locked(true)?;
         locked.write_snapshot(record)?;
@@ -1085,7 +1116,7 @@ impl SharedRecordFile {
         Ok(())
     }
 
-    pub fn publish(&self, record: ProcessRecord) -> std::io::Result<()> {
+    pub fn publish(&self, record: ProcessRecord) -> StoreResult<()> {
         self.publish_with_timeout(record, LOCK_TIMEOUT)
     }
 
@@ -1093,7 +1124,7 @@ impl SharedRecordFile {
         &self,
         record: ProcessRecord,
         timeout: std::time::Duration,
-    ) -> std::io::Result<()> {
+    ) -> StoreResult<()> {
         let id = record.id;
         let locked = match self.open_locked_timeout(true, timeout) {
             Ok(locked) => locked,
@@ -1101,42 +1132,57 @@ impl SharedRecordFile {
                 if err.kind() == std::io::ErrorKind::WouldBlock {
                     self.note_pending_row(id);
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
-        let mut snapshot = locked.read_snapshot()?;
+        let frame = locked.read_frame()?;
+        let mut meta = frame.meta;
+        let original_snapshot = frame.record.clone();
+        let mut snapshot = frame.record;
         self.remember_snapshot(&snapshot);
         let repairs = self.pending_repairs();
         let repairs_changed = repairs.apply_to(&mut snapshot);
         if let Err(err) = snapshot.publish(record) {
             let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string());
+            let count = meta.increment(RefusalCategory::Publish);
             let removed = snapshot.remove(id);
             let cleanup_attempted = removed || repairs_changed;
-            let cleanup_wrote = cleanup_attempted && locked.write_snapshot(&snapshot).is_ok();
-            if cleanup_wrote {
+            let persisted = if cleanup_attempted {
+                locked.write_frame(&snapshot, meta).is_ok()
+            } else if frame.header_len == FRAME_HEADER_BYTES {
+                locked.write_meta(meta, frame.payload_len).is_ok()
+            } else {
+                locked.write_frame(&original_snapshot, meta).is_ok()
+            };
+            if persisted && cleanup_attempted {
                 self.remember_snapshot(&snapshot);
                 self.forget_compare_pending(&repairs);
                 self.clear_pending_row(id);
             } else if cleanup_attempted {
                 self.note_pending_row(id);
             }
-            return Err(err);
+            return Err(if persisted {
+                StoreError::with_refusal_count(err, count)
+            } else {
+                err.into()
+            });
         }
-        if let Err(err) = locked.write_snapshot(&snapshot) {
+        if let Err(err) = locked.write_frame(&snapshot, meta) {
             // A refused replacement must not leave its stale
             // predecessor to outrank process-local state. This
             // snapshot is the previously valid one plus the
             // attempted replacement, so removing that row can
             // only shrink it back under the cap.
-            let cleanup_wrote = snapshot.remove(id) && locked.write_snapshot(&snapshot).is_ok();
+            let count = meta.increment(RefusalCategory::Publish);
+            let cleanup_wrote = snapshot.remove(id) && locked.write_frame(&snapshot, meta).is_ok();
             if cleanup_wrote {
                 self.remember_snapshot(&snapshot);
                 self.forget_compare_pending(&repairs);
                 self.clear_pending_row(id);
-            } else {
-                self.note_pending_row(id);
+                return Err(StoreError::with_refusal_count(err, count));
             }
-            return Err(err);
+            self.note_pending_row(id);
+            return Err(err.into());
         }
         self.remember_snapshot(&snapshot);
         self.forget_compare_pending(&repairs);
@@ -1144,7 +1190,7 @@ impl SharedRecordFile {
         Ok(())
     }
 
-    pub fn publish_exec_state(&self, id: ProcessId, state: &ExecState) -> std::io::Result<()> {
+    pub fn publish_exec_state(&self, id: ProcessId, state: &ExecState) -> StoreResult<()> {
         let row = ProcessRecord::from_exec_state(id, state)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         self.publish(row)
@@ -1222,7 +1268,7 @@ impl SharedRecordFile {
         Ok((nodename, domainname))
     }
 
-    pub fn set_uts_nodename(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
+    pub fn set_uts_nodename(&self, name: Option<Vec<u8>>) -> StoreResult<()> {
         self.set_uts_nodename_with_timeout(name, LOCK_TIMEOUT)
     }
 
@@ -1230,40 +1276,52 @@ impl SharedRecordFile {
         &self,
         name: Option<Vec<u8>>,
         timeout: std::time::Duration,
-    ) -> std::io::Result<()> {
+    ) -> StoreResult<()> {
         let locked = match self.open_locked_timeout(true, timeout) {
             Ok(locked) => locked,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::WouldBlock {
                     self.note_pending_nodename();
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
-        let mut snapshot = locked.read_snapshot()?;
+        let frame = locked.read_frame()?;
+        let mut meta = frame.meta;
+        let original_snapshot = frame.record.clone();
+        let mut snapshot = frame.record;
         self.remember_snapshot(&snapshot);
         let repairs = self.pending_repairs();
         let _repairs_changed = repairs.apply_to(&mut snapshot);
         if let Err(err) = snapshot.set_uts_nodename(name) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                err.to_string(),
-            ));
+            let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string());
+            let count = meta.increment(RefusalCategory::UtsNodename);
+            let persisted = if frame.header_len == FRAME_HEADER_BYTES {
+                locked.write_meta(meta, frame.payload_len).is_ok()
+            } else {
+                locked.write_frame(&original_snapshot, meta).is_ok()
+            };
+            return Err(if persisted {
+                StoreError::with_refusal_count(err, count)
+            } else {
+                err.into()
+            });
         }
-        if let Err(err) = locked.write_snapshot(&snapshot) {
+        if let Err(err) = locked.write_frame(&snapshot, meta) {
             // Clearing the attempted field can only shrink the
             // previously valid snapshot, and prevents its stale
             // value from outranking the caller's local update.
-            let cleanup_wrote =
-                snapshot.set_uts_nodename(None).is_ok() && locked.write_snapshot(&snapshot).is_ok();
+            let count = meta.increment(RefusalCategory::UtsNodename);
+            let cleanup_wrote = snapshot.set_uts_nodename(None).is_ok()
+                && locked.write_frame(&snapshot, meta).is_ok();
             if cleanup_wrote {
                 self.remember_snapshot(&snapshot);
                 self.forget_compare_pending(&repairs);
                 self.clear_pending_nodename();
-            } else {
-                self.note_pending_nodename();
+                return Err(StoreError::with_refusal_count(err, count));
             }
-            return Err(err);
+            self.note_pending_nodename();
+            return Err(err.into());
         }
         self.remember_snapshot(&snapshot);
         self.forget_compare_pending(&repairs);
@@ -1271,7 +1329,7 @@ impl SharedRecordFile {
         Ok(())
     }
 
-    pub fn set_uts_domainname(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
+    pub fn set_uts_domainname(&self, name: Option<Vec<u8>>) -> StoreResult<()> {
         self.set_uts_domainname_with_timeout(name, LOCK_TIMEOUT)
     }
 
@@ -1279,37 +1337,49 @@ impl SharedRecordFile {
         &self,
         name: Option<Vec<u8>>,
         timeout: std::time::Duration,
-    ) -> std::io::Result<()> {
+    ) -> StoreResult<()> {
         let locked = match self.open_locked_timeout(true, timeout) {
             Ok(locked) => locked,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::WouldBlock {
                     self.note_pending_domainname();
                 }
-                return Err(err);
+                return Err(err.into());
             }
         };
-        let mut snapshot = locked.read_snapshot()?;
+        let frame = locked.read_frame()?;
+        let mut meta = frame.meta;
+        let original_snapshot = frame.record.clone();
+        let mut snapshot = frame.record;
         self.remember_snapshot(&snapshot);
         let repairs = self.pending_repairs();
         let _repairs_changed = repairs.apply_to(&mut snapshot);
         if let Err(err) = snapshot.set_uts_domainname(name) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                err.to_string(),
-            ));
+            let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string());
+            let count = meta.increment(RefusalCategory::UtsDomainname);
+            let persisted = if frame.header_len == FRAME_HEADER_BYTES {
+                locked.write_meta(meta, frame.payload_len).is_ok()
+            } else {
+                locked.write_frame(&original_snapshot, meta).is_ok()
+            };
+            return Err(if persisted {
+                StoreError::with_refusal_count(err, count)
+            } else {
+                err.into()
+            });
         }
-        if let Err(err) = locked.write_snapshot(&snapshot) {
+        if let Err(err) = locked.write_frame(&snapshot, meta) {
+            let count = meta.increment(RefusalCategory::UtsDomainname);
             let cleanup_wrote = snapshot.set_uts_domainname(None).is_ok()
-                && locked.write_snapshot(&snapshot).is_ok();
+                && locked.write_frame(&snapshot, meta).is_ok();
             if cleanup_wrote {
                 self.remember_snapshot(&snapshot);
                 self.forget_compare_pending(&repairs);
                 self.clear_pending_domainname();
-            } else {
-                self.note_pending_domainname();
+                return Err(StoreError::with_refusal_count(err, count));
             }
-            return Err(err);
+            self.note_pending_domainname();
+            return Err(err.into());
         }
         self.remember_snapshot(&snapshot);
         self.forget_compare_pending(&repairs);
@@ -2054,6 +2124,7 @@ mod tests {
             .set_uts_nodename(Some(b"second-longer-name".to_vec()))
             .expect_err("over-cap UTS replacement must refuse");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.refusal_count(), Some(1));
         assert_eq!(
             store.uts().expect("UTS after refusal"),
             (None, Some(b"dom".to_vec()))
@@ -2093,6 +2164,7 @@ mod tests {
             .set_uts_domainname(Some(b"second-longer-domain".to_vec()))
             .expect_err("over-cap domainname replacement must refuse");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.refusal_count(), Some(1));
         assert_eq!(
             store.uts().expect("UTS after domainname refusal"),
             (Some(b"node".to_vec()), None)
@@ -2182,42 +2254,52 @@ mod tests {
     #[test]
     fn refusal_counts_are_shared_across_handles() {
         let first = SharedRecordFile::create().expect("create shared-record memfd");
+        // Fill the snapshot exactly, with no UTS fields, so
+        // every attempt to add one is a cap refusal counted
+        // under the lock the refusing write already holds.
+        let mut record = SharedRecord::new();
+        let mut filler = row(1, 1, b"/bin/big");
+        filler.argv = vec![Vec::new()];
+        record.publish(filler.clone()).expect("publish filler base");
+        let overhead = record.encode().expect("encode exact-cap base").len();
+        filler.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record
+            .publish(filler.clone())
+            .expect("publish exact filler");
+        first.replace(&record).expect("store exact cap");
+
         // A fresh handle adopted from the same descriptor
         // stands in for a new in-guest program image after
         // exec: its process-local state is new, but the frame
         // header counts are the session's.
         let second = SharedRecordFile::from_env_value(Some(&first.fd().to_string()))
             .expect("adopt same memfd in a fresh handle");
+        let err = first
+            .set_uts_nodename(Some(b"x".to_vec()))
+            .expect_err("first nodename write must refuse at the cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.refusal_count(), Some(1));
+        let err = second
+            .set_uts_nodename(Some(b"y".to_vec()))
+            .expect_err("second nodename write must refuse at the cap");
         assert_eq!(
-            first
-                .note_refusal(RefusalCategory::Publish)
-                .expect("first refusal"),
-            Some(1)
-        );
-        assert_eq!(
-            second
-                .note_refusal(RefusalCategory::Publish)
-                .expect("second refusal"),
+            err.refusal_count(),
             Some(2),
             "a new image must not reset the session refusal count"
         );
+        let err = second
+            .set_uts_domainname(Some(b"d".to_vec()))
+            .expect_err("domainname write must refuse at the cap");
         assert_eq!(
-            second
-                .note_refusal(RefusalCategory::UtsNodename)
-                .expect("nodename refusal"),
+            err.refusal_count(),
             Some(1),
             "categories count independently"
         );
-        assert_eq!(
-            first
-                .note_refusal(RefusalCategory::UtsNodename)
-                .expect("second nodename refusal"),
-            Some(2)
-        );
-        assert_eq!(
-            first.snapshot().expect("snapshot after counts"),
-            SharedRecord::new()
-        );
+        let err = first
+            .set_uts_domainname(Some(b"e".to_vec()))
+            .expect_err("second domainname write must refuse at the cap");
+        assert_eq!(err.refusal_count(), Some(2));
+        assert_eq!(first.snapshot().expect("snapshot after counts"), record);
     }
 
     #[test]
@@ -2316,6 +2398,7 @@ mod tests {
             .publish(replacement)
             .expect_err("one-byte-larger replacement must refuse at the cap");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.refusal_count(), Some(1));
         assert_eq!(
             store.lookup(target.id).expect("lookup refused target"),
             None,
@@ -2334,6 +2417,7 @@ mod tests {
             .publish(invalid)
             .expect_err("invalid replacement must also refuse");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.refusal_count(), Some(2));
         assert_eq!(
             store
                 .lookup(filler.id)

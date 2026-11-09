@@ -169,12 +169,15 @@ that shared field (or records the pending clear on a lock
 timeout), reports the refusal, and the uname reader then
 retains the field's existing static. Refusal reports are
 rate-limited per category for the whole guest session:
-the frame header carries the three refusal counts, so the
-first and every hundredth print even across in-guest
-fork/exec program images, with intermediate counts
-suppressed. If that header cannot be updated (for example
-the lock is still contended), a per-process limiter is
-the fallback. Under ptrace reports go to the tracer's
+a cap refusal is counted in the frame header under the
+exclusive lock the refusing write already holds and the
+count returns with the error, so the first and every
+hundredth print even across in-guest fork/exec program
+images, with intermediate counts suppressed. The
+per-process limiter is only the fallback for errors with
+no persisted count, above all the five-second lock
+timeout; in-guest that fallback prints at most once per
+program image. Under ptrace reports go to the tracer's
 stderr; in-guest they go to the guest process's own fd 2.
 There is intentionally
 no process-exit reaping hook in this slice: qualified

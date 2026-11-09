@@ -112,6 +112,38 @@ static int observe(int do_exec) {
     return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 105;
 }
 
+static int forkfill(void) {
+    const char *seq_text = getenv("SR_SEQ");
+    const char *par_text = getenv("SR_PAR");
+    int seq = seq_text == NULL ? 0 : atoi(seq_text);
+    int par = par_text == NULL ? 0 : atoi(par_text);
+    if (seq < 0 || par < 0 || par > 64) return 601;
+    for (int i = 0; i < seq; i++) {
+        pid_t pid = fork();
+        if (pid < 0) return 602;
+        if (pid == 0) _exit(0);
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) return 603;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 604;
+    }
+    pid_t kids[64];
+    for (int i = 0; i < par; i++) {
+        pid_t pid = fork();
+        if (pid < 0) return 605;
+        if (pid == 0) {
+            usleep(20000);
+            _exit(0);
+        }
+        kids[i] = pid;
+    }
+    for (int i = 0; i < par; i++) {
+        int status = 0;
+        if (waitpid(kids[i], &status, 0) < 0) return 606;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 607;
+    }
+    return 0;
+}
+
 static int uts_length(void) {
     char node65[66];
     char domain65[66];
@@ -241,6 +273,7 @@ int main(void) {
     const char *mode = getenv("SR_MODE");
     if (mode == NULL || strcmp(mode, "observe-fork") == 0) return observe(0);
     if (strcmp(mode, "observe-exec") == 0) return observe(1);
+    if (strcmp(mode, "forkfill") == 0) return forkfill();
     if (strcmp(mode, "uts-length") == 0) return uts_length();
     if (strcmp(mode, "uts-observe") == 0) return uts_observe();
     if (strcmp(mode, "capfill") == 0) return capfill();
@@ -449,6 +482,77 @@ fn inguest_parent_sees_child_hostname_and_shared_row() {
         stdout.contains("observed exe=/bin/sr cmdline=/bin/sr|argA|"),
         "shared fork row not consumed in-guest: stdout={stdout:?} stderr={stderr:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn liteinst_sequential_forks_print_one_publish_refusal() {
+    if !fixture_libs_available() {
+        return;
+    }
+    let Some(preload) = preload_path() else {
+        return;
+    };
+    let dir = base_dir("liteinst-forkfill-seq");
+    let guest = build_guest(&dir);
+    let root = dir.join("root");
+    make_root(&root, &guest);
+    // The parent row and each fork child's row carry this
+    // ~120 KB argv, so the 1 MiB snapshot fills after roughly
+    // eight forks; the remaining forks are refused publishes.
+    let big_arg = "B".repeat(120_000);
+    let (stdout, stderr, status) = run_literoot(
+        &root,
+        Some("liteinst"),
+        true,
+        &["/bin/sr", &big_arg],
+        &[("SR_MODE", "forkfill"), ("SR_SEQ", "12"), ("SR_PAR", "0")],
+        Some(&preload),
+    );
+    assert!(
+        status.success(),
+        "status={status} stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches("shared record publish refused").count(),
+        1,
+        "sequential in-guest forks must print one refusal line: stderr={stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn liteinst_concurrent_forks_print_one_publish_refusal_repeatedly() {
+    if !fixture_libs_available() {
+        return;
+    }
+    let Some(preload) = preload_path() else {
+        return;
+    };
+    let dir = base_dir("liteinst-forkfill-par");
+    let guest = build_guest(&dir);
+    let root = dir.join("root");
+    make_root(&root, &guest);
+    let big_arg = "B".repeat(120_000);
+    for run in 0..10 {
+        let (stdout, stderr, status) = run_literoot(
+            &root,
+            Some("liteinst"),
+            true,
+            &["/bin/sr", &big_arg],
+            &[("SR_MODE", "forkfill"), ("SR_SEQ", "9"), ("SR_PAR", "40")],
+            Some(&preload),
+        );
+        assert!(
+            status.success(),
+            "run {run}: status={status} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            stderr.matches("shared record publish refused").count(),
+            1,
+            "run {run}: concurrent in-guest forks must print one refusal line: stderr={stderr:?}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

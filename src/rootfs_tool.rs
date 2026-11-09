@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::exec_state::{ExecState, ExecStateError};
 use crate::shared_record::{
-    shared_record_file, ProcessId, ProcessRecord, RefusalCategory, SharedRecordFile, MAX_UTS_BYTES,
+    shared_record_file, ProcessId, ProcessRecord, RefusalCategory, StoreError, MAX_UTS_BYTES,
 };
 use crate::translate::{Bind, RootConfig};
 
@@ -256,16 +256,18 @@ impl RefusalReporter {
 static SHARED_RECORD_REFUSALS: RefusalReporter = RefusalReporter::new();
 
 fn report_shared_record_refusal(
-    store: &SharedRecordFile,
     category: RefusalCategory,
+    err: &StoreError,
     detail: String,
 ) {
-    // The frame header carries the count for the whole
-    // guest session, across fork and exec. If that header
-    // cannot be updated right now (lock contended or the
-    // descriptor is gone), fall back to this process's
-    // limiter rather than losing the first report entirely.
-    let message = match store.note_refusal(category).ok().flatten() {
+    // Cap refusals are counted in the frame header under
+    // the exclusive lock the refusing write already held,
+    // and that session count arrives with the error. The
+    // per-process limiter is only the fallback for errors
+    // with no persisted count (above all the 5 s lock
+    // timeout); in-guest it therefore prints at most once
+    // per program image for those.
+    let message = match err.refusal_count() {
         Some(count) => RefusalReporter::message_for_count(category, count, &detail),
         None => SHARED_RECORD_REFUSALS.message(category, &detail),
     };
@@ -363,8 +365,8 @@ impl RootfsTool {
         };
         if let Err(err) = store.publish(row) {
             report_shared_record_refusal(
-                store,
                 RefusalCategory::Publish,
+                &err,
                 format!("for pid {}: {err}", id.pid),
             );
         }
@@ -378,7 +380,11 @@ impl RootfsTool {
     fn set_shared_uts_nodename(name: Vec<u8>) {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_nodename(Some(name)) {
-                report_shared_record_refusal(store, RefusalCategory::UtsNodename, err.to_string());
+                report_shared_record_refusal(
+                    RefusalCategory::UtsNodename,
+                    &err,
+                    err.to_string(),
+                );
             }
         }
     }
@@ -387,8 +393,8 @@ impl RootfsTool {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_domainname(Some(name)) {
                 report_shared_record_refusal(
-                    store,
                     RefusalCategory::UtsDomainname,
+                    &err,
                     err.to_string(),
                 );
             }
