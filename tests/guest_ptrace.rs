@@ -198,6 +198,15 @@ int main(void) {
 /// same RootfsTool refusal and is covered by the row
 /// binaries in the lane evidence.
 fn run_trap_guest(src_bin: &std::path::Path, guest_name: &str) -> Option<Output> {
+    run_trap_guest_with(src_bin, guest_name, &[], &[])
+}
+
+fn run_trap_guest_with(
+    src_bin: &std::path::Path,
+    guest_name: &str,
+    launcher_args: &[&str],
+    envs: &[(&str, &str)],
+) -> Option<Output> {
     let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("preload/target/release/libliteroot_preload.so");
     if !preload.exists() {
@@ -224,7 +233,9 @@ fn run_trap_guest(src_bin: &std::path::Path, guest_name: &str) -> Option<Output>
     let root = dir.to_string_lossy().to_string();
     let mut cmd = Command::new(literoot_bin());
     cmd.args(["--backend", "trap", "-r", &root])
+        .args(launcher_args)
         .arg(format!("/bin/{guest_name}"))
+        .envs(envs.iter().copied())
         .env("LITEROOT_PRELOAD", &preload);
     let out = run_bounded(cmd, "trap backend");
     let _ = std::fs::remove_dir_all(&dir);
@@ -369,5 +380,29 @@ fn guest_ptrace_swallow_cleared_by_intercepted_syscall() {
     assert!(
         out.status.success() && stderr.contains("STOP-HONOURED"),
         "self-stop after an intercepted syscall must be honoured, not swallowed: {out:?}"
+    );
+}
+
+/// Gate pin: in-guest kompat must not execute because there
+/// post-exec is not at the exec stop. Output alone cannot
+/// catch an accidentally open gate on this host, so assert
+/// the production debug line.
+#[test]
+fn kompat_auxv_skipped_in_guest_under_trap() {
+    let true_bin = PathBuf::from("/bin/true");
+    let Some(out) = run_trap_guest_with(
+        &true_bin,
+        "true",
+        &["-k", "6.6.6"],
+        &[("LITEROOT_DEBUG", "1")],
+    ) else {
+        return;
+    };
+    assert!(out.status.success(), "trap /bin/true must run: {out:?}");
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text.contains("literoot-tool: kompat auxv skipped: post-exec not at exec stop"),
+        "in-guest kompat gate must report skipped post-exec handling: {text:?}"
     );
 }

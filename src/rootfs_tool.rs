@@ -61,7 +61,9 @@ pub struct LiterootConfig {
     /// False on in-guest backends, where post-exec runs at
     /// the root thread's first trapped syscall and the
     /// initial-stack auxv walk must not run at all for the
-    /// kompat rewrite (it would rewrite live stack words).
+    /// kompat rewrite (it could rewrite live stack words;
+    /// measured dormant on this host, where the computed
+    /// auxv start is unmapped and nothing is written).
     #[serde(default)]
     pub post_exec_at_exec_stop: bool,
     /// Refuse guest ptrace with EPERM (in-guest backends
@@ -1086,6 +1088,13 @@ impl Tool for RootfsTool {
             .unwrap_or(false);
         let kompat = guest.config().kernel_release.is_some()
             && guest.config().post_exec_at_exec_stop;
+        if guest.config().kernel_release.is_some()
+            && !kompat
+            && !guest.config().post_exec_at_exec_stop
+            && std::env::var_os("LITEROOT_DEBUG").is_some()
+        {
+            eprintln!("literoot-tool: kompat auxv skipped: post-exec not at exec stop");
+        }
         let kompat_force = kompat && guest.config().kompat_force;
         if fake.is_some() || zero_hwcap || kompat {
             use reverie::syscalls::MemoryAccess as _;
