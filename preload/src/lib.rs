@@ -183,6 +183,7 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
         && a.kernel_release == b.kernel_release
         && a.initial_exe == b.initial_exe
         && a.initial_argv == b.initial_argv
+        && a.initial_stack_limit == b.initial_stack_limit
 }
 
 #[cfg(feature = "successor")]
@@ -314,6 +315,9 @@ mod successor_tests {
         mutations.push(c);
         let mut c = launched_config();
         c.kernel_release = None;
+        mutations.push(c);
+        let mut c = launched_config();
+        c.initial_stack_limit = Some((8388608, 8388608));
         mutations.push(c);
         for (i, mutant) in mutations.iter().enumerate() {
             assert!(

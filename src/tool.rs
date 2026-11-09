@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 use crate::rootfs_tool::{LiterootConfig, RootfsTool, set_config};
 use crate::translate::RootConfig;
 
+/// Whether an initial loader-as-main spawn gets the temporary
+/// stack-limit cap. Only the ptrace backend restores before the
+/// new image's first instruction; in-guest backends would restore
+/// only at the first Tool event, after glibc has cached its
+/// default thread stack size.
+fn initial_loader_cap_needed(has_loader: bool, in_guest: bool) -> bool {
+    has_loader && !in_guest
+}
+
 /// Cap this launcher process's soft stack limit for one initial
 /// loader-as-main spawn, recording the exact original pair in the
 /// Tool config for post-exec restore in the guest. AArch64-only
@@ -240,7 +249,7 @@ pub fn run_guest(
         };
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-        let initial_restore = if has_loader {
+        let initial_restore = if initial_loader_cap_needed(has_loader, in_guest) {
             cap_initial_stack_limit(&mut cfg)?
         } else {
             None
@@ -294,7 +303,7 @@ pub fn run_guest(
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
     // agrees — test-bind-cwd-bash-pwd).
     cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-    let initial_restore = if interp_guest.is_some() {
+    let initial_restore = if initial_loader_cap_needed(interp_guest.is_some(), in_guest) {
         cap_initial_stack_limit(&mut cfg)?
     } else {
         None
