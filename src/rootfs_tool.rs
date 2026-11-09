@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::exec_state::{ExecState, ExecStateError};
+use crate::shared_record::{ProcessId, ProcessRecord, shared_record_file};
 use crate::translate::{Bind, RootConfig};
 
 /// Serializable launch config (GlobalTool::Config).
@@ -251,6 +252,50 @@ impl RootfsTool {
         }
     }
 
+    /// Start-time-qualified identity for a guest pid, learned
+    /// from the host `/proc` stat for that exact process. A
+    /// missing/unparseable stat is absence: callers retain
+    /// today's bare-pid process-local maps rather than mint a
+    /// row that could alias a reused pid.
+    fn guest_process_id(pid: i32) -> Option<ProcessId> {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        parse_process_start_time(&stat, pid)
+    }
+
+    /// Publish this process's current exe/argv row after a
+    /// successful exec or a fork-seed restore. Best effort by
+    /// design: no shared store (or an unavailable/corrupt one)
+    /// leaves every existing process-local behavior intact.
+    fn publish_self_shared<T: Guest<Self>>(&self, guest: &T) {
+        let Some(store) = shared_record_file() else {
+            return;
+        };
+        let Some(id) = Self::guest_process_id(guest.pid().as_raw()) else {
+            return;
+        };
+        let row = ProcessRecord {
+            id,
+            exe_guest: self
+                .exe_guest(guest)
+                .as_os_str()
+                .as_bytes()
+                .to_vec(),
+            argv: self.current_argv(guest.config()),
+        };
+        if let Err(err) = store.publish(row) {
+            if std::env::var_os("LITEROOT_DEBUG").is_some() {
+                eprintln!(
+                    "literoot: shared record publish unavailable: {err}"
+                );
+            }
+        }
+    }
+
+    fn shared_process_record(pid: i32) -> Option<ProcessRecord> {
+        let id = Self::guest_process_id(pid)?;
+        shared_record_file()?.lookup(id).ok().flatten()
+    }
+
     /// Stage a fork seed for a process-creating clone. The
     /// accessor-produced current exe/argv are computed *before*
     /// the capture state lock below (`exe_guest` locks state
@@ -320,6 +365,21 @@ impl RootfsTool {
         LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(true)
     }
+}
+
+/// Parse Linux `/proc/<pid>/stat` field 22 (`starttime`).
+/// The comm field may contain spaces and parentheses, so the
+/// numeric tail is taken after the final `)`: its first token
+/// is field 3, making start time index 19 in that tail.
+fn parse_process_start_time(stat: &[u8], pid: i32) -> Option<ProcessId> {
+    let text = std::str::from_utf8(stat).ok()?;
+    let (prefix, tail) = text.rsplit_once(')')?;
+    let raw_pid: i32 = prefix.split_whitespace().next()?.parse().ok()?;
+    if raw_pid != pid {
+        return None;
+    }
+    let start_time: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+    ProcessId::new(pid, start_time).ok()
 }
 
 /// The empty-current-exe return branch of `RootfsTool::exe_guest`,
@@ -515,10 +575,17 @@ impl Tool for RootfsTool {
         &self,
         guest: &mut T,
     ) -> Result<(), Error> {
+        // Adopt and identity-check the shared descriptor at the
+        // first lifecycle hook, before ordinary guest execution
+        // gets an opportunity to close/replace the number.
+        let _ = shared_record_file();
         // Fork-child restore: apply the inherited snapshot to the
         // child's fresh Tool before ordinary execution. Threads
         // (never staged) take the None fast path, unchanged.
-        self.consume_pending(guest)?;
+        let restored = self.consume_pending(guest)?;
+        if restored {
+            self.publish_self_shared(guest);
+        }
         Ok(())
     }
 
@@ -568,6 +635,7 @@ impl Tool for RootfsTool {
                 }
             }
         }
+        self.publish_self_shared(guest);
         // Setuid/setgid exec under fake identity: euid/suid take
         // the file owner's fake id (owner == real caller maps to
         // 0 by proot's fake-id rule; test-getresid-native).
@@ -2260,6 +2328,9 @@ impl Tool for RootfsTool {
                         if mem.read(addr, &mut v).is_ok() {
                             *UTS_NODENAME.lock().unwrap() =
                                 Some(String::from_utf8_lossy(&v).into_owned());
+                            if let Some(store) = shared_record_file() {
+                                let _ = store.set_uts_nodename(Some(v));
+                            }
                         }
                     }
                     Ok(0)
@@ -2278,6 +2349,9 @@ impl Tool for RootfsTool {
                         if mem.read(addr, &mut v).is_ok() {
                             *UTS_DOMAIN.lock().unwrap() =
                                 Some(String::from_utf8_lossy(&v).into_owned());
+                            if let Some(store) = shared_record_file() {
+                                let _ = store.set_uts_domainname(Some(v));
+                            }
                         }
                     }
                     Ok(0)
@@ -2746,8 +2820,19 @@ impl RootfsTool {
         let Some(buf) = buf else { return };
         let cfg = self.config(guest);
         let kr = cfg.kernel_release.clone();
-        let nodename = UTS_NODENAME.lock().unwrap().clone();
-        let domain = UTS_DOMAIN.lock().unwrap().clone();
+        let local_nodename = UTS_NODENAME.lock().unwrap().clone();
+        let local_domain = UTS_DOMAIN.lock().unwrap().clone();
+        let (nodename, domain) =
+            match shared_record_file().and_then(|store| store.uts().ok()) {
+                Some((node, domain)) => (
+                    node.map(|v| String::from_utf8_lossy(&v).into_owned())
+                        .or(local_nodename),
+                    domain
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                        .or(local_domain),
+                ),
+                None => (local_nodename, local_domain),
+            };
         if kr.is_none() && nodename.is_none() && domain.is_none() {
             return;
         }
@@ -2912,9 +2997,12 @@ impl RootfsTool {
             }
             materialized
         } else {
-            let argv = match pid_argv_map().lock().unwrap().get(&target_pid) {
-                Some(a) => a.clone(),
-                None => return None,
+            let argv = match Self::shared_process_record(target_pid) {
+                Some(row) => row.argv,
+                None => match pid_argv_map().lock().unwrap().get(&target_pid) {
+                    Some(a) => a.clone(),
+                    None => return None,
+                },
             };
             if argv.is_empty() {
                 let init = guest.config().initial_argv.clone();
@@ -3541,9 +3629,14 @@ impl RootfsTool {
                 .to_vec()
         } else if let Some(other) = proc_pid_exe(link_guest) {
             use std::os::unix::ffi::OsStrExt as _;
-            match pid_exe_map().lock().unwrap().get(&other) {
-                Some(p) => p.as_os_str().as_bytes().to_vec(),
-                None => cfg.detranslate_readlink(link_host, link_guest, &stored),
+            match Self::shared_process_record(other) {
+                Some(row) => row.exe_guest,
+                None => match pid_exe_map().lock().unwrap().get(&other) {
+                    Some(p) => p.as_os_str().as_bytes().to_vec(),
+                    None => {
+                        cfg.detranslate_readlink(link_host, link_guest, &stored)
+                    }
+                },
             }
         } else {
             cfg.detranslate_readlink(link_host, link_guest, &stored)
@@ -3918,6 +4011,23 @@ mod tests {
         assert_eq!(child.pending, None);
         let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
         assert_eq!(root.pending, None);
+    }
+
+    #[test]
+    fn process_start_time_parser_uses_final_comm_close() {
+        // comm is "my (proc) name": the tail begins at field 3,
+        // so field 22 is tail index 19. Build that tail by
+        // position instead of counting words in a long literal.
+        let mut fields = vec!["S"; 20];
+        fields[19] = "123456";
+        let stat = format!("4242 (my (proc) name) {}", fields.join(" "));
+        assert_eq!(
+            parse_process_start_time(stat.as_bytes(), 4242),
+            ProcessId::new(4242, 123456).ok()
+        );
+        assert_eq!(parse_process_start_time(stat.as_bytes(), 4243), None);
+        assert_eq!(parse_process_start_time(b"4242 (x) S", 4242), None);
+        assert_eq!(parse_process_start_time(b"not-a-stat", 4242), None);
     }
 
     #[test]

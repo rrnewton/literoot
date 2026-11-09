@@ -3,18 +3,23 @@
 //! B4 deliberately separates two kinds of continuity state:
 //! per-process state travels in [`ExecState`], while facts
 //! visible across the guest process tree belong here. This
-//! module is the codec-level precursor to the launcher-owned
-//! shared record: it defines the values, their identity and
-//! bounds, and a deterministic snapshot encoding that future
-//! transports can bootstrap or exchange. It deliberately is
-//! not an in-place shared-memory layout and performs no I/O,
-//! locking, process discovery, or syscalls.
+//! module defines the values, their identity and bounds, the
+//! deterministic snapshot encoding, and the first file-backed
+//! transport: a launcher-created memfd holding exactly one
+//! length-framed snapshot. It is not an in-place shared-memory
+//! layout; every operation reloads or rewrites the bounded
+//! snapshot while holding an open-file-description lock.
 //!
 //! Process identity is `(pid, start_time)`, never a bare pid:
 //! pid reuse must not alias a dead predecessor's exe/argv row.
 //! The unit/epoch of `start_time` is supplied by the transport
 //! that learns it (for example `stat` start-time ticks); this
 //! codec only preserves and compares the opaque value.
+
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::OnceLock;
 
 use crate::exec_state::ExecState;
 
@@ -481,6 +486,316 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Internal launcher-to-Tool environment variable carrying the
+/// shared-record memfd number. It follows the existing
+/// `LITEROOT_PROBE_GEN_FD` handoff shape: an inherited fd, not a
+/// guest-visible pathname or CLI option.
+pub const SHARED_RECORD_FD_ENV: &str = "LITEROOT_SHARED_RECORD_FD";
+
+const FRAME_HEADER_BYTES: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
+    let meta = file.metadata()?;
+    Ok(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn identity_of_fd(fd: RawFd) -> std::io::Result<FileIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fstat` borrows the descriptor and writes only
+    // through `stat`; an env-supplied closed/invalid number is
+    // reported as EBADF instead of being wrapped in a File.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    })
+}
+
+fn invalid_data(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn lock_file(file: &File, exclusive: bool, wait: bool) -> std::io::Result<bool> {
+    let mut request: libc::flock = unsafe { std::mem::zeroed() };
+    request.l_type = (if exclusive {
+        libc::F_WRLCK
+    } else {
+        libc::F_RDLCK
+    }) as i16;
+    request.l_whence = libc::SEEK_SET as i16;
+    let cmd = if wait {
+        libc::F_OFD_SETLKW
+    } else {
+        libc::F_OFD_SETLK
+    };
+    // SAFETY: `request` is a fully initialized flock for the
+    // whole file; the descriptor remains open in `file`.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &request) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if !wait && matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EACCES)) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+struct LockedFile {
+    file: File,
+}
+
+impl LockedFile {
+    fn read_snapshot(&self) -> std::io::Result<SharedRecord> {
+        use std::os::unix::fs::FileExt;
+
+        let len = self.file.metadata()?.len();
+        if len < FRAME_HEADER_BYTES as u64 {
+            return Err(invalid_data("shared-record: short frame header"));
+        }
+        if len > (FRAME_HEADER_BYTES + MAX_ENCODED_BYTES) as u64 {
+            return Err(invalid_data("shared-record: frame exceeds snapshot cap"));
+        }
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        self.file.read_exact_at(&mut header, 0)?;
+        let payload_len = u64::from_le_bytes(header);
+        if payload_len > MAX_ENCODED_BYTES as u64 {
+            return Err(invalid_data("shared-record: snapshot payload over cap"));
+        }
+        if len != FRAME_HEADER_BYTES as u64 + payload_len {
+            return Err(invalid_data("shared-record: frame length mismatch"));
+        }
+        let mut payload = vec![0u8; payload_len as usize];
+        self.file
+            .read_exact_at(&mut payload, FRAME_HEADER_BYTES as u64)?;
+        SharedRecord::decode(&payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    fn write_snapshot(&self, record: &SharedRecord) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let payload = record
+            .encode()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut framed = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
+        framed.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        self.file.write_all_at(&framed, 0)?;
+        self.file.set_len(framed.len() as u64)
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        let mut request: libc::flock = unsafe { std::mem::zeroed() };
+        request.l_type = libc::F_UNLCK as i16;
+        request.l_whence = libc::SEEK_SET as i16;
+        // SAFETY: best-effort unlock of this open description;
+        // closing the File immediately afterwards would also
+        // release an OFD lock.
+        let _ = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_OFD_SETLK, &request) };
+    }
+}
+
+/// Optional UTS `(nodename, domainname)` pair from one snapshot.
+pub type UtsPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// A launcher-created memfd carrying one whole `SharedRecord`
+/// snapshot. The file is intentionally rewritten under lock
+/// instead of becoming a shared-memory layout: snapshot size
+/// is bounded at 1 MiB, and all current mutation sites are
+/// exec/fork/UTS transitions rather than the syscall hot path.
+///
+/// `fd` is borrowed for the process lifetime and is never
+/// closed by this handle. Every operation instead reopens
+/// `/proc/self/fd/<fd>`, yielding a distinct open file
+/// description for OFD locking, and validates that its
+/// `(st_dev, st_ino)` still equals the identity recorded when
+/// the handle was created/adopted. Closing or replacing this
+/// hosting process's number therefore fails closed to
+/// callers' process-local fallbacks rather than writing some
+/// other file. That is the in-guest guest-visible case; a
+/// ptrace guest has a separate descriptor table from the
+/// tracer-hosted Tool.
+pub struct SharedRecordFile {
+    fd: RawFd,
+    identity: FileIdentity,
+}
+
+impl SharedRecordFile {
+    pub fn create() -> std::io::Result<Self> {
+        let name = std::ffi::CString::new("literoot-shared-record").unwrap();
+        // SAFETY: the name is NUL-terminated for the call. No
+        // MFD_CLOEXEC: descendants and guest execs must inherit.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let identity = match identity_of_fd(fd) {
+            Ok(identity) => identity,
+            Err(err) => {
+                // SAFETY: creation just made this descriptor and
+                // no other owner exists yet on this error path.
+                unsafe { libc::close(fd) };
+                return Err(err);
+            }
+        };
+        let store = Self { fd, identity };
+        if let Err(err) = store.replace(&SharedRecord::new()) {
+            // SAFETY: creation just made this descriptor and no
+            // other owner exists yet on this error path.
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        Ok(store)
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var(SHARED_RECORD_FD_ENV).ok()?;
+        Self::from_env_value(Some(&raw))
+    }
+
+    fn from_env_value(raw: Option<&str>) -> Option<Self> {
+        let fd: RawFd = raw?.parse().ok()?;
+        if fd < 0 {
+            return None;
+        }
+        let store = Self {
+            fd,
+            identity: identity_of_fd(fd).ok()?,
+        };
+        // Establishing the expected file's identity is part of
+        // adoption: a malformed or replaced descriptor is
+        // absent, not a partially trusted store.
+        store.snapshot().ok()?;
+        Some(store)
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    fn open_locked(&self, exclusive: bool) -> std::io::Result<LockedFile> {
+        self.open_locked_wait(exclusive, true)?
+            .ok_or_else(|| invalid_data("shared-record: lock unexpectedly unavailable"))
+    }
+
+    fn open_locked_wait(&self, exclusive: bool, wait: bool) -> std::io::Result<Option<LockedFile>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", self.fd))?;
+        // Check identity before locking/writing anything: a
+        // guest may have replaced the inherited number with a
+        // descriptor for an unrelated file.
+        if file_identity(&file)? != self.identity {
+            return Err(invalid_data("shared-record: file identity mismatch"));
+        }
+        if lock_file(&file, exclusive, wait)? {
+            Ok(Some(LockedFile { file }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(test)]
+    fn try_lock_exclusive_for_test(&self) -> std::io::Result<Option<LockedFile>> {
+        self.open_locked_wait(true, false)
+    }
+
+    pub fn snapshot(&self) -> std::io::Result<SharedRecord> {
+        self.open_locked(false)?.read_snapshot()
+    }
+
+    pub fn replace(&self, record: &SharedRecord) -> std::io::Result<()> {
+        self.open_locked(true)?.write_snapshot(record)
+    }
+
+    pub fn publish(&self, record: ProcessRecord) -> std::io::Result<()> {
+        let locked = self.open_locked(true)?;
+        let mut snapshot = locked.read_snapshot()?;
+        snapshot
+            .publish(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        locked.write_snapshot(&snapshot)
+    }
+
+    pub fn publish_exec_state(&self, id: ProcessId, state: &ExecState) -> std::io::Result<()> {
+        let row = ProcessRecord::from_exec_state(id, state)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        self.publish(row)
+    }
+
+    pub fn lookup(&self, id: ProcessId) -> std::io::Result<Option<ProcessRecord>> {
+        Ok(self.snapshot()?.lookup(id).cloned())
+    }
+
+    pub fn remove(&self, id: ProcessId) -> std::io::Result<bool> {
+        let locked = self.open_locked(true)?;
+        let mut snapshot = locked.read_snapshot()?;
+        let removed = snapshot.remove(id);
+        if removed {
+            locked.write_snapshot(&snapshot)?;
+        }
+        Ok(removed)
+    }
+
+    pub fn uts(&self) -> std::io::Result<UtsPair> {
+        let snapshot = self.snapshot()?;
+        Ok((snapshot.uts_nodename, snapshot.uts_domainname))
+    }
+
+    pub fn set_uts_nodename(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
+        let locked = self.open_locked(true)?;
+        let mut snapshot = locked.read_snapshot()?;
+        snapshot
+            .set_uts_nodename(name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        locked.write_snapshot(&snapshot)
+    }
+
+    pub fn set_uts_domainname(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
+        let locked = self.open_locked(true)?;
+        let mut snapshot = locked.read_snapshot()?;
+        snapshot
+            .set_uts_domainname(name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        locked.write_snapshot(&snapshot)
+    }
+}
+
+static SHARED_RECORD_FILE: OnceLock<Option<SharedRecordFile>> = OnceLock::new();
+
+/// Register the launcher-created store in the launcher/tracer
+/// process. Returns false if a store was already registered.
+pub fn init_shared_record_file(store: SharedRecordFile) -> bool {
+    SHARED_RECORD_FILE.set(Some(store)).is_ok()
+}
+
+/// The registered store, or the inherited env-named store in a
+/// successor process. Initialization captures the descriptor's
+/// file identity before ordinary guest execution; later close,
+/// replacement, or environment loss yields `None` on the next
+/// store call (or no store at all), never a guessed descriptor.
+pub fn shared_record_file() -> Option<&'static SharedRecordFile> {
+    SHARED_RECORD_FILE
+        .get_or_init(SharedRecordFile::from_env)
+        .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,6 +1101,247 @@ mod tests {
             .publish(big)
             .expect("publish itself has no byte-size cap");
         assert_eq!(record.encode(), Err(SharedRecordError::TooLarge));
+    }
+
+    #[test]
+    fn file_store_is_visible_across_handles_and_rejects_replaced_fd() {
+        let first = SharedRecordFile::create().expect("create shared-record memfd");
+        let second = SharedRecordFile {
+            fd: first.fd(),
+            identity: first.identity,
+        };
+        first.publish(row(42, 900, b"/bin/sh")).expect("publish");
+        first
+            .set_uts_nodename(Some(b"guest-a".to_vec()))
+            .expect("set UTS");
+        assert_eq!(
+            second
+                .lookup(ProcessId::new(42, 900).unwrap())
+                .expect("lookup"),
+            Some(row(42, 900, b"/bin/sh"))
+        );
+        assert_eq!(
+            second.uts().expect("read UTS"),
+            (Some(b"guest-a".to_vec()), None)
+        );
+        assert!(second
+            .remove(ProcessId::new(42, 900).unwrap())
+            .expect("remove"));
+        assert_eq!(
+            first
+                .lookup(ProcessId::new(42, 900).unwrap())
+                .expect("lookup removed"),
+            None
+        );
+
+        let unrelated = SharedRecordFile::create().expect("create unrelated memfd");
+        let replaced = SharedRecordFile {
+            fd: unrelated.fd(),
+            identity: first.identity,
+        };
+        assert_eq!(
+            replaced
+                .snapshot()
+                .expect_err("replaced fd must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        // The handles intentionally do not own/close the raw fd;
+        // dropping them keeps both memfds for the test process.
+    }
+
+    #[test]
+    fn file_store_adoption_rejects_missing_malformed_and_closed_env_fd() {
+        assert!(SharedRecordFile::from_env_value(None).is_none());
+        assert!(SharedRecordFile::from_env_value(Some("not-a-fd")).is_none());
+        assert!(SharedRecordFile::from_env_value(Some("-1")).is_none());
+
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.publish(row(42, 900, b"/bin/sh")).expect("publish");
+        let adopted = SharedRecordFile::from_env_value(Some(&store.fd().to_string()))
+            .expect("adopt valid env fd");
+        assert_eq!(
+            adopted
+                .lookup(ProcessId::new(42, 900).unwrap())
+                .expect("lookup adopted"),
+            Some(row(42, 900, b"/bin/sh"))
+        );
+
+        // A descriptor that is open but is not a framed snapshot
+        // is absent, never a partially trusted store.
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert!(SharedRecordFile::from_env_value(Some(&null.as_raw_fd().to_string())).is_none());
+
+        // Allocate the closed-fd probe above the ordinary
+        // lowest-free range so another parallel test's ordinary
+        // open does not immediately reuse this exact number.
+        let mut closed = unsafe { libc::fcntl(store.fd(), libc::F_DUPFD_CLOEXEC, 512) };
+        if closed < 0 {
+            closed = unsafe { libc::dup(store.fd()) };
+        }
+        assert!(
+            closed >= 0,
+            "dup closed-fd probe: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(unsafe { libc::close(closed) }, 0);
+        assert!(SharedRecordFile::from_env_value(Some(&closed.to_string())).is_none());
+    }
+
+    #[test]
+    fn file_store_fails_closed_after_guest_dup2_and_close_range() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.publish(row(42, 900, b"/bin/sh")).expect("publish");
+        let adopted_fd = unsafe { libc::dup(store.fd()) };
+        assert!(
+            adopted_fd >= 0,
+            "dup adopted fd: {}",
+            std::io::Error::last_os_error()
+        );
+        let adopted = SharedRecordFile {
+            fd: adopted_fd,
+            identity: store.identity,
+        };
+        assert_eq!(
+            adopted
+                .lookup(ProcessId::new(42, 900).unwrap())
+                .expect("lookup before guest fd ops"),
+            Some(row(42, 900, b"/bin/sh"))
+        );
+
+        let unrelated = SharedRecordFile::create().expect("create unrelated memfd");
+        assert_eq!(
+            unsafe { libc::dup2(unrelated.fd(), adopted_fd) },
+            adopted_fd
+        );
+        assert_eq!(
+            adopted
+                .snapshot()
+                .expect_err("dup2 replacement must fail closed")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            adopted
+                .publish(row(43, 901, b"/bin/evil"))
+                .expect_err("publish through replaced fd must fail closed")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            unrelated.snapshot().expect("unrelated snapshot"),
+            SharedRecord::new()
+        );
+
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                adopted_fd as libc::c_uint,
+                adopted_fd as libc::c_uint,
+                0 as libc::c_uint,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "close_range adopted fd: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            adopted.snapshot().is_err(),
+            "closed adopted fd must be unavailable"
+        );
+    }
+
+    #[test]
+    fn ofd_lock_survives_closing_unrelated_fd_for_same_memfd() {
+        use std::sync::mpsc;
+
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let raw_fd = store.fd();
+        let identity = store.identity;
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = store
+                .try_lock_exclusive_for_test()
+                .expect("try lock")
+                .expect("initial OFD lock is free");
+            locked_tx.send(()).expect("report lock held");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        locked_rx.recv().expect("holder reports lock");
+
+        let unrelated = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{raw_fd}"))
+            .expect("open unrelated description");
+        drop(unrelated);
+
+        let contender = SharedRecordFile {
+            fd: raw_fd,
+            identity,
+        };
+        assert!(
+            contender
+                .try_lock_exclusive_for_test()
+                .expect("contender try lock")
+                .is_none(),
+            "OFD lock must survive closing an unrelated descriptor"
+        );
+        release_tx.send(()).expect("release holder");
+        holder.join().expect("holder thread");
+        assert!(contender
+            .try_lock_exclusive_for_test()
+            .expect("retake lock")
+            .is_some());
+    }
+
+    #[test]
+    fn file_store_accepts_exact_snapshot_cap_and_rejects_one_byte_over() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let mut record = SharedRecord::new();
+        let mut row = row(1, 1, b"/bin/big");
+        row.argv = vec![Vec::new()];
+        record.publish(row.clone()).expect("publish boundary row");
+        let overhead = record.encode().expect("encode boundary base").len();
+        row.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record.publish(row.clone()).expect("publish exact cap row");
+        assert_eq!(
+            record.encode().expect("encode exact cap").len(),
+            MAX_ENCODED_BYTES
+        );
+        store.replace(&record).expect("store exact cap snapshot");
+        assert_eq!(store.snapshot().expect("load exact cap"), record);
+
+        row.argv[0].push(b'x');
+        let mut too_big = SharedRecord::new();
+        too_big
+            .publish(row)
+            .expect("publish itself has no aggregate cap");
+        let err = store.replace(&too_big).expect_err("cap+1 must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(store.snapshot().expect("previous snapshot remains"), record);
+    }
+
+    #[test]
+    fn file_store_rejects_oversized_frame_without_rewriting_previous_snapshot() {
+        use std::os::unix::fs::FileExt;
+
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let good = sample();
+        store.replace(&good).expect("store good snapshot");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", store.fd()))
+            .expect("reopen memfd");
+        file.write_all_at(&((MAX_ENCODED_BYTES + 1) as u64).to_le_bytes(), 0)
+            .expect("write oversized frame header");
+        let err = store.snapshot().expect_err("oversized frame must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

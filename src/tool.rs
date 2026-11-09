@@ -230,6 +230,22 @@ fn run_backend(
     if gen_fd >= 0 {
         cmd.env("LITEROOT_PROBE_GEN_FD", gen_fd.to_string());
     }
+    // Cross-process facts memfd: the launcher owns creation,
+    // registers the same handle for ptrace Tools in this
+    // process, and passes the inherited descriptor number to
+    // the guest tree. Failure is a named absence: consumers
+    // retain today's process-local maps/statics.
+    match crate::shared_record::SharedRecordFile::create() {
+        Ok(store) => {
+            let fd = store.fd();
+            if crate::shared_record::init_shared_record_file(store) {
+                cmd.env(crate::shared_record::SHARED_RECORD_FD_ENV, fd.to_string());
+            }
+        }
+        Err(err) => {
+            eprintln!("literoot: shared record unavailable: {err}");
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

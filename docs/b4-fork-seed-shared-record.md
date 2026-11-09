@@ -1,15 +1,15 @@
-# B4 fork seed and shared-record codec slice
+# B4 fork seed and shared record
 
 ## Status and dependency
 
-This slice is stacked only on B4-1's reviewed head
-(`41e790a`, containing canonical `ExecState` at `15840f4`).
-B4-1 admission is still pending, so this slice deliberately
-contains no syscall subscriptions, no Tool dispatch changes,
-no successor/exec-stop/loader wiring, and absolutely no
-arming of `exec_watch`. It is a design plus pure codec layer
-that later fork and transport work can call without changing
-either wire format casually.
+This document records the B4 stack in order: the codec
+slice on B4-1's reviewed head (`41e790a`, containing
+canonical `ExecState` at `15840f4`), the fork-wiring slice
+that stages and applies those seeds, and the first
+shared-record transport and consumers below. The stack
+adds no successor/exec-stop/loader format and absolutely
+no arming of `exec_watch`; later transport work must not
+change either wire format casually.
 
 ## Fork seed
 
@@ -51,8 +51,8 @@ seed in the existing pending slot. The already-landed
 step-4 pending clone into `init_thread_state`, parent clear
 after inject, and `handle_thread_start` application are
 unchanged; this slice only replaces how the staged fork
-snapshot is captured. It does not publish or read
-`SharedRecord` rows in production yet.
+snapshot is captured. See "First shared-record transport"
+below for the now-wired publication/consumption slice.
 
 ## Shared-record snapshot
 
@@ -87,9 +87,66 @@ memory while snapshot encoding refuses the whole record
 so a bootstrap transport must surface or resolve that named
 refusal itself.
 
-## Transport direction (not wired here)
+## First shared-record transport
 
-The snapshot bytes are an exchange/bootstrap form, not a
+`SharedRecordFile` is the first transport. The launcher
+creates one memfd, initializes it with an empty snapshot,
+registers it for Tools hosted in the launcher process, and
+passes its number through `LITEROOT_SHARED_RECORD_FD`
+following the existing probe-generation fd precedent. The
+file holds one whole length-framed snapshot, not an
+in-place shared-memory layout. The snapshot payload cap is
+`MAX_ENCODED_BYTES` = 1 MiB (plus the 8-byte frame header,
+so a 1,048,584-byte file at most), with at most 4096
+process rows. Each operation reopens `/proc/self/fd/<fd>`
+so it locks a distinct open file description with Linux
+OFD locks, then reloads or rewrites the bounded snapshot
+while holding that lock. The exact 1 MiB payload is stored;
+one byte over refuses without replacing the previous
+snapshot.
+
+The handle records `(st_dev, st_ino)` when created/adopted
+and validates the reopened file before locking or writing.
+The descriptor it checks is the one in the process hosting
+the Tool. In an in-guest process that is also the guest's
+descriptor table: if guest code closes the inherited
+number, `dup2`s another file over it, closes it through
+close_range, or scrubs the environment before exec, there
+is no guessed descriptor, record operations are
+unavailable, and each consumer retains today's
+process-local behavior. Under ptrace the Tool's descriptor
+is in the tracer, so a guest closing its own inherited copy
+does not disable the tracer's consumers. In every backend,
+a guest that deliberately writes through its copy can
+still corrupt the framed snapshot; strict decoding makes
+consumers fail closed to their process-local fallbacks. The
+inherited
+probe-generation descriptor is narrower: `translate.rs`
+already falls back when its env is scrubbed or the fd was
+closed before first use, and after the first-use mmap the
+fd number no longer matters. It does not identity-check a
+replacement made before that mmap; that is follow-up
+`dh-n6pie`, not part of this slice.
+
+Publication is from the Tool's current accessor-materialized
+exe/argv and is keyed by the host `/proc/<pid>/stat` start
+time. It happens after a fork-seed restore in
+`handle_thread_start` and after each successful post-exec
+transition. Other-process synthetic `/proc/<pid>/exe` and
+cmdline lookups consult the shared row first, then today's
+detached bare-pid maps. UTS setters write both today's
+statics and the shared fields; the uname reader prefers a
+shared field when present and otherwise retains that
+field's existing static, so a refused shared write does not
+erase the process-local value. There is intentionally
+no process-exit reaping hook in this slice: qualified
+identities make stale rows non-aliasing, while removal, a
+sealed/atomic in-place layout, and permission hardening are
+later transport work.
+
+## Transport direction (later slices)
+
+The snapshot bytes remain an exchange/bootstrap form, not a
 proposed in-place shared-memory layout. A future transport
 may carry this snapshot once at admission, or translate its
 rows into an inherited-memfd directory following the probe
@@ -100,15 +157,20 @@ now:
    `ExecState` has been restored (or at initial launch from
    an equivalent current-image capture).
 2. Lookups for another process must match both pid and start
-   time; failure to find that qualified row is absence, not
-   permission to fall back to a bare-pid row.
+   time; failure to find that qualified row is absence from
+   `SharedRecord`, never permission to match a bare-pid row
+   inside it. The first consumers retain today's separate
+   bare-pid maps as a transitional fallback when the store
+   or qualified row is unavailable; removing that fallback
+   after publication covers clone windows is later work.
 3. UTS writes replace the shared field as one value; they
    are never snapshotted into `ExecState`, because a sibling
    update after fork/exec must remain visible.
-4. Reaping/removal, the start-time source, locking or atomic
-   row publication, sealing, and who creates any memfd are
-   transport-slice questions. They must be answered there;
-   this codec does not pretend a copied snapshot stays live.
+4. The first transport answers the start-time source
+   (`/proc/<pid>/stat`), OFD locking, and launcher memfd
+   creation above. Reaping/removal, an atomic in-place row
+   layout, and sealing remain later transport work; this
+   codec does not pretend a copied snapshot stays live.
 
 The exec transports likewise remain as designed for B4:
 native W6a carries `ExecState` in the sealed thread-state
@@ -119,17 +181,17 @@ second per-process state format.
 
 ## Non-goals and next slices
 
-- No fork syscall interception or child Tool application is
-  wired in this slice; it only proves the fork-seed capture
-  semantics and encoding.
-- No shared memory, file, socket, RPC, or supervisor state
-  is introduced.
-- No PID/UTS consumers switch from today's ptrace-process
-  statics to `SharedRecord` yet.
+- No process-exit reaping, sealed file, atomic in-place
+  layout, or guest-fd virtualization is introduced; the
+  whole-snapshot memfd and fail-closed identity checks are
+  the first transport only.
+- The transitional bare-pid map and UTS-static fallbacks
+  remain where named above, rather than being deleted in
+  the same slice that first publishes shared rows.
 - No `exec_watch` arming and no dependency on P1-P3.
 
-Next slices can therefore be reviewed independently: fork
-wiring consuming `capture_fork_seed`, then a transport that
-instantiates or imports `SharedRecord`, then switching
-`PID_EXE`/`PID_ARGV`/UTS readers and writers to it with the
-existing ptrace suite as the non-regression anchor.
+Next slices can therefore be reviewed independently:
+reaping and permission hardening, publication that closes
+clone windows so the bare-pid fallback can be removed, and
+any atomic in-place layout that replaces whole-snapshot
+rewrites.
