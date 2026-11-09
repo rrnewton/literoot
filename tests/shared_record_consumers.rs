@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GUEST_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -67,6 +68,10 @@ static void print_observed(pid_t pid) {
 }
 
 static int child_image(void) {
+    if (getenv("SR_FAILED_EXEC") != NULL) {
+        char *argv[] = {(char *)"bogus", (char *)"zzz", NULL};
+        execve("/bin/nonexist", argv, environ);
+    }
     const char *fd_text = getenv("SR_READY_FD");
     if (fd_text != NULL) {
         (void)write_byte(atoi(fd_text), 'R');
@@ -105,6 +110,29 @@ static int observe(int do_exec) {
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return 104;
     return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 105;
+}
+
+static int uts_length(void) {
+    char node65[66];
+    char domain65[66];
+    memset(node65, 'N', 65);
+    node65[65] = '\0';
+    memset(domain65, 'D', 65);
+    domain65[65] = '\0';
+    if (sethostname("first", 5) != 0) return 501;
+    if (setdomainname("domfirst", 8) != 0) return 502;
+    errno = 0;
+    int rc_node = sethostname(node65, 65);
+    int errno_node = errno;
+    errno = 0;
+    int rc_domain = setdomainname(domain65, 65);
+    int errno_domain = errno;
+    struct utsname uts;
+    if (uname(&uts) != 0) return 503;
+    printf("uts=%s|%s rc_node=%d errno_node=%d rc_domain=%d errno_domain=%d\n",
+           uts.nodename, uts.domainname, rc_node, errno_node, rc_domain, errno_domain);
+    fflush(stdout);
+    return 0;
 }
 
 static int uts_observe(void) {
@@ -205,6 +233,7 @@ int main(void) {
     const char *mode = getenv("SR_MODE");
     if (mode == NULL || strcmp(mode, "observe-fork") == 0) return observe(0);
     if (strcmp(mode, "observe-exec") == 0) return observe(1);
+    if (strcmp(mode, "uts-length") == 0) return uts_length();
     if (strcmp(mode, "uts-observe") == 0) return uts_observe();
     if (strcmp(mode, "capfill") == 0) return capfill();
     if (strcmp(mode, "filler") == 0) return 0;
@@ -329,7 +358,10 @@ fn ptrace_parent_reads_fork_child_shared_exe_and_cmdline() {
         Some("ptrace"),
         false,
         &["/bin/sr", "argA"],
-        &[("SR_MODE", "observe-fork")],
+        &[
+            ("SR_MODE", "observe-fork"),
+            ("LITEROOT_SHARED_RECORD_FD", "7"),
+        ],
         None,
     );
     assert!(
@@ -409,6 +441,76 @@ fn inguest_parent_sees_child_hostname_and_shared_row() {
         stdout.contains("observed exe=/bin/sr cmdline=/bin/sr|argA|"),
         "shared fork row not consumed in-guest: stdout={stdout:?} stderr={stderr:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ptrace_parent_keeps_successful_exec_row_after_failed_exec() {
+    if !fixture_libs_available() {
+        return;
+    }
+    let dir = base_dir("ptrace-failed-exec");
+    let guest = build_guest(&dir);
+    let root = dir.join("root");
+    make_root(&root, &guest);
+    let (stdout, stderr, status) = run_literoot(
+        &root,
+        Some("ptrace"),
+        false,
+        &["/bin/sr", "argA"],
+        &[
+            ("SR_MODE", "observe-exec"),
+            ("SR_EXEC_PATH", "/bin/h"),
+            ("SR_FAILED_EXEC", "1"),
+        ],
+        None,
+    );
+    assert!(
+        status.success(),
+        "status={status} stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("observed exe=/bin/h cmdline=renamed|argA|"),
+        "failed exec must not replace the successful shared row: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn overlong_uts_names_return_einval_and_leave_both_fields_unchanged() {
+    if !fixture_libs_available() {
+        return;
+    }
+    let dir = base_dir("uts-length");
+    let guest = build_guest(&dir);
+    for (name, backend, preload) in [
+        ("ptrace", Some("ptrace"), None),
+        ("liteinst", Some("liteinst"), preload_path()),
+    ] {
+        if backend == Some("liteinst") && preload.is_none() {
+            continue;
+        }
+        let root = dir.join(format!("root-{name}"));
+        make_root(&root, &guest);
+        let (stdout, stderr, status) = run_literoot(
+            &root,
+            backend,
+            true,
+            &["/bin/sr"],
+            &[("SR_MODE", "uts-length")],
+            preload.as_deref(),
+        );
+        assert!(
+            status.success(),
+            "{name}: status={status} stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains(
+                "uts=first|domfirst rc_node=-1 errno_node=22 rc_domain=-1 errno_domain=22"
+            ),
+            "{name}: overlong UTS write was not EINVAL/unchanged: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

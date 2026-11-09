@@ -245,9 +245,7 @@ fn run_backend(
             let fd = store.fd();
             if !in_guest {
                 if let Err(err) = store.set_close_on_exec() {
-                    eprintln!(
-                        "literoot: shared record close-on-exec unavailable: {err}"
-                    );
+                    eprintln!("literoot: shared record close-on-exec unavailable: {err}");
                 }
             }
             if crate::shared_record::init_shared_record_file(store) && in_guest {

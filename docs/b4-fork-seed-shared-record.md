@@ -106,8 +106,14 @@ distinct open file description with a non-blocking Linux
 OFD lock, then reloads or rewrites the bounded snapshot
 while holding that lock. Contention retries with a yield
 and bounded exponential sleep for at most five seconds,
-rather than parking in `F_OFD_SETLKW`; after that the
-operation fails closed to the caller's local fallback.
+rather than parking in `F_OFD_SETLKW`. After that a read
+fails closed to the caller's local fallback. A timed-out
+write records a per-process pending repair (remove its
+row or clear its UTS field): this process's consumers
+overlay that repair immediately, and it is persisted at
+the next successful write or opportunistically acquired
+lock on a later read. Another process can still see the
+previous shared value until that repair is persisted.
 The exact 1 MiB payload is stored; a whole-record replace
 one byte over refuses without replacing the previous
 snapshot.
@@ -147,11 +153,20 @@ lookups consult the shared row first, then today's
 detached bare-pid maps. If a publish is refused at the
 snapshot cap, the store removes that qualified row before
 returning the error and the Tool reports the refusal, so a
-stale exec image cannot outrank process-local state.
-UTS setters write both today's statics and the shared
-fields; a refused shared UTS write clears that shared
-field, reports the refusal, and the uname reader then
-retains the field's existing static. There is intentionally
+stale exec image cannot outrank process-local state. A
+publish that times out on the lock instead records the
+pending row removal above. UTS setters first return
+`EINVAL` for a guest length over 64 bytes, before touching
+either store. Otherwise they write both today's statics
+and the shared fields; a refused shared UTS write clears
+that shared field (or records the pending clear on a lock
+timeout), reports the refusal, and the uname reader then
+retains the field's existing static. Refusal reports are
+rate-limited per category in each Tool-host process: the
+first and every hundredth print, with intermediate counts
+suppressed. Under ptrace they go to the tracer's stderr;
+in-guest they go to the guest process's own fd 2. There is
+intentionally
 no process-exit reaping hook in this slice: qualified
 identities make stale rows non-aliasing, while removal, a
 sealed/atomic in-place layout, and permission hardening are

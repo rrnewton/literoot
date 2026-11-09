@@ -31,7 +31,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::exec_state::{ExecState, ExecStateError};
-use crate::shared_record::{ProcessId, ProcessRecord, shared_record_file};
+use crate::shared_record::{
+    ProcessId, ProcessRecord, shared_record_file, MAX_UTS_BYTES,
+};
 use crate::translate::{Bind, RootConfig};
 
 /// Serializable launch config (GlobalTool::Config).
@@ -193,6 +195,76 @@ pub struct RootfsThreadState {
     pub pending: Option<ExecState>,
 }
 
+#[derive(Clone, Copy)]
+enum RefusalCategory {
+    Publish,
+    UtsNodename,
+    UtsDomainname,
+}
+
+impl RefusalCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::UtsNodename => "UTS nodename write",
+            Self::UtsDomainname => "UTS domainname write",
+        }
+    }
+}
+
+/// Per-category refusal counts for this Tool-host process.
+/// The first refusal and every hundredth are reported; all
+/// intermediate refusals are counted and suppressed. Rows
+/// are not reaped yet, so unconditional reporting would
+/// otherwise print on every fork/exec after the store fills.
+struct RefusalReporter {
+    publish: std::sync::atomic::AtomicU64,
+    nodename: std::sync::atomic::AtomicU64,
+    domainname: std::sync::atomic::AtomicU64,
+}
+
+impl RefusalReporter {
+    const fn new() -> Self {
+        Self {
+            publish: std::sync::atomic::AtomicU64::new(0),
+            nodename: std::sync::atomic::AtomicU64::new(0),
+            domainname: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn message(&self, category: RefusalCategory, detail: &str) -> Option<String> {
+        let counter = match category {
+            RefusalCategory::Publish => &self.publish,
+            RefusalCategory::UtsNodename => &self.nodename,
+            RefusalCategory::UtsDomainname => &self.domainname,
+        };
+        let before = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if before == 0 {
+            Some(format!(
+                "literoot: shared record {} refused: {detail}",
+                category.label()
+            ))
+        } else if before % 100 == 99 {
+            Some(format!(
+                "literoot: shared record {} refused: {detail} \
+                 ({} refusals so far; intermediate reports suppressed)",
+                category.label(),
+                before + 1
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+static SHARED_RECORD_REFUSALS: RefusalReporter = RefusalReporter::new();
+
+fn report_shared_record_refusal(category: RefusalCategory, detail: String) {
+    if let Some(message) = SHARED_RECORD_REFUSALS.message(category, &detail) {
+        eprintln!("{message}");
+    }
+}
+
 impl RootfsTool {
     /// Reconstruct a Tool from a predecessor snapshot. The
     /// successor consumer seam (B4 step 3) builds on this; B4-1
@@ -281,9 +353,9 @@ impl RootfsTool {
             argv: self.current_argv(guest.config()),
         };
         if let Err(err) = store.publish(row) {
-            eprintln!(
-                "literoot: shared record publish refused for pid {}: {err}",
-                id.pid
+            report_shared_record_refusal(
+                RefusalCategory::Publish,
+                format!("for pid {}: {err}", id.pid),
             );
         }
     }
@@ -296,8 +368,9 @@ impl RootfsTool {
     fn set_shared_uts_nodename(name: Vec<u8>) {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_nodename(Some(name)) {
-                eprintln!(
-                    "literoot: shared record UTS nodename write refused: {err}"
+                report_shared_record_refusal(
+                    RefusalCategory::UtsNodename,
+                    err.to_string(),
                 );
             }
         }
@@ -306,8 +379,9 @@ impl RootfsTool {
     fn set_shared_uts_domainname(name: Vec<u8>) {
         if let Some(store) = shared_record_file() {
             if let Err(err) = store.set_uts_domainname(Some(name)) {
-                eprintln!(
-                    "literoot: shared record UTS domainname write refused: {err}"
+                report_shared_record_refusal(
+                    RefusalCategory::UtsDomainname,
+                    err.to_string(),
                 );
             }
         }
@@ -2346,6 +2420,9 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::Sethostname(sh) => {
+                if sh.len() > MAX_UTS_BYTES {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 if self.fake_ids(guest).is_some() {
                     if let Some(name) = sh.name() {
                         let mut v = vec![0u8; sh.len()];
@@ -2365,6 +2442,9 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setdomainname(sd) => {
+                if sd.len() > MAX_UTS_BYTES {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 if self.fake_ids(guest).is_some() {
                     if let Some(name) = sd.name() {
                         let mut v = vec![0u8; sd.len()];
@@ -4035,6 +4115,52 @@ mod tests {
         assert_eq!(child.pending, None);
         let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
         assert_eq!(root.pending, None);
+    }
+
+    #[test]
+    fn refusal_reporter_prints_first_and_every_hundredth_per_category() {
+        let reporter = RefusalReporter::new();
+        let first = reporter
+            .message(RefusalCategory::Publish, "for pid 42: full")
+            .expect("first publish refusal is reported");
+        assert!(
+            first.contains("shared record publish refused: for pid 42: full"),
+            "first message: {first}"
+        );
+        assert_eq!(
+            reporter.message(RefusalCategory::Publish, "for pid 43: full"),
+            None,
+            "second publish refusal must be suppressed"
+        );
+        assert!(
+            reporter
+                .message(RefusalCategory::UtsNodename, "full")
+                .is_some_and(|message| {
+                    message.contains("shared record UTS nodename write refused: full")
+                }),
+            "nodename has its own first report"
+        );
+        assert!(
+            reporter
+                .message(RefusalCategory::UtsDomainname, "full")
+                .is_some_and(|message| {
+                    message.contains("shared record UTS domainname write refused: full")
+                }),
+            "domainname has its own first report"
+        );
+        for _ in 0..97 {
+            assert_eq!(
+                reporter.message(RefusalCategory::Publish, "for pid 44: full"),
+                None
+            );
+        }
+        let hundredth = reporter
+            .message(RefusalCategory::Publish, "for pid 45: full")
+            .expect("hundredth publish refusal is summarized");
+        assert!(
+            hundredth.contains("100 refusals so far"),
+            "summary message: {hundredth}"
+        );
     }
 
     #[test]

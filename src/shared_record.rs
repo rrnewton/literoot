@@ -16,10 +16,11 @@
 //! that learns it (for example `stat` start-time ticks); this
 //! codec only preserves and compares the opaque value.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::exec_state::ExecState;
 
@@ -612,6 +613,41 @@ impl Drop for LockedFile {
 /// Optional UTS `(nodename, domainname)` pair from one snapshot.
 pub type UtsPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// Repairs owed after a write could not acquire the lock.
+/// They remove exactly the values that the timed-out write
+/// would have replaced, so a stale shared value cannot keep
+/// outranking this process's local state.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PendingRepairs {
+    clear_nodename: bool,
+    clear_domainname: bool,
+    remove_rows: BTreeSet<ProcessId>,
+}
+
+impl PendingRepairs {
+    fn is_empty(&self) -> bool {
+        !self.clear_nodename && !self.clear_domainname && self.remove_rows.is_empty()
+    }
+
+    fn merge(&mut self, other: PendingRepairs) {
+        self.clear_nodename |= other.clear_nodename;
+        self.clear_domainname |= other.clear_domainname;
+        self.remove_rows.extend(other.remove_rows);
+    }
+
+    fn apply_to(&self, snapshot: &mut SharedRecord) {
+        if self.clear_nodename {
+            snapshot.uts_nodename = None;
+        }
+        if self.clear_domainname {
+            snapshot.uts_domainname = None;
+        }
+        for id in &self.remove_rows {
+            snapshot.remove(*id);
+        }
+    }
+}
+
 /// A launcher-created memfd carrying one whole `SharedRecord`
 /// snapshot. The file is intentionally rewritten under lock
 /// instead of becoming a shared-memory layout: snapshot size
@@ -632,9 +668,18 @@ pub type UtsPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 pub struct SharedRecordFile {
     fd: RawFd,
     identity: FileIdentity,
+    pending: Mutex<PendingRepairs>,
 }
 
 impl SharedRecordFile {
+    fn from_fd_identity(fd: RawFd, identity: FileIdentity) -> Self {
+        Self {
+            fd,
+            identity,
+            pending: Mutex::new(PendingRepairs::default()),
+        }
+    }
+
     pub fn create() -> std::io::Result<Self> {
         let name = std::ffi::CString::new("literoot-shared-record").unwrap();
         // SAFETY: the name is NUL-terminated for the call. No
@@ -652,7 +697,7 @@ impl SharedRecordFile {
                 return Err(err);
             }
         };
-        let store = Self { fd, identity };
+        let store = Self::from_fd_identity(fd, identity);
         if let Err(err) = store.replace(&SharedRecord::new()) {
             // SAFETY: creation just made this descriptor and no
             // other owner exists yet on this error path.
@@ -672,10 +717,7 @@ impl SharedRecordFile {
         if fd < 0 {
             return None;
         }
-        let store = Self {
-            fd,
-            identity: identity_of_fd(fd).ok()?,
-        };
+        let store = Self::from_fd_identity(fd, identity_of_fd(fd).ok()?);
         // Establishing the expected file's identity is part of
         // adoption: a malformed or replaced descriptor is
         // absent, not a partially trusted store.
@@ -760,22 +802,100 @@ impl SharedRecordFile {
         self.open_locked_try(true)
     }
 
+    fn note_pending_row(&self, id: ProcessId) {
+        self.pending.lock().unwrap().remove_rows.insert(id);
+    }
+
+    fn note_pending_nodename(&self) {
+        self.pending.lock().unwrap().clear_nodename = true;
+    }
+
+    fn note_pending_domainname(&self) {
+        self.pending.lock().unwrap().clear_domainname = true;
+    }
+
+    fn take_pending_repairs_raw(&self) -> PendingRepairs {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+
+    fn take_pending_repairs(&self, snapshot: &mut SharedRecord) -> PendingRepairs {
+        let repairs = self.take_pending_repairs_raw();
+        repairs.apply_to(snapshot);
+        repairs
+    }
+
+    fn restore_pending_repairs(&self, repairs: PendingRepairs) {
+        if !repairs.is_empty() {
+            self.pending.lock().unwrap().merge(repairs);
+        }
+    }
+
+    fn pending_repairs(&self) -> PendingRepairs {
+        self.pending.lock().unwrap().clone()
+    }
+
+    fn try_apply_pending_repairs(&self) {
+        if self.pending_repairs().is_empty() {
+            return;
+        }
+        let Ok(Some(locked)) = self.open_locked_try(true) else {
+            return;
+        };
+        let Ok(mut snapshot) = locked.read_snapshot() else {
+            return;
+        };
+        let repairs = self.take_pending_repairs(&mut snapshot);
+        if locked.write_snapshot(&snapshot).is_err() {
+            self.restore_pending_repairs(repairs);
+        }
+    }
+
     pub fn snapshot(&self) -> std::io::Result<SharedRecord> {
         self.open_locked(false)?.read_snapshot()
     }
 
     pub fn replace(&self, record: &SharedRecord) -> std::io::Result<()> {
-        self.open_locked(true)?.write_snapshot(record)
+        let locked = self.open_locked(true)?;
+        let repairs = self.take_pending_repairs_raw();
+        if let Err(err) = locked.write_snapshot(record) {
+            self.restore_pending_repairs(repairs);
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn publish(&self, record: ProcessRecord) -> std::io::Result<()> {
-        let locked = self.open_locked(true)?;
-        let mut snapshot = locked.read_snapshot()?;
+        self.publish_with_timeout(record, LOCK_TIMEOUT)
+    }
+
+    fn publish_with_timeout(
+        &self,
+        record: ProcessRecord,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
         let id = record.id;
+        let locked = match self.open_locked_timeout(true, timeout) {
+            Ok(locked) => locked,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.note_pending_row(id);
+                }
+                return Err(err);
+            }
+        };
+        let mut snapshot = locked.read_snapshot()?;
+        let repairs = self.take_pending_repairs(&mut snapshot);
         if let Err(err) = snapshot.publish(record) {
             let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string());
-            if snapshot.remove(id) {
-                let _ = locked.write_snapshot(&snapshot);
+            let removed = snapshot.remove(id);
+            let cleanup_wrote = if removed || !repairs.is_empty() {
+                locked.write_snapshot(&snapshot).is_ok()
+            } else {
+                false
+            };
+            if !cleanup_wrote {
+                self.restore_pending_repairs(repairs);
+                self.note_pending_row(id);
             }
             return Err(err);
         }
@@ -785,8 +905,10 @@ impl SharedRecordFile {
             // snapshot is the previously valid one plus the
             // attempted replacement, so removing that row can
             // only shrink it back under the cap.
-            if snapshot.remove(id) {
-                let _ = locked.write_snapshot(&snapshot);
+            let cleanup_wrote = snapshot.remove(id) && locked.write_snapshot(&snapshot).is_ok();
+            if !cleanup_wrote {
+                self.restore_pending_repairs(repairs);
+                self.note_pending_row(id);
             }
             return Err(err);
         }
@@ -800,36 +922,102 @@ impl SharedRecordFile {
     }
 
     pub fn lookup(&self, id: ProcessId) -> std::io::Result<Option<ProcessRecord>> {
-        Ok(self.snapshot()?.lookup(id).cloned())
+        self.try_apply_pending_repairs();
+        let snapshot = self.snapshot()?;
+        if self.pending_repairs().remove_rows.contains(&id) {
+            return Ok(None);
+        }
+        Ok(snapshot.lookup(id).cloned())
     }
 
     pub fn remove(&self, id: ProcessId) -> std::io::Result<bool> {
-        let locked = self.open_locked(true)?;
+        self.remove_with_timeout(id, LOCK_TIMEOUT)
+    }
+
+    fn remove_with_timeout(
+        &self,
+        id: ProcessId,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<bool> {
+        let locked = match self.open_locked_timeout(true, timeout) {
+            Ok(locked) => locked,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.note_pending_row(id);
+                }
+                return Err(err);
+            }
+        };
         let mut snapshot = locked.read_snapshot()?;
+        let repairs = self.take_pending_repairs(&mut snapshot);
+        let pending_removed = repairs.remove_rows.contains(&id);
         let removed = snapshot.remove(id);
-        if removed {
-            locked.write_snapshot(&snapshot)?;
+        if removed || !repairs.is_empty() {
+            if let Err(err) = locked.write_snapshot(&snapshot) {
+                self.restore_pending_repairs(repairs);
+                if removed {
+                    self.note_pending_row(id);
+                }
+                return Err(err);
+            }
         }
-        Ok(removed)
+        Ok(removed || pending_removed)
     }
 
     pub fn uts(&self) -> std::io::Result<UtsPair> {
+        self.try_apply_pending_repairs();
         let snapshot = self.snapshot()?;
-        Ok((snapshot.uts_nodename, snapshot.uts_domainname))
+        let pending = self.pending_repairs();
+        Ok((
+            if pending.clear_nodename {
+                None
+            } else {
+                snapshot.uts_nodename
+            },
+            if pending.clear_domainname {
+                None
+            } else {
+                snapshot.uts_domainname
+            },
+        ))
     }
 
     pub fn set_uts_nodename(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
-        let locked = self.open_locked(true)?;
+        self.set_uts_nodename_with_timeout(name, LOCK_TIMEOUT)
+    }
+
+    fn set_uts_nodename_with_timeout(
+        &self,
+        name: Option<Vec<u8>>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        let locked = match self.open_locked_timeout(true, timeout) {
+            Ok(locked) => locked,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.note_pending_nodename();
+                }
+                return Err(err);
+            }
+        };
         let mut snapshot = locked.read_snapshot()?;
-        snapshot
-            .set_uts_nodename(name)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let repairs = self.take_pending_repairs(&mut snapshot);
+        if let Err(err) = snapshot.set_uts_nodename(name) {
+            self.restore_pending_repairs(repairs);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                err.to_string(),
+            ));
+        }
         if let Err(err) = locked.write_snapshot(&snapshot) {
             // Clearing the attempted field can only shrink the
             // previously valid snapshot, and prevents its stale
             // value from outranking the caller's local update.
-            if snapshot.set_uts_nodename(None).is_ok() {
-                let _ = locked.write_snapshot(&snapshot);
+            let cleanup_wrote =
+                snapshot.set_uts_nodename(None).is_ok() && locked.write_snapshot(&snapshot).is_ok();
+            if !cleanup_wrote {
+                self.restore_pending_repairs(repairs);
+                self.note_pending_nodename();
             }
             return Err(err);
         }
@@ -837,14 +1025,38 @@ impl SharedRecordFile {
     }
 
     pub fn set_uts_domainname(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
-        let locked = self.open_locked(true)?;
+        self.set_uts_domainname_with_timeout(name, LOCK_TIMEOUT)
+    }
+
+    fn set_uts_domainname_with_timeout(
+        &self,
+        name: Option<Vec<u8>>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        let locked = match self.open_locked_timeout(true, timeout) {
+            Ok(locked) => locked,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    self.note_pending_domainname();
+                }
+                return Err(err);
+            }
+        };
         let mut snapshot = locked.read_snapshot()?;
-        snapshot
-            .set_uts_domainname(name)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let repairs = self.take_pending_repairs(&mut snapshot);
+        if let Err(err) = snapshot.set_uts_domainname(name) {
+            self.restore_pending_repairs(repairs);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                err.to_string(),
+            ));
+        }
         if let Err(err) = locked.write_snapshot(&snapshot) {
-            if snapshot.set_uts_domainname(None).is_ok() {
-                let _ = locked.write_snapshot(&snapshot);
+            let cleanup_wrote = snapshot.set_uts_domainname(None).is_ok()
+                && locked.write_snapshot(&snapshot).is_ok();
+            if !cleanup_wrote {
+                self.restore_pending_repairs(repairs);
+                self.note_pending_domainname();
             }
             return Err(err);
         }
@@ -1181,10 +1393,7 @@ mod tests {
     #[test]
     fn file_store_is_visible_across_handles_and_rejects_replaced_fd() {
         let first = SharedRecordFile::create().expect("create shared-record memfd");
-        let second = SharedRecordFile {
-            fd: first.fd(),
-            identity: first.identity,
-        };
+        let second = SharedRecordFile::from_fd_identity(first.fd(), first.identity);
         first.publish(row(42, 900, b"/bin/sh")).expect("publish");
         first
             .set_uts_nodename(Some(b"guest-a".to_vec()))
@@ -1210,10 +1419,7 @@ mod tests {
         );
 
         let unrelated = SharedRecordFile::create().expect("create unrelated memfd");
-        let replaced = SharedRecordFile {
-            fd: unrelated.fd(),
-            identity: first.identity,
-        };
+        let replaced = SharedRecordFile::from_fd_identity(unrelated.fd(), first.identity);
         assert_eq!(
             replaced
                 .snapshot()
@@ -1273,10 +1479,7 @@ mod tests {
             "dup adopted fd: {}",
             std::io::Error::last_os_error()
         );
-        let adopted = SharedRecordFile {
-            fd: adopted_fd,
-            identity: store.identity,
-        };
+        let adopted = SharedRecordFile::from_fd_identity(adopted_fd, store.identity);
         assert_eq!(
             adopted
                 .lookup(ProcessId::new(42, 900).unwrap())
@@ -1355,10 +1558,7 @@ mod tests {
             .expect("open unrelated description");
         drop(unrelated);
 
-        let contender = SharedRecordFile {
-            fd: raw_fd,
-            identity,
-        };
+        let contender = SharedRecordFile::from_fd_identity(raw_fd, identity);
         assert!(
             contender
                 .try_lock_exclusive_for_test()
@@ -1376,21 +1576,30 @@ mod tests {
 
     #[test]
     fn lock_retry_is_bounded() {
+        use std::sync::mpsc;
+
+        assert_eq!(LOCK_TIMEOUT, std::time::Duration::from_secs(5));
         let store = SharedRecordFile::create().expect("create shared-record memfd");
         let guard = store
             .try_lock_exclusive_for_test()
             .expect("try lock")
             .expect("initial lock is free");
-        let contender = SharedRecordFile {
-            fd: store.fd(),
-            identity: store.identity,
-        };
+        let contender = SharedRecordFile::from_fd_identity(store.fd(), store.identity);
+        let watched = SharedRecordFile::from_fd_identity(store.fd(), store.identity);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let kind = match watched.open_locked_timeout(true, std::time::Duration::from_millis(25))
+            {
+                Ok(_) => None,
+                Err(err) => Some(err.kind()),
+            };
+            let _ = tx.send(kind);
+        });
         let started = std::time::Instant::now();
-        let err = match contender.open_locked_timeout(true, std::time::Duration::from_millis(25)) {
-            Ok(_) => panic!("bounded retry must time out while the lock is held"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        let kind = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("watchdog: bounded lock retry did not return");
+        assert_eq!(kind, Some(std::io::ErrorKind::WouldBlock));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "bounded retry took {:?}",
@@ -1410,10 +1619,10 @@ mod tests {
             return;
         };
         let fd: RawFd = raw.to_string_lossy().parse().expect("child fd number");
-        let store = SharedRecordFile {
+        let store = SharedRecordFile::from_fd_identity(
             fd,
-            identity: identity_of_fd(fd).expect("child fstat inherited memfd"),
-        };
+            identity_of_fd(fd).expect("child fstat inherited memfd"),
+        );
         assert!(
             store
                 .try_lock_exclusive_for_test()
@@ -1471,6 +1680,10 @@ mod tests {
             saw_blocked,
             "child did not report cross-process lock contention"
         );
+        // Keep the lock through several retry intervals. The
+        // child has already entered publish(); with no retry it
+        // returns WouldBlock and fails before this release.
+        std::thread::sleep(std::time::Duration::from_millis(100));
         drop(guard);
 
         let mut saw_published = false;
@@ -1536,6 +1749,10 @@ mod tests {
             .expect("write oversized frame header");
         let err = store.snapshot().expect_err("oversized frame must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("snapshot payload over cap"),
+            "unexpected oversized-frame error: {err}"
+        );
     }
 
     #[test]
@@ -1593,6 +1810,109 @@ mod tests {
                 .expect("lookup filler after UTS refusal"),
             Some(filler)
         );
+    }
+
+    #[test]
+    fn file_store_refused_domainname_write_clears_stale_field() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let mut record = SharedRecord::from_parts(
+            Some(b"node".to_vec()),
+            Some(b"first-dom".to_vec()),
+            Vec::new(),
+        )
+        .expect("record with UTS fields");
+        let mut filler = row(1, 1, b"/bin/big");
+        filler.argv = vec![Vec::new()];
+        record.publish(filler.clone()).expect("publish filler base");
+        let overhead = record.encode().expect("encode exact-cap base").len();
+        filler.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record
+            .publish(filler.clone())
+            .expect("publish exact filler");
+        assert_eq!(
+            record.encode().expect("encode exact cap").len(),
+            MAX_ENCODED_BYTES
+        );
+        store.replace(&record).expect("store exact cap");
+
+        let err = store
+            .set_uts_domainname(Some(b"second-longer-domain".to_vec()))
+            .expect_err("over-cap domainname replacement must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store.uts().expect("UTS after domainname refusal"),
+            (Some(b"node".to_vec()), None)
+        );
+        assert_eq!(
+            store
+                .lookup(filler.id)
+                .expect("lookup filler after domainname refusal"),
+            Some(filler)
+        );
+    }
+
+    #[test]
+    fn lock_timeout_pending_repairs_overlay_and_persist_on_next_write() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store
+            .set_uts_nodename(Some(b"first".to_vec()))
+            .expect("set initial nodename");
+        store
+            .set_uts_domainname(Some(b"dom".to_vec()))
+            .expect("set initial domainname");
+        let target = row(4242, 777, b"/bin/old");
+        store.publish(target.clone()).expect("publish initial row");
+
+        // A shared lock lets later reads proceed while making
+        // both writes below time out on the exclusive lock.
+        let read_guard = store
+            .open_locked_try(false)
+            .expect("try shared lock")
+            .expect("shared lock is free");
+        let err = store
+            .set_uts_nodename_with_timeout(
+                Some(b"second".to_vec()),
+                std::time::Duration::from_millis(25),
+            )
+            .expect_err("UTS write must time out under a held lock");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        let mut replacement = target.clone();
+        replacement.exe_guest = b"/bin/new".to_vec();
+        let err = store
+            .publish_with_timeout(replacement, std::time::Duration::from_millis(25))
+            .expect_err("publish must time out under a held lock");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // The raw snapshot is still stale, but this handle's
+        // consumers must not let it outrank local state.
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("raw snapshot before repair")
+                .uts_nodename,
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            store.uts().expect("UTS with pending repair"),
+            (None, Some(b"dom".to_vec()))
+        );
+        assert_eq!(
+            store.lookup(target.id).expect("lookup with pending repair"),
+            None
+        );
+        drop(read_guard);
+
+        // The next successful write persists both repairs.
+        store
+            .set_uts_domainname_with_timeout(
+                Some(b"newdom".to_vec()),
+                std::time::Duration::from_secs(1),
+            )
+            .expect("write that applies pending repairs");
+        let snapshot = store.snapshot().expect("raw snapshot after repair");
+        assert_eq!(snapshot.uts_nodename, None);
+        assert_eq!(snapshot.uts_domainname, Some(b"newdom".to_vec()));
+        assert_eq!(snapshot.lookup(target.id), None);
     }
 
     #[test]
