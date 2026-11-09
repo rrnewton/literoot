@@ -27,6 +27,12 @@ fn make_rootfs(dir: &Path) {
     for bin in ["sh", "ls", "cat", "true"] {
         std::fs::copy(format!("/bin/{bin}"), dir.join("bin").join(bin)).unwrap();
     }
+    for bin in ["readlink", "ln", "mknod"] {
+        let src = format!("/bin/{bin}");
+        if Path::new(&src).exists() {
+            std::fs::copy(&src, dir.join("bin").join(bin)).unwrap();
+        }
+    }
     // Shared libraries the fixture binaries need (host ldd set).
     for lib in [
         "libc.so.6",
@@ -205,4 +211,70 @@ fn oracle_cases_match_reference() {
         "oracle failures (retained by name):\n{}",
         failures.join("\n")
     );
+}
+
+/// Task-B named cases (aarch64 suite flips at integration tip
+/// 269f9fe; pinned here so x86 cannot regress them silently):
+/// single-file bind, absolute/relative readlink de-translation,
+/// and mknod requiring fake root. Literoot-only assertions
+/// (the suite scripts remain the cross-runner oracle).
+#[test]
+fn task_b_named_cases() {
+    if !Path::new("/bin/readlink").exists() || !Path::new("/bin/mknod").exists() {
+        eprintln!("task-b: host readlink/mknod unavailable — skipping");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("literoot-taskb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let rootfs = tmp.join("rootfs");
+    make_rootfs(&rootfs);
+    let run = |extra: &[&str], argv: &[&str]| {
+        Command::new(literoot_bin())
+            .args(["-r", rootfs.to_str().unwrap(), "-w", "/work"])
+            .args(extra)
+            .args(argv)
+            .output()
+            .expect("spawn literoot")
+    };
+
+    // test-bind-single-file: a single host file bound at a guest
+    // path is readable there, and binding does not create the
+    // file inside the rootfs tree.
+    let host_file = tmp.join("host-bound.txt");
+    std::fs::write(&host_file, "bound-content\n").unwrap();
+    let bind_arg = format!("{}:/bound.txt", host_file.display());
+    let out = run(&["-b", &bind_arg], &["/bin/cat", "/bound.txt"]);
+    assert_eq!(out.status.code(), Some(0), "bind-single-file cat: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bound-content\n");
+    assert!(
+        !rootfs.join("bound.txt").exists(),
+        "bind must be a view, not a copy into the rootfs"
+    );
+
+    // test-readlink-abs-rel-symlink: absolute guest symlink
+    // targets de-translate to the host-visible path; relative
+    // targets pass through unchanged.
+    let host_true = std::fs::canonicalize("/bin/true").unwrap();
+    std::os::unix::fs::symlink(&host_true, rootfs.join("bin/abs-true")).unwrap();
+    std::os::unix::fs::symlink("./true", rootfs.join("bin/rel-true")).unwrap();
+    let out = run(&[], &["/bin/readlink", "/bin/abs-true"]);
+    assert_eq!(out.status.code(), Some(0), "readlink abs: {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        host_true.display().to_string(),
+        "absolute symlink must de-translate to the host path"
+    );
+    let out = run(&[], &["/bin/readlink", "/bin/rel-true"]);
+    assert_eq!(out.status.code(), Some(0), "readlink rel: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "./true");
+
+    // test-mknod-requires-fake-root: block-device mknod must
+    // fail without fake root and succeed with -0.
+    let out = run(&[], &["/bin/mknod", "/work/dev0", "b", "1", "1"]);
+    assert_ne!(out.status.code(), Some(0), "mknod without -0 must fail");
+    let out = run(&["-0"], &["/bin/mknod", "/work/dev0", "b", "1", "1"]);
+    assert_eq!(out.status.code(), Some(0), "mknod with -0: {out:?}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
