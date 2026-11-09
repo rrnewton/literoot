@@ -325,12 +325,17 @@ impl RootfsTool {
             ExecState::capture(&st, guest.config())
         };
         // Prove the canonical bytes fit the cap now, while refusal
-        // is still possible; the bytes themselves are discarded
-        // (the pending slot carries the value).
-        snapshot.encode().map_err(|e| match e {
+        // is still possible, then stage them into the host birth
+        // mailbox on the mapped successor route. The synchronous
+        // ack must complete before the caller injects exec; any
+        // staging refusal refuses this syscall before injection.
+        // On routes without a recorded coordinator endpoint this
+        // is inert and the pending slot remains the carrier.
+        let encoded = snapshot.encode().map_err(|e| match e {
             ExecStateError::TooLarge => reverie::syscalls::Errno::E2BIG,
             _ => reverie::syscalls::Errno::EIO,
         })?;
+        crate::exec_stage::stage_snapshot(encoded)?;
         guest.thread_state_mut().pending = Some(snapshot);
         Ok(())
     }
@@ -571,6 +576,27 @@ impl RootfsTool {
         self.set_stack_limit(guest, limits).await?;
         self.state.lock().unwrap().pending_stack_limit = None;
         Ok(())
+    }
+
+    /// Invalidate a mailbox-staged exec snapshot after a failed
+    /// inject, then drop the local pending copy. If the host
+    /// invalidation cannot be delivered, the pending copy is
+    /// restored and the failure replaces the inject result:
+    /// the caller must not treat the mailbox as clear.
+    fn invalidate_exec_snapshot<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        let Some(snapshot) = guest.thread_state_mut().pending.take() else {
+            return Ok(());
+        };
+        match crate::exec_stage::invalidate_snapshot() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                guest.thread_state_mut().pending = Some(snapshot);
+                Err(error)
+            }
+        }
     }
 
     /// Apply a pending snapshot staged by the predecessor image
@@ -2332,11 +2358,11 @@ impl Tool for RootfsTool {
                         .await
                     {
                         Ok(res) => {
-                            self.clear_exec_snapshot(guest);
+                            self.invalidate_exec_snapshot(guest)?;
                             return res;
                         }
                         Err(e) => {
-                            self.clear_exec_snapshot(guest);
+                            self.invalidate_exec_snapshot(guest)?;
                             return Err(e);
                         }
                     }
@@ -2354,11 +2380,11 @@ impl Tool for RootfsTool {
                         .await
                     {
                         Ok(res) => {
-                            self.clear_exec_snapshot(guest);
+                            self.invalidate_exec_snapshot(guest)?;
                             return res;
                         }
                         Err(e) => {
-                            self.clear_exec_snapshot(guest);
+                            self.invalidate_exec_snapshot(guest)?;
                             return Err(e);
                         }
                     }
@@ -2378,7 +2404,7 @@ impl Tool for RootfsTool {
                 }
                 // Success does not return; mirror strace-tool shape.
                 let e = guest.inject(rewritten).await.unwrap_err();
-                self.clear_exec_snapshot(guest);
+                self.invalidate_exec_snapshot(guest)?;
                 Err(e.into())
             }
             // ---- identity (fake-root / -i, design §4.4) ----

@@ -10,6 +10,8 @@
 
 mod arch;
 #[cfg(feature = "tool")]
+mod exec_stage;
+#[cfg(feature = "tool")]
 mod exec_state;
 #[cfg(feature = "tool")]
 mod rootfs_tool;

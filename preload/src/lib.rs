@@ -13,6 +13,7 @@
 
 #[path = "../../src/arch.rs"]
 mod arch;
+mod exec_stage;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
 #[path = "../../src/shared_record.rs"]
