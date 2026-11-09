@@ -41,6 +41,30 @@ fn map_control_error(
     }
 }
 
+/// Poison state transition for a stage exchange error. Only a
+/// Dead transport error is ambiguous (the host may have staged
+/// before the ack was lost); authority Refused errors mutate
+/// nothing. On an ambiguous error, run `invalidate`; if that
+/// also fails, leave `staged` set so a later invalidate retries
+/// instead of treating the mailbox as clear.
+#[cfg(feature = "successor")]
+fn note_stage_error(
+    staged: &std::sync::atomic::AtomicBool,
+    error: reverie_rpc_transport::exec_ticket::ExecControlError,
+    invalidate: impl FnOnce() -> Result<(), reverie::syscalls::Errno>,
+) -> reverie::syscalls::Errno {
+    if !matches!(
+        error,
+        reverie_rpc_transport::exec_ticket::ExecControlError::Dead
+    ) {
+        return map_control_error(error);
+    }
+    if invalidate().is_err() {
+        staged.store(true, Ordering::SeqCst);
+    }
+    reverie::syscalls::Errno::EIO
+}
+
 #[cfg(feature = "successor")]
 fn invalidate_now() -> Result<(), reverie::syscalls::Errno> {
     client()?.invalidate().map_err(map_control_error)?;
@@ -91,14 +115,7 @@ pub fn stage_snapshot(encoded: Vec<u8>) -> Result<(), reverie::syscalls::Errno> 
                 STAGED.store(true, Ordering::SeqCst);
                 Ok(())
             }
-            Err(error) => {
-                // The ack may have been lost after the host staged
-                // the snapshot. Best-effort invalidate on a fresh
-                // connection so a failed exec never leaves the
-                // mailbox armed; the original refusal still wins.
-                let _ = invalidate_now();
-                Err(map_control_error(error))
-            }
+            Err(error) => Err(note_stage_error(&STAGED, error, invalidate_now)),
         }
     }
 }
@@ -139,6 +156,32 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn dead_stage_error_poisons_until_invalidate_succeeds() {
+        use reverie_rpc_transport::exec_ticket::ExecControlError;
+        let staged = std::sync::atomic::AtomicBool::new(false);
+        // Refused errors mutate nothing and never poison.
+        let errno = note_stage_error(&staged, ExecControlError::Transition, || {
+            panic!("refused stage errors must not invalidate")
+        });
+        assert_eq!(errno, reverie::syscalls::Errno::EOPNOTSUPP);
+        assert!(!staged.load(Ordering::SeqCst));
+        // Ambiguous Dead plus a failed invalidate stays poisoned
+        // (retryable), never silently clear.
+        let errno = note_stage_error(&staged, ExecControlError::Dead, || {
+            Err(reverie::syscalls::Errno::EIO)
+        });
+        assert_eq!(errno, reverie::syscalls::Errno::EIO);
+        assert!(staged.load(Ordering::SeqCst));
+        // Ambiguous Dead with a delivered invalidate clears it.
+        let errno = note_stage_error(&staged, ExecControlError::Dead, || {
+            staged.store(false, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(errno, reverie::syscalls::Errno::EIO);
+        assert!(!staged.load(Ordering::SeqCst));
     }
 
     #[test]

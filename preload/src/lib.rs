@@ -302,7 +302,6 @@ pub unsafe fn literoot_mapped_successor_initialize(
     mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
 ) -> std::io::Result<()> {
     use reverie_inguest::guest::exec_private::mapped_initial::mapped_scalar::SuccessorPacketSource as _;
-    use reverie_liteinst::NativeSuccessorConsumer as _;
     use reverie_rpc_transport::birth_authority::verify_split_and_decode;
     use reverie_rpc_transport::successor::{ExpectedSuccessor, SuccessorRequest};
 
@@ -335,9 +334,14 @@ pub unsafe fn literoot_mapped_successor_initialize(
         request,
     )
     .map_err(std::io::Error::other)?;
+    // Config binding is the successor redemption itself: the
+    // transport checked the raw delivered config against the
+    // packet config digest before decoding, and prepare below
+    // re-checks all three packet/client digests. There is no
+    // independent expected config in this image to qualify
+    // against, and qualifying the delivered config against
+    // itself would prove nothing, so no consumer is built here.
     let config = client.config().clone();
-    let consumer = RootfsSuccessorConsumer::new(config.clone());
-    consumer.qualify_config(&config)?;
     let packet_expected = ExpectedSuccessor {
         config: packet.expected_config_digest(),
         state: packet.expected_state_digest(),
