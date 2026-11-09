@@ -40,17 +40,11 @@ unsafe fn terminal() -> ! {
     unsafe { reverie_inguest::guest::exec_private::initialization_failed(core::ptr::null_mut()) }
 }
 
-/// Numeric slice preconditions only. No address is
-/// dereferenced or authenticated by this check.
-fn valid_input_range(address: usize, bytes: usize, header: usize, max: usize) -> bool {
-    address != 0
-        && address.is_multiple_of(8)
-        && bytes >= header
-        && bytes <= max
-        && bytes <= isize::MAX as usize
-        && address
-            .checked_add(bytes)
-            .is_some_and(|end| end <= isize::MAX as usize)
+/// Numeric slice preconditions only, via the shared
+/// `reverie-loader` predicate re-exported through
+/// `mapped_initial` (its tests execute on GNU; see dh-axoec).
+fn valid_input_range(address: usize, bytes: usize) -> bool {
+    mapped_initial::valid_mapped_input_range(address, bytes)
 }
 
 /// Actual C-ABI successor entry before private TLS. It never
@@ -82,12 +76,7 @@ fn valid_input_range(address: usize, bytes: usize, header: usize, max: usize) ->
 /// reset, fall back to guest libc, or release guest here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn literoot_mapped_successor_entry(ptr: *const u8, len: usize) -> ! {
-    if !valid_input_range(
-        ptr as usize,
-        len,
-        mapped_initial::MAPPED_INPUT_HEADER_BYTES,
-        mapped_initial::MAPPED_INPUT_MAX_BYTES,
-    ) {
+    if !valid_input_range(ptr as usize, len) {
         unsafe { terminal() }
     }
     // SAFETY: only the physical host contract above establishes
@@ -145,8 +134,8 @@ mod tests {
     #[test]
     fn mapped_entry_bounds_accept_complete_header_and_cap() {
         let address = 0x6000_1000_0000;
-        assert!(valid_input_range(address, 960, 960, 1024 * 1024));
-        assert!(valid_input_range(address, 1024 * 1024, 960, 1024 * 1024));
+        assert!(valid_input_range(address, 960));
+        assert!(valid_input_range(address, 1024 * 1024));
     }
 
     #[test]
@@ -162,7 +151,7 @@ mod tests {
             ((isize::MAX as usize) & !7, 960),
             (address, usize::MAX),
         ] {
-            assert!(!valid_input_range(pointer, bytes, 960, 1024 * 1024));
+            assert!(!valid_input_range(pointer, bytes));
         }
     }
 }
