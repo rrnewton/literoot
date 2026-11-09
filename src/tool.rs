@@ -155,6 +155,7 @@ pub fn run_guest(
         fake_gid: config.fake_ids.map(|(_, g)| g),
         kernel_release: config.kernel_release.clone(),
         kill_on_exit,
+        kompat_force: std::env::var_os("PROOT_FORCE_KOMPAT").is_some(),
         refuse_guest_ptrace: in_guest,
         initial_exe: String::new(),
         initial_argv: Vec::new(),

@@ -51,6 +51,11 @@ pub struct LiterootConfig {
     /// initial guest process exits (proot semantics).
     #[serde(default)]
     pub kill_on_exit: bool,
+    /// PROOT_FORCE_KOMPAT was set on the launcher: in
+    /// post-exec auxv adjustment, move AT_RANDOM to the
+    /// last vector (proot kompat forced-mode observable).
+    #[serde(default)]
+    pub kompat_force: bool,
     /// Refuse guest ptrace with EPERM (in-guest backends
     /// only, set by the launcher). Under the ptrace
     /// backend this is false and guest ptrace passes
@@ -1053,7 +1058,12 @@ impl Tool for RootfsTool {
         // Auxv patching: fake AT_UID/EUID/GID/EGID under fake
         // identity; zero AT_HWCAP when -k requests it (proot's
         // UTS form carries hwcap as field 7; a plain release
-        // string leaves it alone).
+        // string leaves it alone). With any -k spoof, also
+        // apply proot kompat's auxv adjustment: discard
+        // AT_SYSINFO/AT_SYSINFO_EHDR (the vDSO data page would
+        // let the guest read the real kernel release past the
+        // uname spoof), and in forced mode move AT_RANDOM to
+        // the last vector (proot appends it there).
         let fake = self.fake_ids(guest);
         let zero_hwcap = guest
             .config()
@@ -1061,7 +1071,9 @@ impl Tool for RootfsTool {
             .as_deref()
             .map(|k| k.contains('\\'))
             .unwrap_or(false);
-        if fake.is_some() || zero_hwcap {
+        let kompat = guest.config().kernel_release.is_some();
+        let kompat_force = kompat && guest.config().kompat_force;
+        if fake.is_some() || zero_hwcap || kompat {
             use reverie::syscalls::MemoryAccess as _;
             {
                 let regs = guest.regs().await;
@@ -1086,7 +1098,10 @@ impl Tool for RootfsTool {
                             None => break,
                         }
                     }
-                    for _ in 0..64 {
+                    let auxv_start = p;
+                    let mut pair_count = 0usize;
+                    let mut random_pair: Option<(usize, u64)> = None;
+                    for idx in 0..64 {
                         let (Some(ty), Some(val)) =
                             (read64(&mem, p), read64(&mem, p + 8))
                         else {
@@ -1094,6 +1109,29 @@ impl Tool for RootfsTool {
                         };
                         if ty == 0 {
                             break;
+                        }
+                        pair_count = idx + 1;
+                        if ty == 25 {
+                            random_pair = Some((idx, val));
+                        }
+                        // Kompat discard: rewrite the pair in
+                        // place to AT_IGNORE/0 (proot
+                        // adjust_elf_auxv semantics).
+                        if kompat && (ty == 32 || ty == 33) {
+                            let at: reverie::syscalls::AddrMut<u8> = unsafe {
+                                reverie::syscalls::AddrMut::from_raw_unchecked(
+                                    p as usize,
+                                )
+                            };
+                            let av: reverie::syscalls::AddrMut<u8> = unsafe {
+                                reverie::syscalls::AddrMut::from_raw_unchecked(
+                                    (p + 8) as usize,
+                                )
+                            };
+                            let _ = mem.write(at, &1u64.to_ne_bytes());
+                            let _ = mem.write(av, &0u64.to_ne_bytes());
+                            p += 16;
+                            continue;
                         }
                         let new_val = match (ty, fake) {
                             (11, Some((u, _))) => Some(u as u64),
@@ -1114,6 +1152,45 @@ impl Tool for RootfsTool {
                             }
                         }
                         p += 16;
+                    }
+                    // Forced kompat: AT_RANDOM must be the last
+                    // vector (proot appends it there; moving the
+                    // existing pair is observably equivalent for
+                    // auxv readers, which scan the whole table).
+                    if kompat_force {
+                        if let Some((ridx, rval)) = random_pair {
+                            if pair_count > 0 && ridx + 1 < pair_count {
+                                let src = auxv_start + ((ridx + 1) * 16) as u64;
+                                let len = (pair_count - ridx - 1) * 16;
+                                let mut buf = vec![0u8; len];
+                                let sa: reverie::syscalls::Addr<u8> = unsafe {
+                                    reverie::syscalls::Addr::from_raw_unchecked(
+                                        src as usize,
+                                    )
+                                };
+                                if mem.read(sa, &mut buf).is_ok() {
+                                    let da: reverie::syscalls::AddrMut<u8> = unsafe {
+                                        reverie::syscalls::AddrMut::from_raw_unchecked(
+                                            (auxv_start + (ridx * 16) as u64) as usize,
+                                        )
+                                    };
+                                    let _ = mem.write(da, &buf);
+                                    let last = auxv_start + ((pair_count - 1) * 16) as u64;
+                                    let lt: reverie::syscalls::AddrMut<u8> = unsafe {
+                                        reverie::syscalls::AddrMut::from_raw_unchecked(
+                                            last as usize,
+                                        )
+                                    };
+                                    let lv: reverie::syscalls::AddrMut<u8> = unsafe {
+                                        reverie::syscalls::AddrMut::from_raw_unchecked(
+                                            (last + 8) as usize,
+                                        )
+                                    };
+                                    let _ = mem.write(lt, &25u64.to_ne_bytes());
+                                    let _ = mem.write(lv, &rval.to_ne_bytes());
+                                }
+                            }
+                        }
                     }
                 }
             }

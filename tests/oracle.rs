@@ -393,3 +393,53 @@ fn proc_self_root_lists_rootfs_root() {
         "ls /proc/self/root/ leaked the host root, got: {stdout:?}"
     );
 }
+
+/// -k (kernel-release spoof) must apply proot-kompat auxv
+/// adjustment at post-exec: AT_SYSINFO/AT_SYSINFO_EHDR are
+/// discarded (they would let the guest read the real
+/// kernel version from the vDSO data page, bypassing the
+/// uname spoof), and with PROOT_FORCE_KOMPAT set on the
+/// launcher, AT_RANDOM is the last auxv entry. Upstream
+/// test-execve-sysexit-seccomp asserts exactly these two
+/// properties of `env LD_SHOW_AUXV=1 true` output.
+#[test]
+fn kompat_auxv_discards_sysinfo_and_random_last() {
+    if !Path::new("/usr/bin/env").exists() || !Path::new("/bin/true").exists() {
+        eprintln!("oracle: host fixture binaries unavailable — skipping");
+        return;
+    }
+    let run = |force: bool| -> Vec<String> {
+        let mut cmd = Command::new(literoot_bin());
+        cmd.args(["-k", "6.6.6", "/usr/bin/env", "LD_SHOW_AUXV=1", "/bin/true"]);
+        if force {
+            cmd.env("PROOT_FORCE_KOMPAT", "1");
+        } else {
+            cmd.env_remove("PROOT_FORCE_KOMPAT");
+        }
+        let out = cmd.output().expect("spawn literoot");
+        assert!(out.status.success(), "auxv guest must run: {out:?}");
+        // LD_SHOW_AUXV output reaches stdout under literoot
+        // and stderr natively; accept either stream.
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.starts_with("AT_"))
+            .collect()
+    };
+    let plain = run(false);
+    assert!(
+        !plain.iter().any(|l| l.starts_with("AT_SYSINFO")),
+        "-k auxv must not carry AT_SYSINFO*: {plain:?}"
+    );
+    let forced = run(true);
+    assert!(
+        !forced.iter().any(|l| l.starts_with("AT_SYSINFO")),
+        "forced -k auxv must not carry AT_SYSINFO*: {forced:?}"
+    );
+    assert!(
+        forced.last().map(|l| l.starts_with("AT_RANDOM")) == Some(true),
+        "forced -k auxv must end with AT_RANDOM: {forced:?}"
+    );
+}
