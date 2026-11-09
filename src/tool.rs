@@ -103,6 +103,7 @@ pub fn run_guest(
     // backend today refuses guest execve/thread-clone by name
     // (EOPNOTSUPP; stage-1b re-arm outstanding, design §10 item 3)
     // — that refusal surfaces verbatim, never a silent downgrade.
+    refuse_mapped_without_authority(backend, false)?;
     if !["ptrace", "liteinst", "in-guest", "trap"].contains(&backend) {
         return Err(format!(
             "unknown backend {backend:?} (expected: ptrace | liteinst | trap)"
@@ -456,6 +457,23 @@ fn run_backend(
     }
 }
 
+/// E2-3c NB1/S3-5 route refusal: selecting the mapped
+/// successor route without a configured birth authority refuses
+/// by name before any server or guest starts. Until the slice-4
+/// host harness stands up the BirthBridge/RpcServer pair, no
+/// literoot launch configures one, so every mapped selection
+/// refuses here instead of falling through to another backend.
+fn refuse_mapped_without_authority(backend: &str, authority_configured: bool) -> Result<(), String> {
+    if backend == "mapped" && !authority_configured {
+        return Err(
+            "literoot: mapped successor route requires a configured birth authority \
+             (E2-3c host harness not stood up in this build)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
 /// the running binary, else the slot build output.
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
@@ -543,4 +561,21 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Some((interp, opt))
+}
+
+#[cfg(test)]
+mod mapped_route_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_route_without_authority_refuses_by_name() {
+        let error = refuse_mapped_without_authority("mapped", false).unwrap_err();
+        assert!(
+            error.contains("mapped successor route requires a configured birth authority"),
+            "unexpected refusal: {error}"
+        );
+        assert!(refuse_mapped_without_authority("mapped", true).is_ok());
+        assert!(refuse_mapped_without_authority("ptrace", false).is_ok());
+        assert!(refuse_mapped_without_authority("trap", false).is_ok());
+    }
 }
