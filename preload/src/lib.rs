@@ -14,6 +14,8 @@
 #[path = "../../src/arch.rs"]
 mod arch;
 mod exec_stage;
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+mod mapped_entry;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
 #[path = "../../src/shared_record.rs"]
