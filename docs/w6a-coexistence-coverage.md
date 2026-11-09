@@ -58,8 +58,9 @@ docs/proot-suite-results.md plus test-execve-sysexit-seccomp.
   `execve` line for `true`. Successor arming/loader execs visible to
   a guest strace can change the count; not guaranteed by W6a.
 - `test-execve-sysexit-seccomp` — not a ptrace-coexistence test at
-  all (proot `-k` kompat/auxv behaviour; in-suite flake that passes
-  in isolated runs). W6a neither covers nor affects it; it stays
+  all (proot `-k` kompat/auxv behaviour; ptrace fixed by 58bf5a51,
+  scoped to the ptrace backend by its successor, in-guest not
+  implemented). W6a neither covers nor affects it; it stays
   classified separately.
 
 ## Summary

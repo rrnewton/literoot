@@ -396,21 +396,44 @@ fn proc_self_root_lists_rootfs_root() {
 
 /// -k (kernel-release spoof) must apply proot-kompat auxv
 /// adjustment at post-exec: AT_SYSINFO/AT_SYSINFO_EHDR are
-/// discarded (they would let the guest read the real
-/// kernel version from the vDSO data page, bypassing the
-/// uname spoof), and with PROOT_FORCE_KOMPAT set on the
+/// discarded (under Reverie ptrace the EHDR points at
+/// Reverie's canonical vDSO, whose fixed 6.0.0 note still
+/// bypasses the spoof), and with PROOT_FORCE_KOMPAT set on the
 /// launcher, AT_RANDOM is the last auxv entry. Upstream
 /// test-execve-sysexit-seccomp asserts exactly these two
 /// properties of `env LD_SHOW_AUXV=1 true` output.
 #[test]
 fn kompat_auxv_discards_sysinfo_and_random_last() {
-    if !Path::new("/usr/bin/env").exists() || !Path::new("/bin/true").exists() {
-        eprintln!("oracle: host fixture binaries unavailable — skipping");
-        return;
-    }
-    let run = |force: bool| -> Vec<String> {
+    assert!(Path::new("/usr/bin/env").exists() && Path::new("/bin/true").exists(), "missing required fixture tool /usr/bin/env or /bin/true: install coreutils");
+    let auxv_of = |out: &std::process::Output| -> Vec<String> {
+        // glibc prints LD_SHOW_AUXV on stdout natively too;
+        // accept either stream (they are disjoint here).
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        text.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.starts_with("AT_"))
+            .collect()
+    };
+    // Positive control first: the host itself must expose
+    // AT_SYSINFO_EHDR, or the negative cases below could
+    // pass on an empty/hostless auxv. Fail loudly if not.
+    let native = Command::new("/usr/bin/env")
+        .args(["LD_SHOW_AUXV=1", "/bin/true"])
+        .output()
+        .expect("spawn native env");
+    assert!(native.status.success(), "native auxv guest must run: {native:?}");
+    let native_auxv = auxv_of(&native);
+    assert!(
+        native_auxv.iter().any(|l| l.starts_with("AT_SYSINFO_EHDR")),
+        "positive control: native auxv must show AT_SYSINFO_EHDR, got: {native_auxv:?}"
+    );
+    let run = |k: Option<&str>, force: bool| -> Vec<String> {
         let mut cmd = Command::new(literoot_bin());
-        cmd.args(["-k", "6.6.6", "/usr/bin/env", "LD_SHOW_AUXV=1", "/bin/true"]);
+        if let Some(k) = k {
+            cmd.args(["-k", k]);
+        }
+        cmd.args(["/usr/bin/env", "LD_SHOW_AUXV=1", "/bin/true"]);
         if force {
             cmd.env("PROOT_FORCE_KOMPAT", "1");
         } else {
@@ -418,22 +441,32 @@ fn kompat_auxv_discards_sysinfo_and_random_last() {
         }
         let out = cmd.output().expect("spawn literoot");
         assert!(out.status.success(), "auxv guest must run: {out:?}");
-        // LD_SHOW_AUXV output reaches stdout under literoot
-        // and stderr natively; accept either stream.
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        text
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| l.starts_with("AT_"))
-            .collect()
+        auxv_of(&out)
     };
-    let plain = run(false);
+    // Negative: without -k the discard must not happen.
+    let no_k = run(None, false);
+    assert!(
+        no_k.iter().any(|l| l.starts_with("AT_SYSINFO_EHDR")),
+        "without -k, AT_SYSINFO_EHDR must be present: {no_k:?}"
+    );
+    let plain = run(Some("6.6.6"), false);
+    assert!(
+        plain.len() >= 10,
+        "plain -k auxv floor: at least 10 AT_ lines, got: {plain:?}"
+    );
     assert!(
         !plain.iter().any(|l| l.starts_with("AT_SYSINFO")),
         "-k auxv must not carry AT_SYSINFO*: {plain:?}"
     );
-    let forced = run(true);
+    // Negative: without force, AT_RANDOM stays singular
+    // and mid-table (the move must not happen).
+    let random_count = plain.iter().filter(|l| l.starts_with("AT_RANDOM")).count();
+    assert_eq!(random_count, 1, "plain -k must carry exactly one AT_RANDOM: {plain:?}");
+    assert!(
+        plain.last().map(|l| l.starts_with("AT_RANDOM")) != Some(true),
+        "plain -k AT_RANDOM must not be last without force: {plain:?}"
+    );
+    let forced = run(Some("6.6.6"), true);
     assert!(
         !forced.iter().any(|l| l.starts_with("AT_SYSINFO")),
         "forced -k auxv must not carry AT_SYSINFO*: {forced:?}"
@@ -441,5 +474,19 @@ fn kompat_auxv_discards_sysinfo_and_random_last() {
     assert!(
         forced.last().map(|l| l.starts_with("AT_RANDOM")) == Some(true),
         "forced -k auxv must end with AT_RANDOM: {forced:?}"
+    );
+    // The move changes order only: same set of AT_ types.
+    let types = |v: &Vec<String>| -> Vec<String> {
+        let mut t: Vec<String> = v
+            .iter()
+            .map(|l| l.split(':').next().unwrap_or("").trim().to_string())
+            .collect();
+        t.sort();
+        t
+    };
+    assert_eq!(
+        types(&plain),
+        types(&forced),
+        "forced move must keep the same AT_ type set as plain -k"
     );
 }

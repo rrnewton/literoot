@@ -164,7 +164,7 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 - `test-nested-proot-options`
 - `test-python-extension-getdents`
 
-Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp passes manually and in isolated make runs (in-suite flake); test-execve-eacces-enoexec is an upstream test bug (reclassified 2026-11-06, see below; retained by name).
+Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp was a literoot -k kompat auxv gap (AT_SYSINFO* not discarded), fixed on the ptrace backend by 58bf5a51 as scoped by its successor, in-guest not implemented; test-execve-eacces-enoexec is an upstream test bug (reclassified 2026-11-06, see below; retained by name).
 
 ## Reclassification: test-execve-eacces-enoexec (2026-11-06, museport/W1)
 
@@ -291,10 +291,12 @@ have to be supported:
 
 ### Ptrace-baseline misses re-examined on this host
 
-- `test-execve-sysexit-seccomp`: deterministic here (6/6 isolated),
-  **environment**: host glibc prints `AT_??? (0x1b/0x1c)` entries
-  after `AT_RANDOM`, breaking the test's `tail -1 | grep ^AT_RANDOM`
-  assumption; AT_SYSINFO handling itself is correct.
+- `test-execve-sysexit-seccomp`: ptrace fixed by 58bf5a51
+  (kompat auxv adjustment, scoped to the ptrace backend by
+  its successor); in-guest kompat auxv adjustment is not
+  implemented (post-exec there runs at the first trapped
+  syscall, not the exec stop, so the initial-stack walk
+  does not run for it).
 - `test-unix-socket-bind-getsockname`: translated socket path is
   110 bytes at this slot depth (> 107-byte `sun_path`) —
   **environment** (suite-rootfs path length).

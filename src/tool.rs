@@ -156,6 +156,7 @@ pub fn run_guest(
         kernel_release: config.kernel_release.clone(),
         kill_on_exit,
         kompat_force: std::env::var_os("PROOT_FORCE_KOMPAT").is_some(),
+        post_exec_at_exec_stop: !in_guest,
         refuse_guest_ptrace: in_guest,
         initial_exe: String::new(),
         initial_argv: Vec::new(),
