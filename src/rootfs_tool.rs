@@ -236,6 +236,56 @@ impl RootfsTool {
         Ok(())
     }
 
+    /// The argv the `/proc/self/cmdline` path materializes for
+    /// this process: replicated argv if present, else the launch
+    /// `initial_argv`. Locks and drops state before returning.
+    fn current_argv(&self, cfg: &LiterootConfig) -> Vec<Vec<u8>> {
+        let argv = self.state.lock().unwrap().argv.clone();
+        if argv.is_empty() {
+            cfg.initial_argv
+                .iter()
+                .map(|arg| arg.clone().into_bytes())
+                .collect()
+        } else {
+            argv
+        }
+    }
+
+    /// Stage a fork seed for a process-creating clone. The
+    /// accessor-produced current exe/argv are computed *before*
+    /// the capture state lock below (`exe_guest` locks state
+    /// internally, as does `current_argv`), so the codec never
+    /// re-resolves them against config or the current cwd.
+    fn stage_fork_snapshot<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+    ) -> Result<(), reverie::syscalls::Errno> {
+        let current_exe = self.exe_guest(guest);
+        let current_argv = self.current_argv(guest.config());
+        let snapshot = {
+            let st = self.state.lock().unwrap();
+            match fork_seed_if_bootstrapped(&st, guest.config(), &current_exe, &current_argv) {
+                Some(seed) => seed?,
+                None => {
+                    // Named seed refusal, not a guest clone
+                    // failure: the clone proceeds unstaged
+                    // rather than applying a seed whose restore
+                    // would force bootstrapped.
+                    eprintln!("literoot: fork seed refused: parent not bootstrapped");
+                    return Ok(());
+                }
+            }
+        };
+        // Same fit proof as the exec staging path: refuse before
+        // injection rather than completing the clone degraded.
+        snapshot.encode().map_err(|e| match e {
+            ExecStateError::TooLarge => reverie::syscalls::Errno::E2BIG,
+            _ => reverie::syscalls::Errno::EIO,
+        })?;
+        guest.thread_state_mut().pending = Some(snapshot);
+        Ok(())
+    }
+
     /// Drop a staged snapshot after a failed exec inject. A
     /// successful inject never returns, so every return path past
     /// staging is a failure; the next exec re-stages from live
@@ -270,6 +320,65 @@ impl RootfsTool {
         LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(true)
     }
+}
+
+/// The empty-current-exe return branch of `RootfsTool::exe_guest`,
+/// extracted so the accessor and its tests share exactly one
+/// implementation. `launch_cwd` is the guest config's launch cwd;
+/// empty means "/" exactly as `seed_cwd` defines it.
+fn initial_exe_guest(initial_exe: &str, launch_cwd: &str, cfg: &RootConfig) -> PathBuf {
+    if initial_exe.is_empty() {
+        return PathBuf::from("/proc/self/exe");
+    }
+    let p = PathBuf::from(initial_exe);
+    if p.is_absolute() {
+        return p;
+    }
+    let seed_cwd = if launch_cwd.is_empty() {
+        Path::new("/")
+    } else {
+        Path::new(launch_cwd)
+    };
+    let host = cfg.translate(&p, seed_cwd, None);
+    cfg.reverse(&host).unwrap_or(p)
+}
+
+/// Build a fork seed from accessor-produced current exe/argv.
+/// Refuses by name (`EINVAL`) for a not-yet-bootstrapped
+/// parent: `apply_to` would force `bootstrapped = true` in the
+/// child and silently skip its launcher-exec transition,
+/// because `ExecState` does not carry that bit.
+fn fork_seed(
+    st: &ProcState,
+    cfg: &LiterootConfig,
+    current_exe: &Path,
+    current_argv: &[Vec<u8>],
+) -> Result<ExecState, reverie::syscalls::Errno> {
+    if !st.bootstrapped {
+        return Err(reverie::syscalls::Errno::EINVAL);
+    }
+    Ok(ExecState::capture_fork_seed(
+        st,
+        cfg,
+        current_exe,
+        current_argv,
+    ))
+}
+
+/// The production staging gate: `None` means do not stage a
+/// seed for this clone (the caller logs the named refusal and
+/// lets the clone proceed unstaged). Guest-free so the exact
+/// decision production uses is unit-testable.
+fn fork_seed_if_bootstrapped(
+    st: &ProcState,
+    cfg: &LiterootConfig,
+    current_exe: &Path,
+    current_argv: &[Vec<u8>],
+) -> Option<Result<ExecState, reverie::syscalls::Errno>> {
+    if !st.bootstrapped {
+        return None;
+    }
+    Some(fork_seed(st, cfg, current_exe, current_argv))
 }
 
 /// B4 step 4 staging decision: snapshot for a new *process*, never
@@ -426,8 +535,15 @@ impl Tool for RootfsTool {
         // fake set-id transition, comm restore and auxv patch
         // below compose on top of predecessor state.
         self.consume_pending(guest)?;
-        // New image: any previous scratch mapping is gone.
-        self.state.lock().unwrap().scratch = None;
+        // The initial launcher exec has passed in this process;
+        // later forks may stage seeds whose restore forces this
+        // same post-bootstrap state in the child.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.bootstrapped = true;
+            // New image: any previous scratch mapping is gone.
+            st.scratch = None;
+        }
         // Pre-allocate the execve scratch page here: injecting
         // an mmap between a guest's two execve calls was
         // measured to make the second fail EFAULT.
@@ -1737,7 +1853,7 @@ impl Tool for RootfsTool {
             Syscall::Clone(clone) => {
                 let fam = reverie::syscalls::family::CloneFamily::Clone(clone);
                 if clone_is_process(fam.flags(&guest.memory()).bits()) {
-                    if let Err(e) = self.stage_snapshot(guest) {
+                    if let Err(e) = self.stage_fork_snapshot(guest) {
                         return Err(e.into());
                     }
                     let ret = guest.inject(clone).await;
@@ -1750,7 +1866,7 @@ impl Tool for RootfsTool {
             Syscall::Clone3(clone3) => {
                 let fam = reverie::syscalls::family::CloneFamily::Clone3(clone3);
                 if clone_is_process(fam.flags(&guest.memory()).bits()) {
-                    if let Err(e) = self.stage_snapshot(guest) {
+                    if let Err(e) = self.stage_fork_snapshot(guest) {
                         return Err(e.into());
                     }
                     let ret = guest.inject(clone3).await;
@@ -1762,7 +1878,7 @@ impl Tool for RootfsTool {
             }
             #[cfg(not(target_arch = "aarch64"))]
             Syscall::Fork(fork) => {
-                if let Err(e) = self.stage_snapshot(guest) {
+                if let Err(e) = self.stage_fork_snapshot(guest) {
                     return Err(e.into());
                 }
                 let ret = guest.inject(fork).await;
@@ -1771,7 +1887,7 @@ impl Tool for RootfsTool {
             }
             #[cfg(not(target_arch = "aarch64"))]
             Syscall::Vfork(vfork) => {
-                if let Err(e) = self.stage_snapshot(guest) {
+                if let Err(e) = self.stage_fork_snapshot(guest) {
                     return Err(e.into());
                 }
                 let ret = guest.inject(vfork).await;
@@ -2533,21 +2649,10 @@ impl RootfsTool {
                         }
                     });
             }
-            if init.is_empty() {
-                PathBuf::from("/proc/self/exe")
-            } else {
-                // Must be absolute: glibc _dl_get_origin asserts
-                // /proc/self/exe starts with '/' (measured abort
-                // in test-fork-vfork-execve with ./prog).
-                let p = PathBuf::from(init);
-                if p.is_absolute() {
-                    p
-                } else {
-                    let cfg = self.config(guest);
-                    let host = cfg.translate(&p, &self.seed_cwd(guest), None);
-                    cfg.reverse(&host).unwrap_or(p)
-                }
-            }
+            // Must be absolute: glibc _dl_get_origin asserts
+            // /proc/self/exe starts with '/' (measured abort
+            // in test-fork-vfork-execve with ./prog).
+            initial_exe_guest(&init, &guest.config().cwd, &self.config(guest))
         } else {
             st.exe_guest.clone()
         }
@@ -2801,22 +2906,25 @@ impl RootfsTool {
         };
         let Some(target_pid) = target_pid else { return None };
         let argv: Vec<Vec<u8>> = if target_pid == guest.pid().as_raw() {
-            let st = self.state.lock().unwrap();
-            st.argv.clone()
-        } else {
-            match pid_argv_map().lock().unwrap().get(&target_pid) {
-                Some(a) => a.clone(),
-                None => return None,
-            }
-        };
-        let argv = if argv.is_empty() {
-            let init = guest.config().initial_argv.clone();
-            if init.is_empty() {
+            let materialized = self.current_argv(guest.config());
+            if materialized.is_empty() {
                 return None;
             }
-            init.into_iter().map(|s| s.into_bytes()).collect::<Vec<_>>()
+            materialized
         } else {
-            argv
+            let argv = match pid_argv_map().lock().unwrap().get(&target_pid) {
+                Some(a) => a.clone(),
+                None => return None,
+            };
+            if argv.is_empty() {
+                let init = guest.config().initial_argv.clone();
+                if init.is_empty() {
+                    return None;
+                }
+                init.into_iter().map(|s| s.into_bytes()).collect::<Vec<_>>()
+            } else {
+                argv
+            }
         };
         let mut content: Vec<u8> = Vec::new();
         for a in &argv {
@@ -3810,6 +3918,70 @@ mod tests {
         assert_eq!(child.pending, None);
         let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
         assert_eq!(root.pending, None);
+    }
+
+    #[test]
+    fn initial_exe_accessor_resolves_launch_relative_paths() {
+        // Translation uses filesystem probes, so the launch cwd
+        // must be a real directory for `..` to collapse.
+        let rootfs =
+            std::env::temp_dir().join(format!("literoot-initial-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rootfs);
+        std::fs::create_dir_all(rootfs.join("work/dir")).expect("fixture rootfs");
+        let root = RootConfig::new(rootfs.clone(), Vec::new());
+        assert_eq!(
+            initial_exe_guest("./prog", "/work/dir", &root),
+            PathBuf::from("/work/dir/prog")
+        );
+        assert_eq!(
+            initial_exe_guest("../x/prog", "/work/dir", &root),
+            PathBuf::from("/work/x/prog")
+        );
+        assert_eq!(
+            initial_exe_guest("", "/work/dir", &root),
+            PathBuf::from("/proc/self/exe")
+        );
+        assert_eq!(
+            initial_exe_guest("./prog", "", &root),
+            PathBuf::from("/prog")
+        );
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn fork_seed_gate_refuses_unbootstrapped_parent_and_preserves_fake() {
+        let tool = RootfsTool::default();
+        let cfg = LiterootConfig::default();
+        let current_argv = vec![b"prog".to_vec()];
+        {
+            let mut st = tool.state.lock().unwrap();
+            st.bootstrapped = false;
+            st.fake = Some([9, 8, 7, 6, 5, 4]);
+            let fake_before = st.fake;
+            // The exact decision production staging uses:
+            // nothing is staged for this clone.
+            assert_eq!(
+                fork_seed_if_bootstrapped(&st, &cfg, Path::new("/bin/sh"), &current_argv),
+                None
+            );
+            // The checked constructor still refuses by name if
+            // a future caller bypasses the production gate.
+            let result = fork_seed(&st, &cfg, Path::new("/bin/sh"), &current_argv);
+            assert_eq!(result, Err(reverie::syscalls::Errno::EINVAL));
+            assert_eq!(st.fake, fake_before);
+        }
+        {
+            let mut st = tool.state.lock().unwrap();
+            st.bootstrapped = true;
+            st.fake = Some([9, 8, 7, 6, 5, 4]);
+            let seed = fork_seed_if_bootstrapped(&st, &cfg, Path::new("/bin/sh"), &current_argv)
+                .expect("bootstrapped gate stages")
+                .expect("bootstrapped fork seed");
+            assert_eq!(seed.exe_guest, b"/bin/sh");
+            assert_eq!(seed.argv, current_argv);
+            assert_eq!(seed.fake, Some([9, 8, 7, 6, 5, 4]));
+            assert_eq!(st.fake, Some([9, 8, 7, 6, 5, 4]));
+        }
     }
 
     #[test]

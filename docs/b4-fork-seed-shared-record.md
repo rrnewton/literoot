@@ -33,15 +33,26 @@ fork encoding.
   validation happens before mutation, `bootstrapped` becomes
   true, and scratch is not carried. Consequently a fork seed
   may only be staged for a bootstrapped parent until the
-  restore contract learns to carry that bit; a pre-bootstrap
-  parent would skip the launcher-exec transition, and the
-  fork-wiring slice must refuse that case by name rather than
-  use this seed silently.
-- The fork seed is the value a later step stages before a
-  process-creating clone and applies in the child's fresh
-  Tool before ordinary execution. Thread clones must not use
-  the seed. The later fork-wiring slice owns clone-family
-  classification, parent cleanup, and any suite re-baselining.
+  restore contract learns to carry that bit; for a
+  pre-bootstrap parent, staging is refused by name and the
+  clone proceeds unstaged rather than applying a seed that
+  would skip the launcher-exec transition.
+- The fork seed is the value the current process-creating
+  clone handlers stage before a clone for the existing step-4
+  machinery to apply in the child's fresh Tool before
+  ordinary execution. Thread clones must not use the seed.
+
+Current Tool wiring is intentionally narrow: process-
+creating Clone/Clone3/Fork/Vfork handlers compute the
+accessor-produced current exe/argv before taking the capture
+lock, refuse to stage for an unbootstrapped parent by name
+(the clone proceeds unstaged), and otherwise stage the fork
+seed in the existing pending slot. The already-landed
+step-4 pending clone into `init_thread_state`, parent clear
+after inject, and `handle_thread_start` application are
+unchanged; this slice only replaces how the staged fork
+snapshot is captured. It does not publish or read
+`SharedRecord` rows in production yet.
 
 ## Shared-record snapshot
 
