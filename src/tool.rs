@@ -230,15 +230,27 @@ fn run_backend(
     if gen_fd >= 0 {
         cmd.env("LITEROOT_PROBE_GEN_FD", gen_fd.to_string());
     }
-    // Cross-process facts memfd: the launcher owns creation,
-    // registers the same handle for ptrace Tools in this
-    // process, and passes the inherited descriptor number to
-    // the guest tree. Failure is a named absence: consumers
+    // Cross-process facts memfd: the launcher owns creation
+    // and registers the handle for Tools in this process.
+    // Only an in-guest Tool needs the inherited descriptor
+    // number in its environment. Under ptrace, keep the store
+    // entirely tracer-side: no env var and no inherited copy
+    // for the guest. Failure is a named absence: consumers
     // retain today's process-local maps/statics.
+    if !in_guest {
+        cmd.env_remove(crate::shared_record::SHARED_RECORD_FD_ENV);
+    }
     match crate::shared_record::SharedRecordFile::create() {
         Ok(store) => {
             let fd = store.fd();
-            if crate::shared_record::init_shared_record_file(store) {
+            if !in_guest {
+                if let Err(err) = store.set_close_on_exec() {
+                    eprintln!(
+                        "literoot: shared record close-on-exec unavailable: {err}"
+                    );
+                }
+            }
+            if crate::shared_record::init_shared_record_file(store) && in_guest {
                 cmd.env(crate::shared_record::SHARED_RECORD_FD_ENV, fd.to_string());
             }
         }

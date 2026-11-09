@@ -273,27 +273,44 @@ impl RootfsTool {
         let Some(id) = Self::guest_process_id(guest.pid().as_raw()) else {
             return;
         };
+        let raw_exe = self.exe_guest(guest);
+        let canonical_exe = self.canonical_exe(guest, &raw_exe);
         let row = ProcessRecord {
             id,
-            exe_guest: self
-                .exe_guest(guest)
-                .as_os_str()
-                .as_bytes()
-                .to_vec(),
+            exe_guest: canonical_exe.as_os_str().as_bytes().to_vec(),
             argv: self.current_argv(guest.config()),
         };
         if let Err(err) = store.publish(row) {
-            if std::env::var_os("LITEROOT_DEBUG").is_some() {
-                eprintln!(
-                    "literoot: shared record publish unavailable: {err}"
-                );
-            }
+            eprintln!(
+                "literoot: shared record publish refused for pid {}: {err}",
+                id.pid
+            );
         }
     }
 
     fn shared_process_record(pid: i32) -> Option<ProcessRecord> {
         let id = Self::guest_process_id(pid)?;
         shared_record_file()?.lookup(id).ok().flatten()
+    }
+
+    fn set_shared_uts_nodename(name: Vec<u8>) {
+        if let Some(store) = shared_record_file() {
+            if let Err(err) = store.set_uts_nodename(Some(name)) {
+                eprintln!(
+                    "literoot: shared record UTS nodename write refused: {err}"
+                );
+            }
+        }
+    }
+
+    fn set_shared_uts_domainname(name: Vec<u8>) {
+        if let Some(store) = shared_record_file() {
+            if let Err(err) = store.set_uts_domainname(Some(name)) {
+                eprintln!(
+                    "literoot: shared record UTS domainname write refused: {err}"
+                );
+            }
+        }
     }
 
     /// Stage a fork seed for a process-creating clone. The
@@ -372,13 +389,24 @@ impl RootfsTool {
 /// numeric tail is taken after the final `)`: its first token
 /// is field 3, making start time index 19 in that tail.
 fn parse_process_start_time(stat: &[u8], pid: i32) -> Option<ProcessId> {
-    let text = std::str::from_utf8(stat).ok()?;
-    let (prefix, tail) = text.rsplit_once(')')?;
-    let raw_pid: i32 = prefix.split_whitespace().next()?.parse().ok()?;
+    // Keep this on raw bytes: the kernel comm is a truncated
+    // filename and can split a non-ASCII character, so the
+    // whole stat line is not guaranteed to be valid UTF-8.
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let prefix = &stat[..close];
+    let tail = &stat[close + 1..];
+    let raw_pid_token = prefix
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|token| !token.is_empty())?;
+    let raw_pid: i32 = std::str::from_utf8(raw_pid_token).ok()?.parse().ok()?;
     if raw_pid != pid {
         return None;
     }
-    let start_time: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+    let start_token = tail
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
+        .nth(19)?;
+    let start_time: u64 = std::str::from_utf8(start_token).ok()?.parse().ok()?;
     ProcessId::new(pid, start_time).ok()
 }
 
@@ -2328,9 +2356,7 @@ impl Tool for RootfsTool {
                         if mem.read(addr, &mut v).is_ok() {
                             *UTS_NODENAME.lock().unwrap() =
                                 Some(String::from_utf8_lossy(&v).into_owned());
-                            if let Some(store) = shared_record_file() {
-                                let _ = store.set_uts_nodename(Some(v));
-                            }
+                            Self::set_shared_uts_nodename(v);
                         }
                     }
                     Ok(0)
@@ -2349,9 +2375,7 @@ impl Tool for RootfsTool {
                         if mem.read(addr, &mut v).is_ok() {
                             *UTS_DOMAIN.lock().unwrap() =
                                 Some(String::from_utf8_lossy(&v).into_owned());
-                            if let Some(store) = shared_record_file() {
-                                let _ = store.set_uts_domainname(Some(v));
-                            }
+                            Self::set_shared_uts_domainname(v);
                         }
                     }
                     Ok(0)
@@ -4026,6 +4050,12 @@ mod tests {
             ProcessId::new(4242, 123456).ok()
         );
         assert_eq!(parse_process_start_time(stat.as_bytes(), 4243), None);
+        let mut non_utf8 = b"4242 (bad\xff) ".to_vec();
+        non_utf8.extend_from_slice(fields.join(" ").as_bytes());
+        assert_eq!(
+            parse_process_start_time(&non_utf8, 4242),
+            ProcessId::new(4242, 123456).ok()
+        );
         assert_eq!(parse_process_start_time(b"4242 (x) S", 4242), None);
         assert_eq!(parse_process_start_time(b"not-a-stat", 4242), None);
     }

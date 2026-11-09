@@ -91,17 +91,24 @@ refusal itself.
 
 `SharedRecordFile` is the first transport. The launcher
 creates one memfd, initializes it with an empty snapshot,
-registers it for Tools hosted in the launcher process, and
-passes its number through `LITEROOT_SHARED_RECORD_FD`
-following the existing probe-generation fd precedent. The
-file holds one whole length-framed snapshot, not an
-in-place shared-memory layout. The snapshot payload cap is
-`MAX_ENCODED_BYTES` = 1 MiB (plus the 8-byte frame header,
-so a 1,048,584-byte file at most), with at most 4096
-process rows. Each operation reopens `/proc/self/fd/<fd>`
-so it locks a distinct open file description with Linux
-OFD locks, then reloads or rewrites the bounded snapshot
-while holding that lock. The exact 1 MiB payload is stored;
+and registers it for Tools hosted in the launcher process.
+Only an in-guest Tool receives its number through
+`LITEROOT_SHARED_RECORD_FD`, following the existing
+probe-generation fd precedent; under ptrace the launcher
+sets close-on-exec and exports neither the descriptor nor
+the env var to the guest. The file holds one whole
+length-framed snapshot, not an in-place shared-memory
+layout. The snapshot payload cap is `MAX_ENCODED_BYTES` =
+1 MiB (plus the 8-byte frame header, so a 1,048,584-byte
+file at most), with at most 4096 process rows. Each
+operation reopens `/proc/self/fd/<fd>` so it locks a
+distinct open file description with a non-blocking Linux
+OFD lock, then reloads or rewrites the bounded snapshot
+while holding that lock. Contention retries with a yield
+and bounded exponential sleep for at most five seconds,
+rather than parking in `F_OFD_SETLKW`; after that the
+operation fails closed to the caller's local fallback.
+The exact 1 MiB payload is stored; a whole-record replace
 one byte over refuses without replacing the previous
 snapshot.
 
@@ -115,10 +122,10 @@ close_range, or scrubs the environment before exec, there
 is no guessed descriptor, record operations are
 unavailable, and each consumer retains today's
 process-local behavior. Under ptrace the Tool's descriptor
-is in the tracer, so a guest closing its own inherited copy
-does not disable the tracer's consumers. In every backend,
-a guest that deliberately writes through its copy can
-still corrupt the framed snapshot; strict decoding makes
+is only in the tracer; the guest receives neither a copy
+nor the env var. In an in-guest process, a guest that
+deliberately writes through its inherited copy can still
+corrupt the framed snapshot; strict decoding makes
 consumers fail closed to their process-local fallbacks. The
 inherited
 probe-generation descriptor is narrower: `translate.rs`
@@ -129,16 +136,22 @@ replacement made before that mmap; that is follow-up
 `dh-n6pie`, not part of this slice.
 
 Publication is from the Tool's current accessor-materialized
-exe/argv and is keyed by the host `/proc/<pid>/stat` start
-time. It happens after a fork-seed restore in
-`handle_thread_start` and after each successful post-exec
-transition. Other-process synthetic `/proc/<pid>/exe` and
-cmdline lookups consult the shared row first, then today's
-detached bare-pid maps. UTS setters write both today's
-statics and the shared fields; the uname reader prefers a
-shared field when present and otherwise retains that
-field's existing static, so a refused shared write does not
-erase the process-local value. There is intentionally
+argv and its canonical exe (`canonical_exe(exe_guest())`),
+keyed by the host `/proc/<pid>/stat` start time. The
+start-time parser works on raw stat bytes, so a non-UTF-8
+comm does not make the process unpublishable. Publication
+happens after a fork-seed restore in `handle_thread_start`
+and after each successful post-exec transition.
+Other-process synthetic `/proc/<pid>/exe` and cmdline
+lookups consult the shared row first, then today's
+detached bare-pid maps. If a publish is refused at the
+snapshot cap, the store removes that qualified row before
+returning the error and the Tool reports the refusal, so a
+stale exec image cannot outrank process-local state.
+UTS setters write both today's statics and the shared
+fields; a refused shared UTS write clears that shared
+field, reports the refusal, and the uname reader then
+retains the field's existing static. There is intentionally
 no process-exit reaping hook in this slice: qualified
 identities make stale rows non-aliasing, while removal, a
 sealed/atomic in-place layout, and permission hardening are
@@ -167,10 +180,11 @@ now:
    are never snapshotted into `ExecState`, because a sibling
    update after fork/exec must remain visible.
 4. The first transport answers the start-time source
-   (`/proc/<pid>/stat`), OFD locking, and launcher memfd
-   creation above. Reaping/removal, an atomic in-place row
-   layout, and sealing remain later transport work; this
-   codec does not pretend a copied snapshot stays live.
+   (`/proc/<pid>/stat`), bounded non-blocking OFD locking,
+   and launcher memfd creation above. Reaping/removal, an
+   atomic in-place row layout, and sealing remain later
+   transport work; this codec does not pretend a copied
+   snapshot stays live.
 
 The exec transports likewise remain as designed for B4:
 native W6a carries `ExecState` in the sealed thread-state

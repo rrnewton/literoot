@@ -527,7 +527,11 @@ fn invalid_data(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-fn lock_file(file: &File, exclusive: bool, wait: bool) -> std::io::Result<bool> {
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOCK_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+const LOCK_MAX_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn try_lock_file(file: &File, exclusive: bool) -> std::io::Result<bool> {
     let mut request: libc::flock = unsafe { std::mem::zeroed() };
     request.l_type = (if exclusive {
         libc::F_WRLCK
@@ -535,19 +539,14 @@ fn lock_file(file: &File, exclusive: bool, wait: bool) -> std::io::Result<bool> 
         libc::F_RDLCK
     }) as i16;
     request.l_whence = libc::SEEK_SET as i16;
-    let cmd = if wait {
-        libc::F_OFD_SETLKW
-    } else {
-        libc::F_OFD_SETLK
-    };
     // SAFETY: `request` is a fully initialized flock for the
     // whole file; the descriptor remains open in `file`.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), cmd, &request) };
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &request) };
     if rc == 0 {
         return Ok(true);
     }
     let err = std::io::Error::last_os_error();
-    if !wait && matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EACCES)) {
+    if matches!(err.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EACCES)) {
         return Ok(false);
     }
     Err(err)
@@ -688,12 +687,57 @@ impl SharedRecordFile {
         self.fd
     }
 
-    fn open_locked(&self, exclusive: bool) -> std::io::Result<LockedFile> {
-        self.open_locked_wait(exclusive, true)?
-            .ok_or_else(|| invalid_data("shared-record: lock unexpectedly unavailable"))
+    /// Keep this handle usable in the current (tracer) process
+    /// while ensuring a spawned guest does not inherit a copy.
+    pub fn set_close_on_exec(&self) -> std::io::Result<()> {
+        // SAFETY: F_GETFD/F_SETFD only inspect and update this
+        // descriptor's flags; ownership is unchanged.
+        let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rc = unsafe { libc::fcntl(self.fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    fn open_locked_wait(&self, exclusive: bool, wait: bool) -> std::io::Result<Option<LockedFile>> {
+    fn open_locked(&self, exclusive: bool) -> std::io::Result<LockedFile> {
+        self.open_locked_timeout(exclusive, LOCK_TIMEOUT)
+    }
+
+    fn open_locked_timeout(
+        &self,
+        exclusive: bool,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<LockedFile> {
+        // Never park in F_OFD_SETLKW. Under a deterministic
+        // ptrace scheduler the lock holder may need this
+        // process to yield/sleep before it can run and release
+        // the lock; a kernel lock wait can therefore deadlock
+        // the guest tree. Reopen and revalidate on every try,
+        // then yield and sleep with bounded exponential delay.
+        let deadline = std::time::Instant::now() + timeout;
+        let mut delay = LOCK_INITIAL_RETRY;
+        loop {
+            if let Some(locked) = self.open_locked_try(exclusive)? {
+                return Ok(locked);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "shared-record: lock contention timeout",
+                ));
+            }
+            std::thread::yield_now();
+            std::thread::sleep(delay.min(deadline - now));
+            delay = (delay * 2).min(LOCK_MAX_RETRY);
+        }
+    }
+
+    fn open_locked_try(&self, exclusive: bool) -> std::io::Result<Option<LockedFile>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -704,7 +748,7 @@ impl SharedRecordFile {
         if file_identity(&file)? != self.identity {
             return Err(invalid_data("shared-record: file identity mismatch"));
         }
-        if lock_file(&file, exclusive, wait)? {
+        if try_lock_file(&file, exclusive)? {
             Ok(Some(LockedFile { file }))
         } else {
             Ok(None)
@@ -713,7 +757,7 @@ impl SharedRecordFile {
 
     #[cfg(test)]
     fn try_lock_exclusive_for_test(&self) -> std::io::Result<Option<LockedFile>> {
-        self.open_locked_wait(true, false)
+        self.open_locked_try(true)
     }
 
     pub fn snapshot(&self) -> std::io::Result<SharedRecord> {
@@ -727,10 +771,26 @@ impl SharedRecordFile {
     pub fn publish(&self, record: ProcessRecord) -> std::io::Result<()> {
         let locked = self.open_locked(true)?;
         let mut snapshot = locked.read_snapshot()?;
-        snapshot
-            .publish(record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        locked.write_snapshot(&snapshot)
+        let id = record.id;
+        if let Err(err) = snapshot.publish(record) {
+            let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string());
+            if snapshot.remove(id) {
+                let _ = locked.write_snapshot(&snapshot);
+            }
+            return Err(err);
+        }
+        if let Err(err) = locked.write_snapshot(&snapshot) {
+            // A refused replacement must not leave its stale
+            // predecessor to outrank process-local state. This
+            // snapshot is the previously valid one plus the
+            // attempted replacement, so removing that row can
+            // only shrink it back under the cap.
+            if snapshot.remove(id) {
+                let _ = locked.write_snapshot(&snapshot);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn publish_exec_state(&self, id: ProcessId, state: &ExecState) -> std::io::Result<()> {
@@ -764,7 +824,16 @@ impl SharedRecordFile {
         snapshot
             .set_uts_nodename(name)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        locked.write_snapshot(&snapshot)
+        if let Err(err) = locked.write_snapshot(&snapshot) {
+            // Clearing the attempted field can only shrink the
+            // previously valid snapshot, and prevents its stale
+            // value from outranking the caller's local update.
+            if snapshot.set_uts_nodename(None).is_ok() {
+                let _ = locked.write_snapshot(&snapshot);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn set_uts_domainname(&self, name: Option<Vec<u8>>) -> std::io::Result<()> {
@@ -773,7 +842,13 @@ impl SharedRecordFile {
         snapshot
             .set_uts_domainname(name)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        locked.write_snapshot(&snapshot)
+        if let Err(err) = locked.write_snapshot(&snapshot) {
+            if snapshot.set_uts_domainname(None).is_ok() {
+                let _ = locked.write_snapshot(&snapshot);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -1300,6 +1375,125 @@ mod tests {
     }
 
     #[test]
+    fn lock_retry_is_bounded() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let guard = store
+            .try_lock_exclusive_for_test()
+            .expect("try lock")
+            .expect("initial lock is free");
+        let contender = SharedRecordFile {
+            fd: store.fd(),
+            identity: store.identity,
+        };
+        let started = std::time::Instant::now();
+        let err = match contender.open_locked_timeout(true, std::time::Duration::from_millis(25)) {
+            Ok(_) => panic!("bounded retry must time out while the lock is held"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "bounded retry took {:?}",
+            started.elapsed()
+        );
+        drop(guard);
+        contender
+            .open_locked_timeout(true, std::time::Duration::from_secs(1))
+            .expect("lock after release");
+    }
+
+    #[test]
+    fn lock_contention_child_helper() {
+        use std::io::Write as _;
+
+        let Some(raw) = std::env::var_os("LITEROOT_SHARED_RECORD_TEST_CHILD_FD") else {
+            return;
+        };
+        let fd: RawFd = raw.to_string_lossy().parse().expect("child fd number");
+        let store = SharedRecordFile {
+            fd,
+            identity: identity_of_fd(fd).expect("child fstat inherited memfd"),
+        };
+        assert!(
+            store
+                .try_lock_exclusive_for_test()
+                .expect("child try lock")
+                .is_none(),
+            "child process unexpectedly took the parent-held OFD lock"
+        );
+        println!("LOCK_BLOCKED");
+        std::io::stdout().flush().expect("flush blocked marker");
+        store
+            .publish(row(4242, 777, b"/bin/child"))
+            .expect("child publish after parent releases the lock");
+        println!("LOCK_PUBLISHED");
+        std::io::stdout().flush().expect("flush published marker");
+    }
+
+    #[test]
+    fn lock_contention_between_processes_retries_until_release() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os("LITEROOT_SHARED_RECORD_TEST_CHILD_FD").is_some() {
+            return;
+        }
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let guard = store
+            .try_lock_exclusive_for_test()
+            .expect("parent try lock")
+            .expect("parent lock is free");
+        let mut child = Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "shared_record::tests::lock_contention_child_helper",
+                "--nocapture",
+            ])
+            .env(
+                "LITEROOT_SHARED_RECORD_TEST_CHILD_FD",
+                store.fd().to_string(),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn lock-contention child test process");
+        let stdout = child.stdout.take().expect("child stdout pipe");
+        let mut lines = BufReader::new(stdout).lines();
+        let mut saw_blocked = false;
+        for line in lines.by_ref() {
+            let line = line.expect("read child stdout");
+            if line.contains("LOCK_BLOCKED") {
+                saw_blocked = true;
+                break;
+            }
+        }
+        assert!(
+            saw_blocked,
+            "child did not report cross-process lock contention"
+        );
+        drop(guard);
+
+        let mut saw_published = false;
+        for line in lines {
+            let line = line.expect("read child stdout after release");
+            if line.contains("LOCK_PUBLISHED") {
+                saw_published = true;
+            }
+            // Drain to EOF so the child harness does not get
+            // SIGPIPE while printing its own test result.
+        }
+        assert!(saw_published, "child did not publish after lock release");
+        let status = child.wait().expect("wait for lock-contention child");
+        assert!(status.success(), "child helper failed: {status}");
+        assert_eq!(
+            store
+                .lookup(ProcessId::new(4242, 777).unwrap())
+                .expect("lookup child row"),
+            Some(row(4242, 777, b"/bin/child"))
+        );
+    }
+
+    #[test]
     fn file_store_accepts_exact_snapshot_cap_and_rejects_one_byte_over() {
         let store = SharedRecordFile::create().expect("create shared-record memfd");
         let mut record = SharedRecord::new();
@@ -1327,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn file_store_rejects_oversized_frame_without_rewriting_previous_snapshot() {
+    fn file_store_rejects_oversized_frame_header() {
         use std::os::unix::fs::FileExt;
 
         let store = SharedRecordFile::create().expect("create shared-record memfd");
@@ -1342,6 +1536,117 @@ mod tests {
             .expect("write oversized frame header");
         let err = store.snapshot().expect_err("oversized frame must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn file_store_rejects_frame_length_mismatch() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.replace(&sample()).expect("store good snapshot");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", store.fd()))
+            .expect("reopen memfd");
+        let len = file.metadata().expect("frame length").len();
+        file.set_len(len + 1).expect("append one unmatched byte");
+        let err = store
+            .snapshot()
+            .expect_err("frame length mismatch must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("frame length mismatch"),
+            "unexpected frame error: {err}"
+        );
+    }
+
+    #[test]
+    fn file_store_refused_uts_write_clears_stale_field() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let mut record =
+            SharedRecord::from_parts(Some(b"first".to_vec()), Some(b"dom".to_vec()), Vec::new())
+                .expect("record with UTS fields");
+        let mut filler = row(1, 1, b"/bin/big");
+        filler.argv = vec![Vec::new()];
+        record.publish(filler.clone()).expect("publish filler base");
+        let overhead = record.encode().expect("encode exact-cap base").len();
+        filler.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record
+            .publish(filler.clone())
+            .expect("publish exact filler");
+        assert_eq!(
+            record.encode().expect("encode exact cap").len(),
+            MAX_ENCODED_BYTES
+        );
+        store.replace(&record).expect("store exact cap");
+
+        let err = store
+            .set_uts_nodename(Some(b"second-longer-name".to_vec()))
+            .expect_err("over-cap UTS replacement must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store.uts().expect("UTS after refusal"),
+            (None, Some(b"dom".to_vec()))
+        );
+        assert_eq!(
+            store
+                .lookup(filler.id)
+                .expect("lookup filler after UTS refusal"),
+            Some(filler)
+        );
+    }
+
+    #[test]
+    fn file_store_refused_publish_removes_stale_row() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        let mut target = row(1, 1, b"/bin/target");
+        target.argv = vec![b"target".to_vec()];
+        let mut filler = row(2, 1, b"/bin/big");
+        filler.argv = vec![Vec::new()];
+        let mut record = SharedRecord::new();
+        record.publish(target.clone()).expect("publish target base");
+        record.publish(filler.clone()).expect("publish filler base");
+        let overhead = record.encode().expect("encode exact-cap base").len();
+        filler.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record
+            .publish(filler.clone())
+            .expect("publish exact filler");
+        assert_eq!(
+            record.encode().expect("encode exact cap").len(),
+            MAX_ENCODED_BYTES
+        );
+        store.replace(&record).expect("store exact cap");
+
+        let mut replacement = target.clone();
+        replacement.argv[0].push(b'x');
+        let err = store
+            .publish(replacement)
+            .expect_err("one-byte-larger replacement must refuse at the cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store.lookup(target.id).expect("lookup refused target"),
+            None,
+            "stale target row must be removed after a refused replacement"
+        );
+        assert_eq!(
+            store
+                .lookup(filler.id)
+                .expect("lookup filler after refusal"),
+            Some(filler.clone())
+        );
+
+        let mut invalid = filler.clone();
+        invalid.exe_guest = b"relative/path".to_vec();
+        let err = store
+            .publish(invalid)
+            .expect_err("invalid replacement must also refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store
+                .lookup(filler.id)
+                .expect("lookup invalidly replaced row"),
+            None,
+            "any refused replacement must leave no stale row"
+        );
     }
 
     #[test]
