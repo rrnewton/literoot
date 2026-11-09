@@ -274,6 +274,103 @@ unsafe impl reverie_liteinst::NativeSuccessorConsumer<rootfs_tool::RootfsTool>
     }
 }
 
+/// E2-3c slice 4: initialize the mapped successor from its
+/// captured/adopted prelude. This is the Rust initializer the
+/// physical mapped entry calls after capture, private libc
+/// initialization, region adoption, and tool-init enablement;
+/// it is not itself the C-ABI mapped entry.
+///
+/// Order is the settled contract: straddler token first,
+/// HLISUC01 only through the prelude delegate, coordinator
+/// endpoint only from the sealed table-4 carriage, fresh
+/// successor connect by path, runtime split/verify before any
+/// `ExecState` decode, digests only from
+/// `VerifiedSuccessorState`, then prepare -> install ->
+/// mapped lifecycle (post-exec only) -> finish.
+///
+/// # Safety
+/// The caller retains every capture/adoption physical
+/// obligation that produced `mapped`, the same stopped
+/// generation and host terminal owner, and real private
+/// libc/TLS/FD cleanup. No guest instruction has run in this
+/// image. Errors are terminal for this image; the entry must
+/// not fall back to an ordinary or InitialImage route.
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+pub unsafe fn literoot_mapped_successor_initialize(
+    mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
+) -> std::io::Result<()> {
+    use reverie_inguest::guest::exec_private::mapped_initial::mapped_scalar::SuccessorPacketSource as _;
+    use reverie_liteinst::NativeSuccessorConsumer as _;
+    use reverie_rpc_transport::birth_authority::verify_split_and_decode;
+    use reverie_rpc_transport::successor::{ExpectedSuccessor, SuccessorRequest};
+
+    let straddler = reverie_liteinst::validate_straddler_selector()?;
+    // The successor image's own future execs stage through the
+    // same coordinator endpoint on the mapped route.
+    let coordinator = mapped
+        .coordinator_path()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.name()))?;
+    crate::exec_stage::set_coordinator_path(coordinator.clone());
+    let packet = mapped
+        .successor_init_packet()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.name()))?;
+    let stream = std::os::unix::net::UnixStream::connect(&coordinator)?;
+    let stream = reverie_inguest::guest::rpc::move_ordinary_coordinator_stream(stream)?;
+    let tid = reverie::Pid::from_raw(mapped.native_tid());
+    let request = SuccessorRequest {
+        ticket: packet.redemption(),
+        expected: ExpectedSuccessor {
+            config: packet.expected_config_digest(),
+            state: packet.expected_state_digest(),
+        },
+    };
+    let client = reverie_rpc_transport::BlockingRpcClient::<
+        rootfs_tool::LiterootGlobal,
+        reverie_inguest::guest::rpc::GuestRpcStream,
+    >::successor_from_connected_stream(
+        reverie_inguest::guest::rpc::GuestRpcStream::from(stream),
+        tid,
+        request,
+    )
+    .map_err(std::io::Error::other)?;
+    let config = client.config().clone();
+    let consumer = RootfsSuccessorConsumer::new(config.clone());
+    consumer.qualify_config(&config)?;
+    let packet_expected = ExpectedSuccessor {
+        config: packet.expected_config_digest(),
+        state: packet.expected_state_digest(),
+    };
+    let (_runtime, (tool, state)) = verify_split_and_decode(
+        client.state(),
+        packet_expected,
+        |bytes| decode_successor_state(&config, bytes).map_err(reverie_rpc_transport::RpcError::from),
+    )
+    .map_err(std::io::Error::other)?;
+    let verified = reverie_liteinst::MappedSuccessorVerifiedDigests::from(client.state());
+    let (blocking_client, _verified_state) = client.into_parts();
+    let preparation = reverie_liteinst::MappedSuccessorPreparation {
+        client: blocking_client,
+        mapped,
+        tool,
+        state,
+        verified,
+    };
+    // SAFETY: straddler token obtained before redemption above
+    // in program order is not satisfiable after the fact; the
+    // token was obtained before constructing/redeeming the
+    // admitted client in this function, and all prepare
+    // obligations are the caller's per this entry contract.
+    let prepared = unsafe {
+        reverie_liteinst::prepare_tool_mapped_successor_image_validated(straddler, preparation)
+    }?;
+    // SAFETY: prepared retains the exact selected Tool/state
+    // bound by prepare's three digest checks above.
+    let installed =
+        unsafe { reverie_liteinst::install_tool_mapped_successor_image(&coordinator, prepared) }?;
+    reverie_liteinst::initialize_mapped_successor_lifecycle(&installed)?;
+    installed.finish()
+}
+
 #[cfg(all(test, feature = "successor"))]
 mod successor_tests {
     use super::*;

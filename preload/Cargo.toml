@@ -28,6 +28,15 @@ successor = [
     "reverie-liteinst/exec-native-injection",
     "reverie-inguest/exec-native-injection",
 ]
+# Mapped successor consumer (E2-3c slice 4): the mapped-musl
+# successor initializer on top of the successor seam. The
+# physical mapped entry and host harness select this feature
+# for the private successor image only.
+mapped-successor = [
+    "successor",
+    "reverie-liteinst/loader-private-runtime",
+    "reverie-inguest/loader-private-runtime",
+]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "02973cdcfcadd21190fda864dfa9eb1b3e6ed1c1" }
