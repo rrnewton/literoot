@@ -1282,13 +1282,13 @@ impl Tool for RootfsTool {
                     });
             }
         }
-        let fork_like = matches!(
-            syscall.number(),
-            reverie::syscalls::Sysno::fork
-                | reverie::syscalls::Sysno::vfork
-                | reverie::syscalls::Sysno::clone
-                | reverie::syscalls::Sysno::clone3
-        );
+        // aarch64 has no fork/vfork syscalls; only clone/clone3.
+        let fork_like = match syscall.number() {
+            #[cfg(target_arch = "x86_64")]
+            reverie::syscalls::Sysno::fork | reverie::syscalls::Sysno::vfork => true,
+            reverie::syscalls::Sysno::clone | reverie::syscalls::Sysno::clone3 => true,
+            _ => false,
+        };
         let result = match syscall {
             Syscall::Openat(openat) => {
                 // O_CREAT opens can create components (kind
