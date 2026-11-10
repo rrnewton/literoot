@@ -56,6 +56,10 @@ serde = { version = "1.0.219", features = ["derive"] }
 
 
 
+[lints.rust]
+# Set only by an evidence build against dh-axoec (see src/lib.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(literoot_dh_axoec)"] }
+
 [patch.crates-io]
 liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }
 

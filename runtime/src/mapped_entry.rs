@@ -138,6 +138,40 @@ mod tests {
         assert!(valid_input_range(address, 1024 * 1024));
     }
 
+    /// HLMLAY01 decoded and checked as Reverie's producer does in
+    /// `AuditedRuntimeImage::new` (reverie-inguest
+    /// launcher/exec_stop/producer.rs:251-274 at 073e61ea): twelve
+    /// little-endian words from the 96 bytes. Words 3-5 are P's
+    /// `handoff::{VERSION, HEADER_BYTES, MAX_BYTES}`, which
+    /// `mapped_initial` re-exports under these names; word 10 is P's
+    /// `NATIVE_GATE.start`, `RUNTIME_WINDOW.start + PAGE` (producer.rs:99,
+    /// reverie-loader artifact.rs:65). The literal P check, on the real
+    /// ELF, is d2's `AuditedRuntimeImage::new` acceptance.
+    #[test]
+    fn the_layout_decodes_as_the_producer_checks_it() {
+        let raw: Vec<u8> = MAPPED_LAYOUT.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(raw.len(), 96);
+        let mut d = [0u64; 12];
+        for (out, row) in d.iter_mut().zip(raw.chunks_exact(8)) {
+            *out = u64::from_le_bytes(row.try_into().unwrap());
+        }
+        assert_eq!(
+            d[..6],
+            [
+                u64::from_le_bytes(*b"HLMLAY01"),
+                1,
+                96,
+                mapped_initial::MAPPED_INPUT_VERSION,
+                mapped_initial::MAPPED_INPUT_HEADER_BYTES as u64,
+                mapped_initial::MAPPED_INPUT_MAX_BYTES as u64,
+            ]
+        );
+        assert!(d[6] > 0 && d[8] > 0);
+        assert!(d[7].is_power_of_two() && d[9].is_power_of_two());
+        assert_eq!(d[10], 0x6000_e100_0000 + 4096);
+        assert_eq!(d[11], d[10] + 0x7c);
+    }
+
     #[test]
     fn mapped_entry_bounds_refuse_null_alignment_short_excess_and_wrap() {
         let address = 0x6000_1000_0000;

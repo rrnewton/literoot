@@ -11,10 +11,23 @@
 //!   runs through the fallback continuation, zero ptrace and no
 //!   reverie-liteinst in the graph at all.
 
+// Until dh-axoec lands on Reverie main, the mapped successor needs Reverie
+// API that exists only on that branch (`valid_mapped_input_range`,
+// `MappedToolPrelude::coordinator_path`; Reverie 30cf50e5). The feature
+// fails here by name instead of on a missing item.
+// scripts/check-mapped-successor-refusal.sh pins this message. An evidence
+// build against that branch sets `--cfg literoot_dh_axoec`; when dh-axoec
+// lands, the cfg and this refusal go.
+#[cfg(all(feature = "mapped-successor", not(literoot_dh_axoec)))]
+compile_error!(
+    "literoot-preload: the mapped-successor feature needs dh-axoec, whose Reverie \
+     mapped-entry API is not on Reverie main yet"
+);
+
 #[path = "../../src/arch.rs"]
 mod arch;
 mod exec_stage;
-#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+#[cfg(all(feature = "mapped-successor", target_env = "musl", literoot_dh_axoec))]
 #[path = "../../runtime/src/mapped_entry.rs"]
 mod mapped_entry;
 #[path = "../../src/exec_state.rs"]
@@ -330,7 +343,7 @@ unsafe impl reverie_liteinst::NativeSuccessorConsumer<reporting::ReportingTool>
 /// libc/TLS/FD cleanup. No guest instruction has run in this
 /// image. Errors are terminal for this image; the entry must
 /// not fall back to an ordinary or InitialImage route.
-#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+#[cfg(all(feature = "mapped-successor", target_env = "musl", literoot_dh_axoec))]
 pub unsafe fn literoot_mapped_successor_initialize(
     mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
 ) -> std::io::Result<()> {
