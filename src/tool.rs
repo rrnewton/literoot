@@ -252,11 +252,15 @@ pub fn run_guest(
                 guest_prog.clone(),
             )
         } else {
-            // PATH lookup inside the rootfs (guest PATH dirs).
-            let found = find_guest_in_path(config, cwd_guest, &guest_prog).ok_or_else(|| {
-                command_not_runnable();
-                format!("literoot: {guest_prog}: not found in rootfs PATH")
-            })?;
+            // PATH lookup inside the rootfs (guest PATH dirs). An
+            // unexpected error from a candidate is a keyed launcher
+            // refusal, as on the command path below.
+            let found = find_guest_in_path(config, cwd_guest, &guest_prog)
+                .map_err(|e| format!("literoot: {guest_prog}: rootfs PATH search: {e}"))?
+                .ok_or_else(|| {
+                    command_not_runnable();
+                    format!("literoot: {guest_prog}: not found in rootfs PATH")
+                })?;
             let host = resolve_in_rootfs(config, cwd_guest, Path::new(&found));
             (host, found)
         };
@@ -1018,22 +1022,36 @@ fn resolve_in_rootfs(config: &RootConfig, cwd_guest: &Path, guest: &Path) -> Pat
     config.translate(&guest, cwd_guest, None)
 }
 
-fn find_guest_in_path(config: &RootConfig, cwd_guest: &Path, prog: &str) -> Option<String> {
+/// The first PATH candidate that is a regular file, as its guest path.
+/// A candidate that is missing, not a file, or fails with one of the
+/// command-path errors (`path_error_is_not_runnable`) is skipped; any other
+/// error ends the search with that error, so it is never taken for "not
+/// found".
+fn find_guest_in_path(
+    config: &RootConfig,
+    cwd_guest: &Path,
+    prog: &str,
+) -> std::io::Result<Option<String>> {
     // Guest PATH from the environment (proot semantics: empty
     // PATH finds nothing; unset uses the execvp default).
     // Unset PATH: proot performs no search (test-path-search).
-    let path_env = std::env::var("PATH").ok()?;
+    let Ok(path_env) = std::env::var("PATH") else {
+        return Ok(None);
+    };
     for dir in path_env.split(':') {
         if dir.is_empty() {
             continue;
         }
         let guest = Path::new(dir).join(prog);
         let cand = config.translate(&guest, cwd_guest, None);
-        if cand.is_file() {
-            return Some(guest.to_string_lossy().into_owned());
+        match std::fs::metadata(&cand) {
+            Ok(md) if md.is_file() => return Ok(Some(guest.to_string_lossy().into_owned())),
+            Ok(_) => {}
+            Err(e) if path_error_is_not_runnable(&e) => {}
+            Err(e) => return Err(e),
         }
     }
-    None
+    Ok(None)
 }
 
 /// Minimal shebang parse for the launcher (mirrors the Tool's).

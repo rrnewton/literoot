@@ -655,3 +655,70 @@ fn a_failed_log_write_exits_nonzero_from_help_and_version_too() {
         assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
     }
 }
+
+/// Loaded into the literoot launcher (not the guest): `statx` fails with EIO
+/// for any path holding the marker, and goes to libc's for every other path.
+/// Rust's std calls `statx` through libc so that LD_PRELOAD can interpose it.
+const STATX_EIO_C: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/stat.h>
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *buf) {
+    static int (*real)(int, const char *, int, unsigned int, struct statx *);
+    if (path && strstr(path, "literoot-eio-marker")) {
+        errno = EIO;
+        return -1;
+    }
+    if (!real) real = (int (*)(int, const char *, int, unsigned int, struct statx *))dlsym(RTLD_NEXT, "statx");
+    return real(dirfd, path, flags, mask, buf);
+}
+"#;
+
+/// An unexpected error while looking up the guest command is a keyed
+/// launcher refusal, through the PATH search as on the command path; a
+/// candidate that is simply missing stays unkeyed, as real proot also fails
+/// there (review of g2 98d28848 by rev5338-cx, F2). EIO comes from a statx
+/// shim in the launcher, so the witness runs through the real search,
+/// caller and log finalization.
+#[test]
+fn an_unexpected_command_lookup_error_is_keyed_on_path_search_and_command_path() {
+    let Some((scratch, _guest)) = scratch("lookup-eio") else {
+        return;
+    };
+    let src = scratch.0.join("statx_eio.c");
+    let shim = scratch.0.join("statx_eio.so");
+    std::fs::write(&src, STATX_EIO_C).unwrap();
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-O2", "-o"])
+        .arg(&shim)
+        .arg(&src)
+        .arg("-ldl")
+        .output()
+        .expect("cc is required to build the statx shim");
+    if !fixture_or_skip(&built, "statx shim") {
+        return;
+    }
+    let run = |label: &str, path: &str, command: &str| -> (Option<i32>, Result<Vec<String>, String>, String) {
+        let log = scratch.0.join(format!("logs/{label}"));
+        let out = Command::new(literoot_bin())
+            .arg("--refusal-log")
+            .arg(&log)
+            .arg(command)
+            .env("PATH", path)
+            .env("LD_PRELOAD", &shim)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run literoot");
+        (out.status.code(), check(&log), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let keyed = Ok(vec!["refused launcher other".to_owned()]);
+    let (code, refused, stderr) = run("path-eio", "/literoot-eio-marker", "literoot-no-such-prog");
+    assert_eq!((code, &refused), (Some(125), &keyed), "PATH search: {stderr}");
+    assert!(stderr.contains("Input/output error"), "{stderr}");
+    let (code, refused, stderr) = run("path-missing", "/nonexistent-literoot-dir", "literoot-no-such-prog");
+    assert_eq!((code, refused), (Some(125), Ok(Vec::new())), "missing on PATH: {stderr}");
+    let (code, refused, stderr) = run("command-eio", "/usr/bin:/bin", "/literoot-eio-marker/prog");
+    assert_eq!((code, &refused), (Some(125), &keyed), "command path: {stderr}");
+}

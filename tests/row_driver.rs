@@ -92,6 +92,17 @@ fn the_free_space_guard_refuses_what_it_cannot_measure() {
     );
     assert_eq!(out.status.code(), Some(64), "{out:?}");
 
+    // 2^64: all digits, but too large for bash's integers (review of g2
+    // 98d28848 by rev5338-cx, F1).
+    let out = row(
+        root,
+        "hugefloor",
+        &[("LITEROOT_SIDELOG_MIN_FREE_KB", "18446744073709551616")],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(64), "{out:?}");
+
     let out = row(
         root,
         "floor",
@@ -122,5 +133,29 @@ fn the_free_space_guard_refuses_what_it_cannot_measure() {
     assert_eq!(
         pername(root, "nodf"),
         "test-one.sh not-measured free-space-unmeasured keys: none\n"
+    );
+
+    // A df reading of 2^64 KiB: all digits, but no comparison with the
+    // floor can be evaluated, so the name is not measured (F1).
+    let huge = root.join("hugebin");
+    std::fs::create_dir_all(&huge).unwrap();
+    let df = huge.join("df");
+    std::fs::write(
+        &df,
+        "#!/bin/sh\necho Filesystem\necho x 1 2 18446744073709551616\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&df, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = row(
+        root,
+        "hugedf",
+        &[("LITEROOT_SIDELOG_MIN_FREE_KB", "0")],
+        Some(&huge),
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        pername(root, "hugedf"),
+        "test-one.sh not-measured free-space keys: none\n"
     );
 }

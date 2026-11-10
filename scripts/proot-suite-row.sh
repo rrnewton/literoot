@@ -24,9 +24,10 @@
 # whose log is missing, fails `literoot --check-refusal-log`, or whose
 # run breached the free-space floor (LITEROOT_SIDELOG_MIN_FREE_KB on the
 # log's filesystem, default 1048576, checked before and after), or whose
-# free space could not be measured as a number either time, is "not
-# measured", with the reason and any keys its log holds. A floor that is
-# not a number is a usage error (exit 64). A name whose valid log records any refusal is reported as
+# free space could not be measured as a number either time, or could not
+# be compared with the floor (a reading too large for bash's integers), is
+# "not measured", with the reason and any keys its log holds. A floor that
+# is not a number of at most 18 digits is a usage error (exit 64). A name whose valid log records any refusal is reported as
 # "<verdict>-with-refusal <keys>" and is counted in no pass number. A
 # skipped name is a refusal (literoot exits 125 on launcher errors) and
 # is reported with its keys, or as unkeyed. Output: <label>.pername (one
@@ -40,7 +41,7 @@ if [ "${1:-}" = --per-name ]; then
     shift
 fi
 if [ $# -lt 4 ]; then
-    sed -n '2,35p' "$0"
+    sed -n '2,36p' "$0"
     exit 64
 fi
 src=$1 out=$2 label=$3
@@ -57,9 +58,10 @@ if [ -n "$per_name" ]; then
     rm -rf "$logs"
     mkdir -p "$logs"
     floor=${LITEROOT_SIDELOG_MIN_FREE_KB:-1048576}
+    # At most 18 digits, so bash's 64-bit integers always hold it.
     case $floor in
-        '' | *[!0-9]*)
-            echo "LITEROOT_SIDELOG_MIN_FREE_KB=$floor is not a number of KiB" >&2
+        '' | *[!0-9]* | ???????????????????*)
+            echo "LITEROOT_SIDELOG_MIN_FREE_KB=$floor is not a number of KiB (at most 18 digits)" >&2
             exit 64
             ;;
     esac
@@ -102,7 +104,10 @@ if [ -n "$per_name" ]; then
             END { print (cur == "" ? "none" : cur) }' "$name_log")
         if [ -z "$before" ] || [ -z "$after" ]; then
             status="not-measured free-space-unmeasured keys: $(present_keys)"
-        elif [ "$before" -lt "$floor" ] || [ "$after" -lt "$floor" ]; then
+        elif ! [ "$before" -ge "$floor" ] || ! [ "$after" -ge "$floor" ]; then
+            # Fail-safe: a comparison bash cannot evaluate (a reading too
+            # large for its integers) is not true, so the name is not
+            # measured rather than passed through.
             status="not-measured free-space keys: $(present_keys)"
         elif [ ! -e "$side" ]; then
             status="not-measured no-side-log"

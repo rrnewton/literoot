@@ -79,7 +79,7 @@ fn every_exec_stop_only_stack_walk_patch_is_keyed() {
     let lines: Vec<&str> = source.lines().collect();
     let marker = lines
         .iter()
-        .position(|l| l.contains("C4: the initial-stack walk (exec stop only)"))
+        .position(|l| l.contains("C4: the initial-stack walk."))
         .expect("the initial-stack walk marker is gone");
     let guard = (marker..lines.len())
         .find(|&i| lines[i].trim_start().starts_with("if "))
