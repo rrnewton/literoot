@@ -100,6 +100,18 @@ fn command_not_runnable() {
     COMMAND_NOT_RUNNABLE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether a failed lookup of the guest command is exempt from a side-log
+/// key: only the errors the command path itself causes, which a native
+/// execve and real proot also return for the same argv. Any other I/O error
+/// (EIO, ENOMEM, EOVERFLOW, ...) is a keyed launcher refusal
+/// (`launcher other`).
+fn path_error_is_not_runnable(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::EACCES | libc::ELOOP | libc::ENAMETOOLONG)
+    )
+}
+
 /// Whether the launch failed because the guest command cannot be executed.
 pub fn command_was_not_runnable() -> bool {
     COMMAND_NOT_RUNNABLE.load(std::sync::atomic::Ordering::SeqCst)
@@ -121,6 +133,33 @@ fn launch_error(backend: &str, error: impl std::fmt::Display) -> String {
 /// Whether an in-guest launch returned an error.
 pub fn launch_failed() -> bool {
     LAUNCH_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Set when an in-guest run finished while the side log was open and no
+/// preload process had reported (`rootfs_tool::REPORTER_ACKNOWLEDGED`):
+/// the preload predates the refusal side log, so the launcher ends its log
+/// `error reporter`, which no test name can count.
+static REPORTER_MISSING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+fn check_reporter(preload: &Path) {
+    use std::sync::atomic::Ordering;
+    if crate::refusal_log::is_open()
+        && !crate::rootfs_tool::REPORTER_ACKNOWLEDGED.load(Ordering::SeqCst)
+    {
+        REPORTER_MISSING.store(true, Ordering::SeqCst);
+        eprintln!(
+            "literoot: --refusal-log: the preload {} sent no refusal report; it \
+             predates the refusal side log (rebuild it from this literoot)",
+            preload.display()
+        );
+    }
+}
+
+/// Whether an in-guest run finished without a reporter.
+pub fn reporter_missing() -> bool {
+    REPORTER_MISSING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
@@ -240,7 +279,9 @@ pub fn run_guest(
             }
             Ok(_) => {}
             Err(e) => {
-                command_not_runnable();
+                if path_error_is_not_runnable(&e) {
+                    command_not_runnable();
+                }
                 return Err(format!("literoot: {guest_prog}: {e}"));
             }
         }
@@ -448,10 +489,11 @@ fn run_backend(
             let (output, _global) = runtime.block_on(async {
                 reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
                     RootfsTool,
-                >(cmd, cfg, preload, selector.clone())
+                >(cmd, cfg, preload.clone(), selector.clone())
                 .await
                 .map_err(|e| launch_error(backend, e))
             })?;
+            check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
             use std::os::unix::process::ExitStatusExt;
@@ -483,12 +525,13 @@ fn run_backend(
                 reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
                     cmd,
                     cfg,
-                    preload,
+                    preload.clone(),
                     selector.clone(),
                 )
                 .await
                 .map_err(|e| launch_error(backend, e))
             })?;
+            check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
             use std::os::unix::process::ExitStatusExt;
@@ -1017,6 +1060,23 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Some((interp, opt))
+}
+
+#[cfg(test)]
+mod not_runnable_tests {
+    use super::path_error_is_not_runnable;
+
+    #[test]
+    fn only_command_path_errors_are_exempt_from_a_key() {
+        let e = std::io::Error::from_raw_os_error;
+        for errno in [libc::ENOENT, libc::ENOTDIR, libc::EACCES, libc::ELOOP, libc::ENAMETOOLONG] {
+            assert!(path_error_is_not_runnable(&e(errno)), "{errno}");
+        }
+        for errno in [libc::EIO, libc::ENOMEM, libc::EOVERFLOW, libc::EPERM] {
+            assert!(!path_error_is_not_runnable(&e(errno)), "{errno}");
+        }
+        assert!(!path_error_is_not_runnable(&std::io::Error::other("x")));
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@
 //! `handle_syscall_event` and `on_exit_process`; every other method keeps
 //! the trait default here, as it does there.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use reverie::Errno;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -31,6 +34,7 @@ use reverie::Tid;
 use reverie::Tool;
 use reverie::UnsupportedOperation;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 #[cfg(feature = "inguest-trap")]
 use reverie_inguest::guest::protect as records;
 #[cfg(not(feature = "inguest-trap"))]
@@ -100,10 +104,16 @@ fn drained() -> Vec<Refusal> {
     found
 }
 
+/// Whether this process has sent its first report. A forked child
+/// inherits `true`; one acknowledgement per run is what the launcher needs.
+static ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
+
 /// Send `refusals` to the launcher, which writes them before it answers.
-/// An empty drain sends nothing.
+/// An empty drain sends nothing, except the first in a process: that report
+/// acknowledges the reporter, which a preload built before the side log
+/// never sends (`rootfs_tool::REPORTER_ACKNOWLEDGED`).
 async fn report<G: GlobalRPC<LiterootGlobal> + ?Sized>(rpc: &G, refusals: Vec<Refusal>) {
-    if !refusals.is_empty() {
+    if !refusals.is_empty() || !ACKNOWLEDGED.swap(true, Ordering::AcqRel) {
         rpc.send_rpc(Refused(refusals)).await;
     }
 }
@@ -132,7 +142,14 @@ impl Tool for ReportingTool {
     }
 
     fn subscriptions(cfg: &LiterootConfig) -> Subscription {
-        RootfsTool::subscriptions(cfg)
+        // execveat too: unsubscribed, the in-guest runtime refuses it
+        // with no record (its injected-syscall guard), so the log
+        // would miss it. Subscribed, RootfsTool's catch-all injects
+        // it unchanged and the typed Exec refusal reaches the drain
+        // below; the guest sees the same result either way.
+        let mut subs = RootfsTool::subscriptions(cfg);
+        subs.syscalls([Sysno::execveat]);
+        subs
     }
 
     fn init_thread_state(

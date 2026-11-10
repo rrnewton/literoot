@@ -202,16 +202,14 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             "--help" | "-h" => {
                 print_usage();
-                side_log::end(None);
-                std::process::exit(0);
+                exit_after_parse();
             }
             "--version" => {
                 println!("{VERSION_LINE}");
                 println!(
                     "backend: reverie-ptrace (POC reference); in-guest liteinst/trap: design §3"
                 );
-                side_log::end(None);
-                std::process::exit(0);
+                exit_after_parse();
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 // Combined short flags with attached values, proot-style
@@ -410,7 +408,13 @@ fn main() -> ExitCode {
         Ok(_) => launch(argv),
     };
     if refusal_log::is_open() {
-        side_log::end(launch_failed().then_some("launch"));
+        side_log::end(if launch_failed() {
+            Some("launch")
+        } else if reporter_missing() {
+            Some("reporter")
+        } else {
+            None
+        });
         if side_log::failed() {
             eprintln!("literoot: --refusal-log: a write failed");
             return ExitCode::from(REFUSAL_LOG_EXIT);
@@ -419,10 +423,33 @@ fn main() -> ExitCode {
     code
 }
 
+/// For `--help` and `--version`, which exit from parsing: end the side log
+/// and exit 0, or `REFUSAL_LOG_EXIT` when a write to it failed, as `main`
+/// does for every other run (C1).
+fn exit_after_parse() -> ! {
+    if refusal_log::is_open() {
+        side_log::end(None);
+        if side_log::failed() {
+            eprintln!("literoot: --refusal-log: a write failed");
+            std::process::exit(REFUSAL_LOG_EXIT.into());
+        }
+    }
+    std::process::exit(0)
+}
+
 /// Whether the guest's launch itself failed (see `tool::launch_failed`).
 fn launch_failed() -> bool {
     #[cfg(feature = "tool")]
     return tool::launch_failed();
+    #[cfg(not(feature = "tool"))]
+    return false;
+}
+
+/// Whether an in-guest run finished without a reporter (see
+/// `tool::reporter_missing`).
+fn reporter_missing() -> bool {
+    #[cfg(feature = "tool")]
+    return tool::reporter_missing();
     #[cfg(not(feature = "tool"))]
     return false;
 }
@@ -444,7 +471,11 @@ fn launch(argv: Vec<String>) -> ExitCode {
             let _ = std::fs::remove_file(&probe);
         });
         if ok.is_err() {
-            eprintln!("literoot: PROOT_TMP_DIR {tmp:?} is not a writable directory");
+            let e = format!("literoot: PROOT_TMP_DIR {tmp:?} is not a writable directory");
+            if let Some(key) = launcher_refusal(&e) {
+                side_log::refused_launcher(key);
+            }
+            eprintln!("{e}");
             return ExitCode::from(125);
         }
     }

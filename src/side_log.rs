@@ -40,8 +40,10 @@ use crate::refusal_log;
 /// Reverie's refusal to return while a coordinator connection is still
 /// open after the root guest exits. `connections_open` is in the grammar
 /// for a launcher that can tell that case apart; this one cannot by type,
-/// so it writes `launch`.
-pub const END_ERRORS: &[&str] = &["log_write", "connections_open", "launch"];
+/// so it writes `launch`. `reporter`, an in-guest run in which no preload
+/// process acknowledged refusal reporting (a preload built before this
+/// log, which runs the guest but reports nothing).
+pub const END_ERRORS: &[&str] = &["log_write", "connections_open", "launch", "reporter"];
 /// `route` labels.
 pub const ROUTES: &[&str] = &["preload", "static_m2", "ptrace"];
 /// `fork_policy` kinds: the record's five, `clone` split by `CLONE_THREAD`
@@ -59,6 +61,7 @@ pub const GUEST: &[&str] = &[
     "nodename_write",
     "domainname_write",
     "kompat_auxv",
+    "fake_id_auxv",
 ];
 /// `launcher` tokens: launcher errors that refuse a run.
 pub const LAUNCHER: &[&str] = &[
@@ -187,7 +190,9 @@ pub fn validate(contents: &str) -> Result<Vec<String>, String> {
     let mut open: Vec<u32> = Vec::new();
     let mut begins = 0;
     let mut refused = Vec::new();
-    for line in contents.lines() {
+    // Split on LF alone: `str::lines` would also drop a CR before it, and
+    // C3's productions contain no CR, so a CRLF record must fail to parse.
+    for line in contents.split_terminator('\n') {
         match parse(line)? {
             Line::Begin(p) => {
                 begins += 1;
@@ -243,8 +248,15 @@ pub fn take_from_args(args: &mut Vec<String>) -> Result<Option<String>, (String,
             break;
         }
         // An option that takes its value as the next word skips it, so the
-        // value is never mistaken for the guest command.
-        i += if VALUE_OPTIONS.contains(&a) { 2 } else { 1 };
+        // value is never mistaken for the guest command. `-v` takes the
+        // next word only when it is a level (an integer), as `parse_cli`
+        // reads it.
+        let takes_value = if a == "-v" || a == "--verbose" {
+            args.get(i + 1).is_some_and(|next| next.parse::<i64>().is_ok())
+        } else {
+            VALUE_OPTIONS.contains(&a)
+        };
+        i += if takes_value { 2 } else { 1 };
     }
     Ok(found)
 }
@@ -297,6 +309,7 @@ mod tests {
             "literoot: refused unsupported other",
             "literoot: refused guest ptrace",
             "literoot: refused guest kompat_auxv",
+            "literoot: refused guest fake_id_auxv",
             "literoot: refused launcher static_floor",
         ] {
             assert!(parse(ok).is_ok(), "{ok}");
@@ -353,6 +366,7 @@ mod tests {
                 G::NodenameWrite,
                 G::DomainnameWrite,
                 G::KompatAuxv,
+                G::FakeIdAuxv,
             ]
             .map(R::Guest),
         );
@@ -378,8 +392,15 @@ mod tests {
             ("literoot: begin 7\n", "begin without end"),
             ("literoot: end 7 ok\n", "end without begin"),
             ("literoot: begin 7\nliteroot: end 7 error launch\n", "error"),
+            ("literoot: begin 7\nliteroot: end 7 error reporter\n", "error"),
             (
                 "literoot: begin 7\nliteroot: refused what\nliteroot: end 7 ok\n",
+                "not a",
+            ),
+            ("literoot: begin 7\r\nliteroot: end 7 ok\r\n", "bad pid"),
+            ("literoot: begin 7\nliteroot: end 7 ok\r\n", "not a"),
+            (
+                "literoot: begin 7\nliteroot: refused exec\r\nliteroot: end 7 ok\n",
                 "not a",
             ),
         ] {
@@ -408,6 +429,16 @@ mod tests {
             .to_vec();
         assert_eq!(take_from_args(&mut args).unwrap(), None);
         assert_eq!(args.len(), 3);
+        // `-v` takes a level only when the next word is an integer, so a
+        // repeated option after a bare `-v` is still found.
+        let mut args: Vec<String> = ["--refusal-log", "/a", "-v", "--refusal-log", "/b", "/bin/true"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(take_from_args(&mut args).unwrap_err(), ("/a".into(), "/b".into()));
+        let mut args: Vec<String> = ["-v", "2", "--refusal-log", "/a", "/bin/true"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(take_from_args(&mut args).unwrap(), Some("/a".into()));
         // Nor after `--`.
         let mut args: Vec<String> = ["--", "--refusal-log", "/x"].map(String::from).to_vec();
         assert_eq!(take_from_args(&mut args).unwrap(), None);

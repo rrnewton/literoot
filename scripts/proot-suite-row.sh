@@ -23,8 +23,10 @@
 # before any other option. The driver never creates the log. A name
 # whose log is missing, fails `literoot --check-refusal-log`, or whose
 # run breached the free-space floor (LITEROOT_SIDELOG_MIN_FREE_KB on the
-# log's filesystem, default 1048576, checked before and after) is "not
-# measured". A name whose valid log records any refusal is reported as
+# log's filesystem, default 1048576, checked before and after), or whose
+# free space could not be measured as a number either time, is "not
+# measured", with the reason and any keys its log holds. A floor that is
+# not a number is a usage error (exit 64). A name whose valid log records any refusal is reported as
 # "<verdict>-with-refusal <keys>" and is counted in no pass number. A
 # skipped name is a refusal (literoot exits 125 on launcher errors) and
 # is reported with its keys, or as unkeyed. Output: <label>.pername (one
@@ -38,7 +40,7 @@ if [ "${1:-}" = --per-name ]; then
     shift
 fi
 if [ $# -lt 4 ]; then
-    sed -n '2,33p' "$0"
+    sed -n '2,35p' "$0"
     exit 64
 fi
 src=$1 out=$2 label=$3
@@ -55,7 +57,28 @@ if [ -n "$per_name" ]; then
     rm -rf "$logs"
     mkdir -p "$logs"
     floor=${LITEROOT_SIDELOG_MIN_FREE_KB:-1048576}
-    free_kb() { df -Pk "$logs" | awk 'NR == 2 { print $4 }'; }
+    case $floor in
+        '' | *[!0-9]*)
+            echo "LITEROOT_SIDELOG_MIN_FREE_KB=$floor is not a number of KiB" >&2
+            exit 64
+            ;;
+    esac
+    # Available KiB on the logs' filesystem, or nothing when df fails or
+    # does not print a number.
+    free_kb() {
+        local v
+        v=$(df -Pk "$logs" | awk 'NR == 2 { print $4 }') || return 0
+        case $v in
+            '' | *[!0-9]*) ;;
+            *) printf '%s\n' "$v" ;;
+        esac
+    }
+    # The refusal keys a side log holds, valid or not (reporting only).
+    present_keys() {
+        local seen=
+        [ -e "$side" ] && seen=$(sed -n 's/^literoot: refused //p' "$side" | tr ' ' '_' | sort -u | tr '\n' ' ')
+        printf '%s' "${seen:-none}"
+    }
     : >"$log"
     : >"$out/$label.pername"
     for f in $(cd "$copy/test" && ls test-*.sh test-*.c 2>/dev/null); do
@@ -77,15 +100,16 @@ if [ -n "$per_name" ]; then
                 else if (v == "ok" || cur == "ok") cur = "ok"
                 else cur = "skipped" }
             END { print (cur == "" ? "none" : cur) }' "$name_log")
-        if [ "$before" -lt "$floor" ] || [ "$after" -lt "$floor" ]; then
-            status="not-measured free-space"
+        if [ -z "$before" ] || [ -z "$after" ]; then
+            status="not-measured free-space-unmeasured keys: $(present_keys)"
+        elif [ "$before" -lt "$floor" ] || [ "$after" -lt "$floor" ]; then
+            status="not-measured free-space keys: $(present_keys)"
         elif [ ! -e "$side" ]; then
             status="not-measured no-side-log"
         elif ! keys=$("$literoot" --check-refusal-log "$side" 2>"$side.check"); then
             # Still not measured; the reason and any keys in the log are
             # reported for step 3's regression accounting, never counted.
-            seen=$(sed -n 's/^literoot: refused //p' "$side" | tr ' ' '_' | sort -u | tr '\n' ' ')
-            status="not-measured invalid-side-log ($(sed 's/^literoot: refusal log not valid: //' "$side.check" | head -1 | tr ' ' '_')) keys: ${seen:-none}"
+            status="not-measured invalid-side-log ($(sed 's/^literoot: refusal log not valid: //' "$side.check" | head -1 | tr ' ' '_')) keys: $(present_keys)"
         elif [ -n "$keys" ]; then
             status="$verdict-with-refusal $(printf '%s' "$keys" | sed 's/^refused //' | tr ' ' '_' | sort -u | tr '\n' ' ')"
         elif [ "$verdict" = skipped ]; then

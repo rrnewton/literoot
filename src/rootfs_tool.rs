@@ -177,6 +177,10 @@ pub enum GuestKind {
     /// proot kompat's auxv adjustment under `-k`, which the ptrace backend
     /// applies at the exec stop, is not implemented in-guest.
     KompatAuxv,
+    /// The fake-identity auxv patch under `-0`/`-i` (AT_UID, AT_EUID, AT_GID,
+    /// AT_EGID), which the ptrace backend applies at the exec stop, is not
+    /// implemented in-guest.
+    FakeIdAuxv,
 }
 
 impl Refusal {
@@ -205,6 +209,7 @@ impl Refusal {
                     GuestKind::NodenameWrite => "nodename_write",
                     GuestKind::DomainnameWrite => "domainname_write",
                     GuestKind::KompatAuxv => "kompat_auxv",
+                    GuestKind::FakeIdAuxv => "fake_id_auxv",
                 }
             ),
         }
@@ -212,22 +217,32 @@ impl Refusal {
 }
 
 /// The coordinator request: the refusals one drain found, in the order
-/// drained. The launcher writes them before it answers.
+/// drained. The launcher writes them before it answers. Each preload
+/// process sends its first one even when it is empty: that report is the
+/// reporting-capability acknowledgement (see [`REPORTER_ACKNOWLEDGED`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Refused(pub Vec<Refusal>);
+
+/// Set in the launcher when any preload process has reported. A preload
+/// built before the refusal side log installs the bare Tool, which sends
+/// no request at all, so an in-guest run that ends with this unset ran
+/// without a reporter and its log cannot show its refusals.
+pub static REPORTER_ACKNOWLEDGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Refusals the Tool made in this process and has not yet reported: one
 /// bit per [`GuestKind`]. The in-guest wiring takes them at its next drain.
 pub(crate) static PENDING_GUEST_REFUSALS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-pub(crate) const GUEST_KINDS: [GuestKind; 6] = [
+pub(crate) const GUEST_KINDS: [GuestKind; 7] = [
     GuestKind::Ptrace,
     GuestKind::SelfStop,
     GuestKind::SharedRecordPublish,
     GuestKind::NodenameWrite,
     GuestKind::DomainnameWrite,
     GuestKind::KompatAuxv,
+    GuestKind::FakeIdAuxv,
 ];
 
 /// Note a refusal the Tool made. Where the Tool runs in the launcher
@@ -256,6 +271,7 @@ impl GlobalTool for LiterootGlobal {
     }
 
     async fn receive_rpc(&self, _from: Pid, msg: Refused) {
+        REPORTER_ACKNOWLEDGED.store(true, std::sync::atomic::Ordering::SeqCst);
         for refusal in msg.0 {
             crate::refusal_log::write_line(&refusal.line());
         }
@@ -1234,15 +1250,26 @@ impl Tool for RootfsTool {
             .unwrap_or(false);
         let kompat = guest.config().kernel_release.is_some()
             && guest.config().post_exec_at_exec_stop;
-        if guest.config().kernel_release.is_some() && !guest.config().post_exec_at_exec_stop {
-            // In-guest: the kompat adjustment is skipped, so the guest's
-            // auxv differs from the ptrace backend's. Keyed once per exec.
-            note_guest_refusal(GuestKind::KompatAuxv);
-            if std::env::var_os("LITEROOT_DEBUG").is_some() {
-                eprintln!("literoot-tool: kompat auxv skipped: post-exec not at exec stop");
+        if !guest.config().post_exec_at_exec_stop {
+            // In-guest: post-exec runs at the first trapped syscall, so the
+            // initial-stack walk below cannot reach the auxv and every patch
+            // it would make is skipped; the guest's auxv differs from the
+            // ptrace backend's. Each is keyed once per exec (C3 amendments
+            // kompat_auxv and fake_id_auxv). `zero_hwcap` needs `-k`, so
+            // kompat_auxv covers it.
+            if guest.config().kernel_release.is_some() {
+                note_guest_refusal(GuestKind::KompatAuxv);
+                if std::env::var_os("LITEROOT_DEBUG").is_some() {
+                    eprintln!("literoot-tool: kompat auxv skipped: post-exec not at exec stop");
+                }
+            }
+            if fake.is_some() {
+                note_guest_refusal(GuestKind::FakeIdAuxv);
             }
         }
         let kompat_force = kompat && guest.config().kompat_force;
+        // C4: the initial-stack walk (exec stop only). Every disjunct below
+        // is keyed in the in-guest branch above (tests/c4_backend_branches.rs).
         if fake.is_some() || zero_hwcap || kompat {
             use reverie::syscalls::MemoryAccess as _;
             {

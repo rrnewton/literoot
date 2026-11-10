@@ -394,6 +394,55 @@ fn run_literoot(
     )
 }
 
+/// `run_literoot` with `--refusal-log <log>` placed first; returns the
+/// refusal lines of the side log, which `literoot --check-refusal-log` must
+/// accept as valid.
+fn run_literoot_logged(
+    root: &Path,
+    backend: Option<&str>,
+    fake_root: bool,
+    guest_args: &[&str],
+    envs: &[(&str, &str)],
+    preload: Option<&Path>,
+    log: &Path,
+) -> (String, String, std::process::ExitStatus, Vec<String>) {
+    let mut cmd = Command::new(literoot_bin());
+    cmd.arg("--refusal-log").arg(log);
+    if let Some(backend) = backend {
+        cmd.args(["--backend", backend]);
+    }
+    if fake_root {
+        cmd.arg("-0");
+    }
+    cmd.args(["-R", root.to_str().unwrap()]).args(guest_args);
+    if let Some(preload) = preload {
+        cmd.env("LITEROOT_PRELOAD", preload);
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("spawn literoot shared-record guest");
+    let checked = Command::new(literoot_bin())
+        .arg("--check-refusal-log")
+        .arg(log)
+        .output()
+        .expect("run literoot --check-refusal-log");
+    assert!(
+        checked.status.success(),
+        "the side log is not valid: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status,
+        String::from_utf8_lossy(&checked.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 fn fixture_libs_available() -> bool {
     if Path::new("/lib64/libc.so.6").exists() && Path::new("/lib64/ld-linux-x86-64.so.2").exists() {
         return true;
@@ -518,13 +567,15 @@ fn liteinst_sequential_forks_print_one_publish_refusal() {
     // ~120 KB argv, so the 1 MiB snapshot fills after roughly
     // eight forks; the remaining forks are refused publishes.
     let big_arg = "B".repeat(120_000);
-    let (stdout, stderr, status) = run_literoot(
+    let log = dir.join("side.log");
+    let (stdout, stderr, status, refused) = run_literoot_logged(
         &root,
         Some("liteinst"),
         true,
         &["/bin/sr", &big_arg],
         &[("SR_MODE", "forkfill"), ("SR_SEQ", "12"), ("SR_PAR", "0")],
         Some(&preload),
+        &log,
     );
     assert!(
         status.success(),
@@ -534,6 +585,11 @@ fn liteinst_sequential_forks_print_one_publish_refusal() {
         stderr.matches("shared record publish refused").count(),
         1,
         "sequential in-guest forks must print one refusal line: stderr={stderr:?}"
+    );
+    // The in-guest drain carries the refusal to the side log.
+    assert!(
+        refused.iter().any(|l| l == "refused guest shared_record_publish"),
+        "side log: {refused:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -682,7 +738,8 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
     );
     let final_len_text = final_len.to_string();
 
-    let (stdout, stderr, status) = run_literoot(
+    let log = dir.join("side.log");
+    let (stdout, stderr, status, refused) = run_literoot_logged(
         &root,
         Some("ptrace"),
         true,
@@ -692,6 +749,26 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
             ("SR_FINAL_FILL_LEN", &final_len_text),
         ],
         None,
+        &log,
+    );
+    // On ptrace the Tool runs in the launcher and writes each key at once.
+    for key in [
+        "refused guest shared_record_publish",
+        "refused guest nodename_write",
+        "refused guest domainname_write",
+    ] {
+        assert!(refused.iter().any(|l| l == key), "{key}: side log {refused:?}");
+    }
+    // Each UTS key is written at the refusal its stderr line reports, so
+    // the two keys come in the order of the two stderr lines; a swapped
+    // nodename/domainname mapping inverts it.
+    let key_at = |key: &str| refused.iter().position(|l| l == key);
+    let line_at = |text: &str| stderr.find(text);
+    assert_eq!(
+        key_at("refused guest nodename_write") < key_at("refused guest domainname_write"),
+        line_at("shared record UTS nodename write refused")
+            < line_at("shared record UTS domainname write refused"),
+        "UTS keys out of step with their refusals: side log {refused:?} stderr={stderr:?}"
     );
     assert!(
         status.success(),

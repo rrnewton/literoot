@@ -379,3 +379,279 @@ fn kompat_auxv_is_keyed_once_in_guest_and_never_under_ptrace_or_without_k() {
     }
     assert_eq!(kompat_lines("ptrace", Some("5.4.0")), 0, "ptrace with -k");
 }
+
+/// The number of `refused <key>` lines a `/bin/true` run under `options`
+/// leaves in its valid side log.
+fn key_lines(label: &str, backend: &str, options: &[&str], key: &str) -> usize {
+    let Some((scratch, _guest)) = scratch(&format!("{label}-{backend}")) else {
+        return usize::MAX;
+    };
+    let log = scratch.0.join("logs/side");
+    let status = Command::new(literoot_bin())
+        .arg("--refusal-log")
+        .arg(&log)
+        .args(["--backend", backend])
+        .args(options)
+        .arg("/bin/true")
+        .env("LITEROOT_PRELOAD", resolve_preload())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run literoot");
+    assert_eq!(status.code(), Some(0), "{backend} {options:?}: /bin/true");
+    let refused = check(&log).expect("the side log is valid");
+    refused.iter().filter(|l| *l == key).count()
+}
+
+/// The `fake_id_auxv` key (coord7's ruling on the C3 grammar, 2026-11-10,
+/// review of g2 38e83d31, finding 1): under `-0` or `-i`, the in-guest
+/// backends skip the fake-identity auxv patch that the ptrace backend
+/// applies at the exec stop, and say so exactly once per exec; ptrace
+/// writes no such line, and nor does a run without a fake identity.
+#[test]
+fn fake_id_auxv_is_keyed_once_in_guest_and_never_under_ptrace_or_without_fake_ids() {
+    require_preload();
+    let key = "refused guest fake_id_auxv";
+    for backend in ["liteinst", "trap"] {
+        assert_eq!(key_lines("fake0", backend, &["-0"], key), 1, "{backend} -0");
+        assert_eq!(key_lines("fakei", backend, &["-i", "123:456"], key), 1, "{backend} -i");
+        assert_eq!(key_lines("fakenone", backend, &[], key), 0, "{backend} without");
+    }
+    assert_eq!(key_lines("fake0", "ptrace", &["-0"], key), 0, "ptrace -0");
+    assert_eq!(key_lines("fakei", "ptrace", &["-i", "123:456"], key), 0, "ptrace -i");
+}
+
+/// TRACEME, then a self-SIGSTOP, then exit 0: the shape the in-guest Tool
+/// refuses (guest ptrace, EPERM) and then swallows (the self-stop).
+const SELF_STOP_C: &str = r#"
+#include <signal.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        kill(getpid(), SIGSTOP);
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return 3;
+    return WEXITSTATUS(status);
+}
+"#;
+
+/// The `guest ptrace` and `guest self_stop` keys reach the side log on the
+/// in-guest backends (review of g2 38e83d31, finding 2). There is no ptrace
+/// arm: there the self-SIGSTOP really stops the child, as natively.
+#[test]
+fn guest_ptrace_and_self_stop_are_keyed_in_guest() {
+    require_preload();
+    let Some((scratch, _guest)) = scratch("selfstop") else {
+        return;
+    };
+    let src = scratch.0.join("self_stop.c");
+    let bin = scratch.0.join("self-stop");
+    std::fs::write(&src, SELF_STOP_C).unwrap();
+    let built = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("cc is required to build the self-stop guest");
+    if !fixture_or_skip(&built, "self-stop guest") {
+        return;
+    }
+    for backend in ["liteinst", "trap"] {
+        let log = scratch.0.join(format!("logs/{backend}"));
+        let status = Command::new(literoot_bin())
+            .arg("--refusal-log")
+            .arg(&log)
+            .args(["--backend", backend])
+            .arg(&bin)
+            .env("LITEROOT_PRELOAD", resolve_preload())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run literoot");
+        assert_eq!(status.code(), Some(0), "{backend}: the guest exits 0");
+        let refused = check(&log).expect("the side log is valid");
+        let has = |key: &str| refused.iter().any(|l| l == key);
+        assert!(has("refused guest ptrace"), "{backend}: {refused:?}");
+        assert!(has("refused guest self_stop"), "{backend}: {refused:?}");
+    }
+}
+
+/// C4's closed list (main.rs `PROOT_ALSO_RAISES`) and the not-runnable
+/// exemption: these launcher errors, which real proot also raises for the
+/// same argv, leave a valid log with no `refused` line; any other launcher
+/// error is keyed, here `launcher other` (review of g2 38e83d31, finding 3).
+#[test]
+fn only_the_closed_list_and_not_runnable_commands_go_unkeyed() {
+    let Some((scratch, _guest)) = scratch("closed") else {
+        return;
+    };
+    let run = |label: &str, args: &[&str]| -> (Option<i32>, Result<Vec<String>, String>) {
+        let log = scratch.0.join(format!("logs/{label}"));
+        let status = Command::new(literoot_bin())
+            .arg("--refusal-log")
+            .arg(&log)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run literoot");
+        (status.code(), check(&log))
+    };
+    let unkeyed: &[(&str, &[&str])] = &[
+        ("v-without-level", &["-v"]),
+        ("rootfs-missing", &["-r", "/nonexistent-literoot-rootfs", "/bin/true"]),
+        ("bind-over-root", &["-r", "/", "-b", "/etc:/", "/bin/true"]),
+        ("command-missing", &["/no/such/literoot-command"]),
+        ("command-is-a-directory", &["/etc"]),
+    ];
+    for (label, args) in unkeyed {
+        assert_eq!(run(label, args), (Some(125), Ok(Vec::new())), "{label}: {args:?}");
+    }
+    assert_eq!(
+        run("bogus-option", &["--bogus", "/bin/true"]),
+        (Some(125), Ok(vec!["refused launcher other".to_owned()]))
+    );
+}
+
+const EXECVEAT_C: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+int main(void) {
+    char *argv[] = {"true", 0};
+    char *envp[] = {0};
+    syscall(SYS_execveat, AT_FDCWD, "/bin/true", argv, envp, 0);
+    return errno == EOPNOTSUPP ? 95 : 3;
+}
+"#;
+
+/// A raw execveat is keyed `refused exec` on the in-guest backends, and the
+/// guest continues past it with EOPNOTSUPP (review of g2 38e83d31 by
+/// rev5338-cx, finding P1-1: unsubscribed, the in-guest runtime refused it
+/// with no record). The ptrace control execs `/bin/true` and refuses nothing.
+#[test]
+fn a_raw_execveat_is_keyed_in_guest_and_runs_under_ptrace() {
+    require_preload();
+    let Some((scratch, _guest)) = scratch("execveat") else {
+        return;
+    };
+    let src = scratch.0.join("execveat.c");
+    let bin = scratch.0.join("execveat");
+    std::fs::write(&src, EXECVEAT_C).unwrap();
+    let built = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .expect("cc is required to build the execveat guest");
+    if !fixture_or_skip(&built, "execveat guest") {
+        return;
+    }
+    for (backend, code, keyed) in [("liteinst", 95, true), ("trap", 95, true), ("ptrace", 0, false)] {
+        let log = scratch.0.join(format!("logs/{backend}"));
+        let status = Command::new(literoot_bin())
+            .arg("--refusal-log")
+            .arg(&log)
+            .args(["--backend", backend])
+            .arg(&bin)
+            .env("LITEROOT_PRELOAD", resolve_preload())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run literoot");
+        assert_eq!(status.code(), Some(code), "{backend}");
+        let refused = check(&log).expect("the side log is valid");
+        let want: &[&str] = if keyed { &["refused exec"] } else { &[] };
+        assert_eq!(refused, want, "{backend}");
+    }
+}
+
+/// A preload that predates the side log runs the guest but reports nothing:
+/// the pin parent 2dbd5c52 installs the bare Tool under the same Reverie
+/// pin, configuration and selector. The launcher must end its log
+/// `error reporter` and say why on stderr, so no test name counts a run
+/// whose refusals could not be seen (review of g2 38e83d31 by rev5338-cx,
+/// finding P1-2). `LITEROOT_STALE_PRELOAD` names such a preload; unset,
+/// this is a skip, never a pass, and under LITEROOT_REQUIRE_FIXTURES a
+/// failure.
+#[test]
+fn a_preload_without_the_reporter_ends_the_log_in_error() {
+    let Some(stale) = std::env::var_os("LITEROOT_STALE_PRELOAD") else {
+        assert!(
+            std::env::var_os("LITEROOT_REQUIRE_FIXTURES").is_none(),
+            "LITEROOT_STALE_PRELOAD is unset under LITEROOT_REQUIRE_FIXTURES"
+        );
+        eprintln!("stale preload: SKIP (not a pass): LITEROOT_STALE_PRELOAD is unset");
+        return;
+    };
+    let Some((scratch, _guest)) = scratch("stale") else {
+        return;
+    };
+    for backend in ["liteinst", "trap"] {
+        let log = scratch.0.join(format!("logs/{backend}"));
+        let out = Command::new(literoot_bin())
+            .arg("--refusal-log")
+            .arg(&log)
+            .args(["--backend", backend, "/bin/true"])
+            .env("LITEROOT_PRELOAD", &stale)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run literoot");
+        assert_eq!(out.status.code(), Some(0), "{backend}: the guest still runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("sent no refusal report"), "{backend}: {stderr}");
+        let invalid = check(&log).expect_err("the side log must not be valid");
+        assert!(invalid.contains("error reporter"), "{backend}: {invalid}");
+    }
+}
+
+/// An unwritable `PROOT_TMP_DIR` is a launcher refusal outside C4's closed
+/// list, so it is keyed `launcher other` (review of g2 38e83d31 by
+/// rev5338-cx, finding P2-5); the exit status stays proot's 125.
+#[test]
+fn an_unwritable_proot_tmp_dir_is_keyed() {
+    let Some((scratch, _guest)) = scratch("tmpdir") else {
+        return;
+    };
+    let log = scratch.0.join("logs/side");
+    let status = Command::new(literoot_bin())
+        .arg("--refusal-log")
+        .arg(&log)
+        .arg("/bin/true")
+        .env("PROOT_TMP_DIR", "/nonexistent-literoot-tmp-dir")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run literoot");
+    assert_eq!(status.code(), Some(125));
+    assert_eq!(check(&log), Ok(vec!["refused launcher other".to_owned()]));
+}
+
+/// C1: a failed side-log write exits nonzero, including on the help and
+/// version exits, which leave from argument parsing (review of g2 38e83d31
+/// by rev5338-cx, P3). Every write to /dev/full fails.
+#[test]
+fn a_failed_log_write_exits_nonzero_from_help_and_version_too() {
+    for args in [&["--help"][..], &["--version"], &["-r", "/", "/bin/true"]] {
+        let out = Command::new(literoot_bin())
+            .args(["--refusal-log", "/dev/full"])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run literoot");
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {out:?}");
+    }
+}
