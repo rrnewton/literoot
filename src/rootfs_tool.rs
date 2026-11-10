@@ -685,7 +685,7 @@ impl RootfsTool {
         let _guard = stack.commit()?;
         let call = reverie::syscalls::Prlimit64::new()
             .with_pid(0)
-            .with_resource(libc::RLIMIT_STACK)
+            .with_resource(RLIMIT_STACK)
             .with_new_rlim(None)
             .with_old_rlim(Some(old_ptr));
         guest.inject(call).await?;
@@ -712,7 +712,7 @@ impl RootfsTool {
         let _guard = stack.commit()?;
         let call = reverie::syscalls::Prlimit64::new()
             .with_pid(0)
-            .with_resource(libc::RLIMIT_STACK)
+            .with_resource(RLIMIT_STACK)
             .with_new_rlim(Some(new_ptr))
             .with_old_rlim(None);
         guest.inject(call).await?;
@@ -933,6 +933,11 @@ fn clone_is_process(flags: u64) -> bool {
 // most 768 bytes of translated path (POC limit — the in-guest
 // backend uses Tool-region scratch instead, design §6).
 const PATH_BUF: usize = 768;
+
+/// `prlimit64`'s resource number for the stack limit, as the syscall
+/// builder's `u32`: glibc's libc defines it as `u32`, musl's as `i32`.
+#[allow(clippy::unnecessary_cast)]
+const RLIMIT_STACK: u32 = libc::RLIMIT_STACK as u32;
 
 
 #[cfg(target_arch = "x86_64")]
