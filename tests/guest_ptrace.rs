@@ -31,6 +31,24 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// Resolution follows tool.rs's convention: $LITEROOT_PRELOAD wins,
+// then $CARGO_TARGET_DIR/release, then the preload-local target.
+fn resolve_preload() -> PathBuf {
+    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
+        return PathBuf::from(p);
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        let td = PathBuf::from(td);
+        let td = if td.is_absolute() { td } else { root.join(td) };
+        let cand = td.join("release/libliteroot_preload.so");
+        if cand.exists() {
+            return cand;
+        }
+    }
+    root.join("preload/target/release/libliteroot_preload.so")
+}
+
 fn literoot_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
 }
@@ -207,8 +225,7 @@ fn run_trap_guest_with(
     launcher_args: &[&str],
     envs: &[(&str, &str)],
 ) -> Option<Output> {
-    let preload = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("preload/target/release/libliteroot_preload.so");
+    let preload = resolve_preload();
     if !preload.exists() {
         assert!(
             std::env::var_os("LITEROOT_REQUIRE_PRELOAD").is_none(),
