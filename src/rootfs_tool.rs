@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use reverie::Error;
+use reverie::ExitStatus;
 use reverie::GlobalTool;
-use reverie::GlobalRPC as _;
+use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Subscription;
@@ -46,6 +47,10 @@ pub struct LiterootConfig {
     pub fake_uid: Option<u32>,
     pub fake_gid: Option<u32>,
     pub kernel_release: Option<String>,
+    /// --kill-on-exit: kill the whole guest tree when the
+    /// initial guest process exits (proot semantics).
+    #[serde(default)]
+    pub kill_on_exit: bool,
     /// Guest path of the initial program (argv-resolved).
     pub initial_exe: String,
     /// Full initial argv as spelled on the literoot command
@@ -163,6 +168,9 @@ pub(crate) struct ProcState {
     /// Whether the launch config's one-shot initial stack-limit
     /// restore has been consumed by this process.
     pub(crate) initial_stack_limit_consumed: bool,
+    /// This process has been registered for --kill-on-exit
+    /// in the pid registry (creation-time registration).
+    pub(crate) kill_registered: bool,
 }
 
 /// The literoot Tool: one instance per guest process.
@@ -189,6 +197,7 @@ impl Default for RootfsTool {
                 dispatch_seq: 0,
                 translate_memo: Vec::new(),
                 config_memo: None,
+                kill_registered: false,
                 argv: Vec::new(),
                 virtual_fds: std::collections::HashMap::new(),
                 dirent_pending: std::collections::HashMap::new(),
@@ -741,6 +750,51 @@ impl Tool for RootfsTool {
     type GlobalState = LiterootGlobal;
     type ThreadState = RootfsThreadState;
 
+    fn new(pid: Pid, cfg: &LiterootConfig) -> Self {
+        // Creation-time registration (fork event under ptrace,
+        // process construction in-guest): a fork child that only
+        // sleeps/writes/exits may make no subscribed syscall
+        // before the root exits, so first-syscall registration
+        // alone would miss it.
+        if cfg.kill_on_exit {
+            register_guest_pid(pid.as_raw());
+        }
+        Default::default()
+    }
+
+    async fn on_exit_process<G: GlobalRPC<LiterootGlobal>>(
+        self,
+        pid: Pid,
+        _global_state: &G,
+        exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        // Preserve the root guest's real exit status for the
+        // launcher: if it later terminates a wedged tracer
+        // session (kill-on-exit grace expiry), wait() surfaces
+        // the termination cause instead of this status.
+        if pid.as_raw() == FIRST_GUEST_PID.load(std::sync::atomic::Ordering::SeqCst) {
+            let raw = exit_status.into_raw();
+            // Test hook (kill_on_exit delayed-status test):
+            // defer the record on a side thread so the
+            // launcher's sweep gate is exercised against a
+            // late status. Debug builds only: in release
+            // builds the variable is never read, so it
+            // cannot silently disable kill-on-exit.
+            #[cfg(debug_assertions)]
+            if let Ok(ms) = std::env::var("LITEROOT_TEST_DELAY_ROOT_STATUS_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        ROOT_EXIT_RAW.store(raw, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    return Ok(());
+                }
+            }
+            ROOT_EXIT_RAW.store(raw, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     fn subscriptions(_cfg: &LiterootConfig) -> Subscription {
         let mut subs = Subscription::none();
         subs.syscalls([
@@ -846,6 +900,11 @@ impl Tool for RootfsTool {
         &self,
         guest: &mut T,
     ) -> Result<(), Error> {
+        // In-guest creation seam for --kill-on-exit: the initial
+        // thread of every new process starts here, including fork
+        // children whose Tool construction path may not call
+        // Tool::new.
+        self.note_process_for_kill_on_exit(guest);
         // Adopt and identity-check the shared descriptor at the
         // first lifecycle hook, before ordinary guest execution
         // gets an opportunity to close/replace the number.
@@ -1036,6 +1095,7 @@ impl Tool for RootfsTool {
         Ok(())
     }
 
+
     async fn handle_syscall_event<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -1048,6 +1108,7 @@ impl Tool for RootfsTool {
             st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
             st.translate_memo.clear();
         }
+        self.note_process_for_kill_on_exit(guest);
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
             eprintln!("literoot-tool: syscall {:?}", syscall.number());
         }
@@ -1070,7 +1131,14 @@ impl Tool for RootfsTool {
                     });
             }
         }
-        match syscall {
+        let fork_like = matches!(
+            syscall.number(),
+            reverie::syscalls::Sysno::fork
+                | reverie::syscalls::Sysno::vfork
+                | reverie::syscalls::Sysno::clone
+                | reverie::syscalls::Sysno::clone3
+        );
+        let result = match syscall {
             Syscall::Openat(openat) => {
                 // O_CREAT opens can create components (kind
                 // changes); plain opens cannot — gate the bump
@@ -2693,11 +2761,40 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             other => Ok(guest.inject(other).await?),
+        };
+        if fork_like && guest.config().kill_on_exit {
+            if let Ok(child) = result {
+                if child > 0 {
+                    // Parent side of a successful fork: register
+                    // the child before it can fork again (hop
+                    // chains register every link).
+                    register_fork_child(child as i32);
+                }
+            }
         }
+        result
     }
 }
 
 impl RootfsTool {
+    /// First-touch --kill-on-exit registration backstop: record
+    /// this process in the pid registry the launcher kills from
+    /// at root exit (ptrace), if creation-time registration did
+    /// not already happen on this backend.
+    fn note_process_for_kill_on_exit<T: Guest<Self>>(&self, guest: &T) {
+        if !guest.config().kill_on_exit {
+            return;
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.kill_registered {
+                return;
+            }
+            st.kill_registered = true;
+        }
+        register_guest_pid(guest.pid().as_raw());
+    }
+
     /// Stage bytes in the per-process guest scratch page
     /// (injected anonymous mmap, allocated once). Returns the
     /// guest address. Used for execve paths, where guest-stack
@@ -4230,6 +4327,93 @@ pub fn mark_launcher_exec_seen() {
     LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Guest pids seen by Tools in this process, pid -> /proc
+/// starttime (field 22; 0 = unread). Under ptrace every Tool
+/// shares the tracer process, so the launcher can kill the
+/// registered tree at root exit. In-guest the map is
+/// per-process and is not kill authority: --kill-on-exit is
+/// refused there until a launcher-side descent proof exists.
+static GUEST_PIDS: std::sync::OnceLock<Mutex<std::collections::HashMap<i32, u64>>> =
+    std::sync::OnceLock::new();
+
+fn guest_pids() -> &'static Mutex<std::collections::HashMap<i32, u64>> {
+    GUEST_PIDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Start time (clock ticks since boot) of `pid`, for
+/// reuse-safe kill verification.
+pub fn proc_starttime(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 22 overall; fields after comm's closing paren start
+    // at field 3, so starttime is index 19 of the remainder.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Snapshot of registered guest pids (launcher kill-on-exit).
+pub fn guest_pid_snapshot() -> Vec<(i32, u64)> {
+    guest_pids()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, s)| (*p, *s))
+        .collect()
+}
+
+/// First guest pid ever registered in this process (the
+/// initial guest under ptrace, where registration happens in
+/// the tracer). Used only to recognize the root's exit_group.
+static FIRST_GUEST_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Raw wait status of the root guest's exit_group, recorded
+/// Tool-side so the launcher can preserve the guest's real
+/// exit code when it terminates a wedged tracer session.
+static ROOT_EXIT_RAW: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The root guest's recorded raw wait status, if observed.
+pub fn root_exit_raw() -> Option<i32> {
+    match ROOT_EXIT_RAW.load(std::sync::atomic::Ordering::SeqCst) {
+        -1 => None,
+        raw => Some(raw),
+    }
+}
+
+/// Register a guest process at creation (pid + starttime).
+/// Idempotent; called from Tool::new, handle_thread_start and
+/// the first-syscall backstop so a process is recorded at the
+/// earliest hook its backend actually delivers.
+fn register_guest_pid(pid: i32) {
+    let _ = FIRST_GUEST_PID.compare_exchange(
+        0,
+        pid,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let starttime = proc_starttime(pid).unwrap_or(0);
+    guest_pids()
+        .lock()
+        .unwrap()
+        .entry(pid)
+        .or_insert(starttime);
+}
+
+/// Register a fork child from the parent side (fork return in
+/// the parent): the child has not run yet, so this closes the
+/// hop window where a fast chain link forks and exits before
+/// any of its own hooks run.
+fn register_fork_child(child_pid: i32) {
+    register_guest_pid(child_pid);
+}
+
+/// Drop a guest pid from the registry (killed or proven dead).
+pub fn forget_guest_pid(pid: i32) {
+    guest_pids().lock().unwrap().remove(&pid);
+}
+
+
 /// Tool selector for an unwatched launch (today's only shape).
 pub const TOOL_SELECTOR: &[u8] = b"literoot";
 /// Tool selector for a watched launch: the launcher asserts a
@@ -4563,3 +4747,4 @@ mod exec_watch_gate_tests {
         assert!(err.contains("unknown tool selector"), "got: {err}");
     }
 }
+

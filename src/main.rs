@@ -35,6 +35,7 @@ struct Cli {
     cwd_guest: PathBuf,
     backend: String,
     verbose: bool,
+    kill_on_exit: bool,
     check_paths: Vec<String>,
     command: Vec<String>,
 }
@@ -116,6 +117,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut kernel_release: Option<String> = None;
     let mut backend = String::from("ptrace");
     let mut verbose = false;
+    let mut kill_on_exit = false;
     let mut check_paths: Vec<String> = Vec::new();
     let mut command: Vec<String> = Vec::new();
 
@@ -169,6 +171,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             "-k" | "--kernel-release" => kernel_release = Some(take(&mut i, "-k")?),
             "--backend" => backend = take(&mut i, "--backend")?,
+            "--kill-on-exit" => kill_on_exit = true,
             "--check" => check_paths.push(take(&mut i, "--check")?),
             "-v" | "--verbose" => {
                 // proot's -v requires a level argument; only
@@ -268,6 +271,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         cwd_guest,
         backend,
         verbose,
+        kill_on_exit,
         check_paths,
         command,
     })
@@ -286,10 +290,27 @@ fn print_usage() {
          \x20 -0, --root-id          fake uid/gid 0\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
          \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3)\n\
+         \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
+         \x20                        kill-on-exit refusals exit 2 (a guest may also exit 2; the literoot: kill-on-exit: stderr prefix distinguishes)\n\
          \x20 --check <guest-path>   print translation and exit (repeatable)\n\
          \x20 -v, --verbose          report selected mechanism\n\
          \x20 --help, --version"
     );
+}
+
+/// Exit code for a launcher-side error. Named
+/// --kill-on-exit refusals (the unsupported-backend refusal
+/// and the runtime "kill-on-exit: refusing ..." errors)
+/// get 2, not the generic launcher-failure 125 (which the
+/// upstream proot suite counts as "skipped").
+fn launcher_error_exit_code(error: &str) -> u8 {
+    if error.starts_with("--kill-on-exit is supported only on the ptrace backend")
+        || error.starts_with("kill-on-exit:")
+    {
+        2
+    } else {
+        125
+    }
 }
 
 fn main() -> ExitCode {
@@ -353,12 +374,54 @@ fn main() -> ExitCode {
     }
     #[cfg(feature = "tool")]
     {
-        match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command) {
+        match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command, cli.kill_on_exit) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
+                let code = launcher_error_exit_code(&e);
                 eprintln!("literoot: {e}");
-                ExitCode::from(125)
+                ExitCode::from(code)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod kill_on_exit_parse_tests {
+    use super::{launcher_error_exit_code, parse_cli};
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kill_on_exit_flag_accepted_and_default_off() {
+        let off = parse_cli(&args(&["/bin/true"])).unwrap();
+        assert!(!off.kill_on_exit);
+        let on = parse_cli(&args(&["--kill-on-exit", "/bin/true"])).unwrap();
+        assert!(on.kill_on_exit);
+        assert_eq!(on.command, vec!["/bin/true".to_string()]);
+    }
+
+    #[test]
+    fn kill_on_exit_refusal_exit_code_is_distinct_from_suite_skip() {
+        assert_eq!(
+            launcher_error_exit_code(
+                "--kill-on-exit is supported only on the ptrace backend (details)"
+            ),
+            2
+        );
+        assert_eq!(
+            launcher_error_exit_code(
+                "kill-on-exit: refusing unaccepted tracer wait error other tracer error: EPERM"
+            ),
+            2
+        );
+        assert_eq!(
+            launcher_error_exit_code(
+                "kill-on-exit: root exit status was not recorded within 2s after root exit"
+            ),
+            2
+        );
+        assert_eq!(launcher_error_exit_code("tracer spawn: EPERM"), 125);
     }
 }

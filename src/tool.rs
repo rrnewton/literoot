@@ -96,6 +96,7 @@ pub fn run_guest(
     cwd_guest: &Path,
     backend: &str,
     command: &[String],
+    kill_on_exit: bool,
 ) -> Result<u8, String> {
     // Backends (design §3): ptrace = reference (Tool in tracer);
     // liteinst = in-guest patched sites + SIGSYS trap net;
@@ -153,6 +154,7 @@ pub fn run_guest(
         fake_uid: config.fake_ids.map(|(u, _)| u),
         fake_gid: config.fake_ids.map(|(_, g)| g),
         kernel_release: config.kernel_release.clone(),
+        kill_on_exit,
         initial_exe: String::new(),
         initial_argv: Vec::new(),
         initial_stack_limit: None,
@@ -321,6 +323,7 @@ fn run_backend(
     backend: &str,
     in_guest: bool,
 ) -> Result<u8, String> {
+    let kill_on_exit = cfg.kill_on_exit;
     // Shared probe-cache generation (memfd inherited by the
     // whole guest tree; translate.rs probe coherence).
     let gen_fd = crate::translate::create_shared_gen_fd();
@@ -359,6 +362,19 @@ fn run_backend(
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     if in_guest {
+        // --kill-on-exit is ptrace-only today: an in-guest
+        // tree kill needs a launcher-side descent proof the
+        // guest cannot forge (a guest-writable registry
+        // cannot be the authority for SIGKILL), which is a
+        // separate design task. Refuse by name rather than
+        // silently degrade.
+        if kill_on_exit {
+            return Err(
+                "--kill-on-exit is supported only on the ptrace backend \
+                 (in-guest tree kill needs a launcher-side descent proof)"
+                    .into(),
+            );
+        }
         // Watched exec (W6a spawn swap, W-1 gate): no spawn path
         // in this build seizes the guest under a supervisor, so
         // watched mode is never asserted. The W-2 spawn swap is
@@ -451,11 +467,201 @@ fn run_backend(
             .spawn()
             .await
             .map_err(|e| format!("tracer spawn: {e}"))?;
-        let (status, _global) = tracer
-            .wait()
-            .await
-            .map_err(|e| format!("tracer wait: {e}"))?;
-        Ok::<_, String>(status)
+        let root_pid = tracer.guest_pid().as_raw();
+        let termination = tracer.termination_handle();
+        let mut termination_requested = false;
+        let wait = tracer.wait();
+        if !kill_on_exit {
+            let (status, _global) = wait
+                .await
+                .map_err(|e| format!("tracer wait: {e}"))?;
+            return Ok::<_, String>(status);
+        }
+        // --kill-on-exit (ptrace): the tracer otherwise waits for
+        // the whole tracee tree, setsid-detached descendants
+        // included. Watch for the root guest's exit; once the
+        // Tool has recorded its raw status, SIGKILL every
+        // registered guest pid whose start time still matches,
+        // then let wait() reap the now-dying tree. Holding the
+        // first kill until the status is recorded prevents our
+        // own kill from racing ahead of on_exit_process and
+        // turning the root's status into a generic launcher
+        // error. PTRACE_O_EXITKILL (safeptrace default seize
+        // options) backstops anything missed when this launcher
+        // itself exits.
+        tokio::pin!(wait);
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
+        let mut root_gone = false;
+        let mut root_gone_since: Option<std::time::Instant> = None;
+        let mut root_status_since: Option<std::time::Instant> = None;
+        // At least one verified SIGKILL succeeded on some
+        // registered pid (pidfd success on a zombie counts).
+        // It is not tied to the tracee named in a later
+        // tracer error.
+        let mut sent_kill = false;
+        let mut sweep_attempted = false;
+        // Root status snapshot read at the moment our first
+        // sweep/terminate fires. Only this snapshot may be
+        // returned for an accepted tracer error. It is the
+        // same single ROOT_EXIT_RAW store read at sweep
+        // time, so it can itself be a status Reverie's
+        // cleanup imposed before the tick lands; the
+        // SIGKILL-snapshot refusal in kill_wait_decision
+        // covers that case (our sweep never signals root).
+        let mut sweep_root_raw: Option<i32> = None;
+        let status = loop {
+            tokio::select! {
+                done = &mut wait => {
+                    match done {
+                        Ok((status, _global)) => break Ok(status),
+                        Err(e) => {
+                            let class = classify_kill_wait_error(&e);
+                            match kill_wait_decision(
+                                class,
+                                termination_requested,
+                                sent_kill,
+                                sweep_root_raw,
+                            ) {
+                                KillWaitDecision::AcceptRootStatus => {
+                                    // A kill or termination we
+                                    // requested turned the root's
+                                    // clean exit into a tracer
+                                    // error; return only the
+                                    // snapshot taken before that
+                                    // action fired.
+                                    break Ok(reverie::ExitStatus::from_raw(
+                                        sweep_root_raw.unwrap(),
+                                    ));
+                                }
+                                KillWaitDecision::RefuseRootStatusAbsent => {
+                                    break Err(format!(
+                                        "kill-on-exit: refusing tracer wait error {} \
+                                         because no root exit status snapshot was taken \
+                                         before our sweep/terminate: {e}",
+                                        class.as_str()
+                                    ));
+                                }
+                                KillWaitDecision::RefuseSigkillSnapshot => {
+                                    break Err(format!(
+                                        "kill-on-exit: refusing tracer wait error {} \
+                                         because the root status snapshot is SIGKILL, \
+                                         which our sweep never sends to the root: {e}",
+                                        class.as_str()
+                                    ));
+                                }
+                                KillWaitDecision::RefuseUnacceptedError => {
+                                    break Err(format!(
+                                        "kill-on-exit: refusing unaccepted tracer wait error {} \
+                                         (termination_requested={termination_requested}, \
+                                         sent_kill={sent_kill}, sweep_attempted={sweep_attempted}, \
+                                         root_status_snapshot={sweep_root_raw:?}): {e}",
+                                        class.as_str()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = poll.tick() => {
+                    prune_registered_guests();
+                    if !root_gone && proc_exited(root_pid) {
+                        root_gone = true;
+                        root_gone_since = Some(std::time::Instant::now());
+                    }
+                    let root_status_recorded =
+                        crate::rootfs_tool::root_exit_raw().is_some();
+                    // Bounded refusal: a gone root whose status
+                    // is never recorded must not leave the
+                    // launcher waiting on detached descendants
+                    // forever. Kill the registered tree and
+                    // terminate the tracer, then refuse by name.
+                    if root_gone
+                        && !root_status_recorded
+                        && root_gone_since
+                            .map(|s| s.elapsed() >= std::time::Duration::from_secs(2))
+                            .unwrap_or(false)
+                    {
+                        sweep_attempted = true;
+                        sent_kill |= kill_registered_guests(root_pid);
+                        if !termination_requested {
+                            if let Some(handle) = &termination {
+                                termination_requested |= handle.terminate(
+                                    reverie::Error::Errno(
+                                        reverie::syscalls::Errno::ECANCELED,
+                                    ),
+                                );
+                            }
+                        }
+                        break Err(format!(
+                            "kill-on-exit: root exit status was not recorded within 2s \
+                             after root exit (root pid {root_pid}); refusing to wait \
+                             for detached descendants"
+                        ));
+                    }
+                    let sweep_allowed = kill_sweep_allowed(root_gone, root_status_recorded);
+                    if sweep_allowed && root_status_since.is_none() {
+                        root_status_since = Some(std::time::Instant::now());
+                        sweep_root_raw = crate::rootfs_tool::root_exit_raw();
+                    }
+                    // Termination is the last resort, not the
+                    // first move: give the verified sweeps a
+                    // grace period to finish the tree (the
+                    // common case), and only a session still
+                    // wedged after it (e.g. a fork stop that
+                    // never clears) is terminated through the
+                    // tracer's cleanup owner, which supersedes
+                    // fork stops instead of racing external
+                    // SIGKILLs into error 125.
+                    if sweep_allowed
+                        && !termination_requested
+                        && root_status_since
+                            .map(|s| s.elapsed() >= std::time::Duration::from_millis(500))
+                            .unwrap_or(false)
+                    {
+                        if let Some(handle) = &termination {
+                            termination_requested |= handle.terminate(reverie::Error::Errno(
+                                reverie::syscalls::Errno::ECANCELED,
+                            ));
+                        }
+                    }
+                    if sweep_allowed {
+                        // Every tick, not once, as defense in
+                        // depth for registration lag. (A single
+                        // post-status sweep would be
+                        // survival-equivalent for traced guests:
+                        // creation stops are tracer-owned and
+                        // traced guests are registered at
+                        // creation, with the 500 ms termination
+                        // and PTRACE_O_EXITKILL behind it.
+                        // CLONE_UNTRACED children are neither
+                        // registered nor traced and escape every
+                        // sweep variant equally; that gap is
+                        // named in the usage text.)
+                        sweep_attempted = true;
+                        sent_kill |= kill_registered_guests(root_pid);
+                    }
+                }
+            }
+        };
+        if kill_on_exit
+            && (sweep_root_raw.is_some()
+                || sweep_attempted
+                || crate::rootfs_tool::root_exit_raw().is_some())
+        {
+            // Defense-in-depth sweep on every completed wait
+            // path, including tracer-error paths. It is not
+            // the survival guarantee for traced guests
+            // (removing it, or skipping it on the error path,
+            // is survival-equivalent): the per-tick verified
+            // sweeps above are primary, the tracer reaps its
+            // tree before wait() completes, and
+            // PTRACE_O_EXITKILL kills any still-traced
+            // remainder when this launcher exits.
+            // CLONE_UNTRACED children are neither registered
+            // nor traced and escape this sweep too.
+            kill_registered_guests(root_pid);
+        }
+        status
     })?;
     #[cfg(feature = "run")]
     {
@@ -481,6 +687,199 @@ fn refuse_mapped_without_authority(backend: &str, authority_configured: bool) ->
         );
     }
     Ok(())
+}
+
+/// The only tracer-wait error classes kill-on-exit may ever
+/// convert back into the root guest's recorded status.
+#[cfg(feature = "run")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KillWaitErrorClass {
+    /// The typed primary error is the ECANCELED cause passed
+    /// to PtraceTerminationHandle::terminate.
+    OwnTermination,
+    /// Our external SIGKILL raced a queued fork/vfork/clone
+    /// stop, which the tracer reports as superseded by the
+    /// tracee's exit stop.
+    SupersededForkStop,
+    /// Our external SIGKILL removed the initial tracee before
+    /// a resume completed ("wait after initial tracee resume"
+    /// with ENOENT).
+    InitialResumeEnoent,
+    /// The primary error is ESRCH. Always refused by name:
+    /// Reverie can hit ESRCH while the root is still alive
+    /// and its cleanup then SIGKILLs the root, so accepting
+    /// it would relabel a tracer failure as a guest status.
+    TypedEsrch,
+    /// Anything else: never relabelled as a guest status.
+    Other,
+}
+
+#[cfg(feature = "run")]
+impl KillWaitErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnTermination => "own ECANCELED termination",
+            Self::SupersededForkStop => "superseded fork stop after kill-on-exit SIGKILL",
+            Self::InitialResumeEnoent => {
+                "initial tracee resume ENOENT after kill-on-exit SIGKILL"
+            }
+            Self::TypedEsrch => "typed ESRCH tracer failure (refused)",
+            Self::Other => "other tracer error",
+        }
+    }
+}
+
+#[cfg(feature = "run")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KillWaitDecision {
+    AcceptRootStatus,
+    RefuseRootStatusAbsent,
+    RefuseSigkillSnapshot,
+    RefuseUnacceptedError,
+}
+
+/// No external SIGKILL (and no termination backstop) may
+/// fire until the Tool has recorded the root's raw status:
+/// killing from the /proc root-gone probe alone races
+/// on_exit_process and can turn the root's clean exit into
+/// a tracer error with no status to return.
+#[cfg(feature = "run")]
+fn kill_sweep_allowed(root_gone: bool, root_status_recorded: bool) -> bool {
+    root_gone && root_status_recorded
+}
+
+/// True if a raw wait status is death by SIGKILL. Our
+/// sweep never signals the root (kill_registered_guests
+/// skips it), so a SIGKILL snapshot can only be a status
+/// Reverie's own cleanup imposed; it must never be
+/// returned as the guest's exit status.
+#[cfg(feature = "run")]
+fn root_snapshot_is_sigkill(raw: i32) -> bool {
+    reverie::ExitStatus::from_raw(raw).signal() == Some(libc::SIGKILL)
+}
+
+/// Pure acceptance rule for a tracer error after the root
+/// exited. A recorded termination request is not enough by
+/// itself: `class` must prove the returned error's typed
+/// primary cause is our ECANCELED termination (Reverie's
+/// terminate() returns true even when another failure is
+/// already primary). Superseded/resume classes require an
+/// actual verified SIGKILL. Typed ESRCH is always refused:
+/// it can arrive while the root is alive, before Reverie's
+/// cleanup SIGKILLs it. Every accepted class additionally
+/// requires the root-status snapshot taken when our first
+/// sweep/terminate fired, and a SIGKILL snapshot is
+/// refused outright.
+#[cfg(feature = "run")]
+fn kill_wait_decision(
+    class: KillWaitErrorClass,
+    termination_requested: bool,
+    sent_kill: bool,
+    sweep_root_raw: Option<i32>,
+) -> KillWaitDecision {
+    let class_accepted = match class {
+        KillWaitErrorClass::OwnTermination => termination_requested,
+        KillWaitErrorClass::SupersededForkStop | KillWaitErrorClass::InitialResumeEnoent => {
+            sent_kill
+        }
+        KillWaitErrorClass::TypedEsrch | KillWaitErrorClass::Other => false,
+    };
+    if !class_accepted {
+        KillWaitDecision::RefuseUnacceptedError
+    } else {
+        match sweep_root_raw {
+            None => KillWaitDecision::RefuseRootStatusAbsent,
+            Some(raw) if root_snapshot_is_sigkill(raw) => {
+                KillWaitDecision::RefuseSigkillSnapshot
+            }
+            Some(_) => KillWaitDecision::AcceptRootStatus,
+        }
+    }
+}
+
+/// The typed primary cause inside Reverie's legacy wait
+/// error. Legacy waits wrap the complete failure in an
+/// anyhow Tool error (LegacyFailureProjection for a
+/// completed run, CleanupUnconfirmed for a quarantined
+/// cleanup owner); recover its primary instead of trusting
+/// the outer display text, which embeds secondaries.
+#[cfg(feature = "run")]
+fn primary_reverie_error(error: &reverie::Error) -> &reverie::Error {
+    if let reverie::Error::Tool(tool_error) = error {
+        if let Some(projection) =
+            tool_error.downcast_ref::<reverie_ptrace::LegacyFailureProjection>()
+        {
+            return projection.failure().primary();
+        }
+        if let Some(cleanup) =
+            tool_error.downcast_ref::<reverie_ptrace::CleanupUnconfirmed>()
+        {
+            return cleanup.primary();
+        }
+    }
+    error
+}
+
+/// Display text of the primary error only. A unique Tool
+/// primary with cleanup secondaries carries a
+/// LegacyCleanupDiagnostics context whose Display embeds
+/// the secondaries; the next anyhow chain item is the
+/// primary itself.
+#[cfg(feature = "run")]
+fn primary_error_text(error: &reverie::Error) -> String {
+    let primary = primary_reverie_error(error);
+    if let reverie::Error::Tool(tool_error) = primary {
+        if tool_error
+            .downcast_ref::<reverie_ptrace::LegacyCleanupDiagnostics>()
+            .is_some()
+        {
+            if let Some(source) = tool_error.chain().nth(1) {
+                return source.to_string();
+            }
+        }
+    }
+    primary.to_string()
+}
+
+/// Classify from the primary error only: its typed errno
+/// (when the primary is a bare errno) and its own display
+/// text. Secondary/cleanup text never reaches this
+/// function, so a superseded/ENOENT mention in a secondary
+/// cannot be accepted.
+#[cfg(feature = "run")]
+fn classify_primary_error(
+    typed_errno: Option<reverie::syscalls::Errno>,
+    primary_text: &str,
+) -> KillWaitErrorClass {
+    match typed_errno {
+        Some(reverie::syscalls::Errno::ECANCELED) => {
+            return KillWaitErrorClass::OwnTermination;
+        }
+        Some(reverie::syscalls::Errno::ESRCH) => {
+            return KillWaitErrorClass::TypedEsrch;
+        }
+        _ => {}
+    }
+    if primary_text.contains("is a fork, vfork or clone stop superseded by the exit stop") {
+        KillWaitErrorClass::SupersededForkStop
+    } else if primary_text.contains("wait after initial tracee resume")
+        && primary_text.contains(": -2 ENOENT")
+    {
+        KillWaitErrorClass::InitialResumeEnoent
+    } else if primary_text.contains("-3 ESRCH") {
+        KillWaitErrorClass::TypedEsrch
+    } else {
+        KillWaitErrorClass::Other
+    }
+}
+
+#[cfg(feature = "run")]
+fn classify_kill_wait_error(error: &reverie::Error) -> KillWaitErrorClass {
+    let typed_errno = match primary_reverie_error(error) {
+        reverie::Error::Errno(errno) => Some(*errno),
+        _ => None,
+    };
+    classify_primary_error(typed_errno, &primary_error_text(error))
 }
 
 /// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
@@ -588,3 +987,323 @@ mod mapped_route_tests {
         assert!(refuse_mapped_without_authority("trap", false).is_ok());
     }
 }
+
+/// True once `pid` has exited (zombie or fully reaped), read
+/// from /proc without racing the tracer's own wait.
+#[cfg(any(feature = "run", feature = "in-guest", feature = "inguest-trap"))]
+fn proc_exited(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let zombie = stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                .unwrap_or(false);
+            // A group leader that called pthread_exit is a
+            // zombie while sibling threads still run; that is
+            // not process exit. The leader's own zombie task
+            // entry does not count as live.
+            zombie
+                && !std::fs::read_dir(format!("/proc/{pid}/task"))
+                    .map(|tasks| {
+                        tasks.flatten().any(|task| {
+                            std::fs::read_to_string(task.path().join("stat"))
+                                .map(|s| {
+                                    !s.rsplit_once(')')
+                                        .map(|(_, rest)| {
+                                            let st = rest.trim_start();
+                                            st.starts_with('Z') || st.starts_with('X')
+                                        })
+                                        .unwrap_or(true)
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+        }
+        Err(_) => true,
+    }
+}
+
+
+
+
+
+
+/// Pidfd-kill only if `pid` still names the process with
+/// start time `expected`: rechecked immediately before
+/// pidfd_open and again after it (once the fd is open the
+/// identity is pinned, so a pid reused in between fails the
+/// second check instead of being signalled).
+fn pidfd_kill_verified(pid: i32, expected_starttime: u64) -> bool {
+    if expected_starttime == 0
+        || crate::rootfs_tool::proc_starttime(pid) != Some(expected_starttime)
+    {
+        return false;
+    }
+    const SYS_PIDFD_OPEN: i64 = 434;
+    const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
+    // SAFETY: plain syscall wrappers; the fd is closed on every path.
+    unsafe {
+        let fd = libc::syscall(SYS_PIDFD_OPEN, pid, 0i32) as libc::c_int;
+        if fd < 0 {
+            return false;
+        }
+        let same = crate::rootfs_tool::proc_starttime(pid) == Some(expected_starttime);
+        let sent = same
+            && libc::syscall(SYS_PIDFD_SEND_SIGNAL, fd, libc::SIGKILL, 0usize, 0i32) == 0;
+        libc::close(fd);
+        sent
+    }
+}
+
+/// SIGKILL every registered guest pid whose start time was
+/// actually verified at registration; unverified entries
+/// (starttime unread) are never signalled. Killed and
+/// proven-dead entries are forgotten. No ptrace-stop state
+/// is skipped: busy tracees live in syscall stops, and the
+/// named superseded-fork-stop outcome of killing one is
+/// handled by the wait-error acceptance rule above.
+#[cfg(feature = "run")]
+fn kill_registered_guests(root_pid: i32) -> bool {
+    let mut sent_kill = false;
+    for (pid, starttime) in crate::rootfs_tool::guest_pid_snapshot() {
+        if pid == root_pid {
+            crate::rootfs_tool::forget_guest_pid(pid);
+            continue;
+        }
+        if starttime == 0 || crate::rootfs_tool::proc_starttime(pid) != Some(starttime) {
+            crate::rootfs_tool::forget_guest_pid(pid);
+            continue;
+        }
+        if pidfd_kill_verified(pid, starttime) {
+            sent_kill = true;
+            crate::rootfs_tool::forget_guest_pid(pid);
+        }
+    }
+    sent_kill
+}
+
+/// Drop registry entries whose process is already gone (or
+/// whose start time no longer matches).
+#[cfg(feature = "run")]
+fn prune_registered_guests() {
+    for (pid, starttime) in crate::rootfs_tool::guest_pid_snapshot() {
+        if starttime != 0 && crate::rootfs_tool::proc_starttime(pid) != Some(starttime) {
+            crate::rootfs_tool::forget_guest_pid(pid);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "run"))]
+mod kill_wait_acceptance_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_waits_for_recorded_root_status() {
+        assert!(kill_sweep_allowed(true, true));
+        assert!(!kill_sweep_allowed(true, false));
+        assert!(!kill_sweep_allowed(false, true));
+        assert!(!kill_sweep_allowed(false, false));
+    }
+
+    #[test]
+    fn own_ecanceled_termination_is_the_only_termination_acceptance() {
+        let own = reverie::Error::Errno(reverie::syscalls::Errno::ECANCELED);
+        assert_eq!(
+            classify_kill_wait_error(&own),
+            KillWaitErrorClass::OwnTermination
+        );
+        assert_eq!(
+            kill_wait_decision(
+                KillWaitErrorClass::OwnTermination,
+                true,
+                false,
+                Some(7 << 8)
+            ),
+            KillWaitDecision::AcceptRootStatus
+        );
+        // ECANCELED typed primary without our recorded request
+        // is not ours to relabel.
+        assert_eq!(
+            kill_wait_decision(
+                KillWaitErrorClass::OwnTermination,
+                false,
+                true,
+                Some(7 << 8)
+            ),
+            KillWaitDecision::RefuseUnacceptedError
+        );
+        // A recorded request must not launder some other real
+        // tracer failure (terminate() can return true while
+        // another failure is primary).
+        assert_eq!(
+            kill_wait_decision(KillWaitErrorClass::Other, true, true, Some(7 << 8)),
+            KillWaitDecision::RefuseUnacceptedError
+        );
+    }
+
+    #[test]
+    fn kill_induced_classes_require_sent_kill_and_root_status() {
+        for class in [
+            KillWaitErrorClass::SupersededForkStop,
+            KillWaitErrorClass::InitialResumeEnoent,
+        ] {
+            assert_eq!(
+                kill_wait_decision(class, false, true, Some(7 << 8)),
+                KillWaitDecision::AcceptRootStatus,
+                "{class:?} after our verified kill"
+            );
+            assert_eq!(
+                kill_wait_decision(class, false, false, Some(7 << 8)),
+                KillWaitDecision::RefuseUnacceptedError,
+                "{class:?} without our kill"
+            );
+            assert_eq!(
+                kill_wait_decision(class, false, true, None),
+                KillWaitDecision::RefuseRootStatusAbsent,
+                "{class:?} without a recorded root status"
+            );
+        }
+
+        // Typed ESRCH is always refused, even after our kill
+        // with a snapshot: Reverie can hit it while the root
+        // is alive and its cleanup then SIGKILLs the root,
+        // so accepting it would relabel a tracer failure
+        // as the guest's exit status.
+        let esrch = reverie::Error::Errno(reverie::syscalls::Errno::ESRCH);
+        assert_eq!(
+            classify_kill_wait_error(&esrch),
+            KillWaitErrorClass::TypedEsrch
+        );
+        for (termination_requested, sent_kill, snapshot) in [
+            (false, false, None),
+            (false, false, Some(7 << 8)),
+            (false, true, Some(7 << 8)),
+            (true, true, Some(7 << 8)),
+        ] {
+            assert_eq!(
+                kill_wait_decision(
+                    KillWaitErrorClass::TypedEsrch,
+                    termination_requested,
+                    sent_kill,
+                    snapshot
+                ),
+                KillWaitDecision::RefuseUnacceptedError,
+                "ESRCH must never be accepted"
+            );
+        }
+        assert_eq!(
+            kill_wait_decision(
+                KillWaitErrorClass::OwnTermination,
+                true,
+                false,
+                None
+            ),
+            KillWaitDecision::RefuseRootStatusAbsent
+        );
+    }
+
+    #[test]
+    fn sigkill_snapshot_is_refused() {
+        // Raw wait statuses: 9 = SIGKILL, 137 = SIGKILL with
+        // coredump bit. Our sweep never signals the root, so
+        // either snapshot can only be a status Reverie's
+        // cleanup imposed; never return it as the guest exit.
+        for raw in [9, 137] {
+            assert!(root_snapshot_is_sigkill(raw), "raw {raw}");
+            assert_eq!(
+                kill_wait_decision(
+                    KillWaitErrorClass::SupersededForkStop,
+                    false,
+                    true,
+                    Some(raw)
+                ),
+                KillWaitDecision::RefuseSigkillSnapshot,
+                "raw {raw}"
+            );
+            assert_eq!(
+                kill_wait_decision(
+                    KillWaitErrorClass::OwnTermination,
+                    true,
+                    false,
+                    Some(raw)
+                ),
+                KillWaitDecision::RefuseSigkillSnapshot,
+                "raw {raw}"
+            );
+        }
+        assert!(!root_snapshot_is_sigkill(7 << 8));
+    }
+
+    #[test]
+    fn classifier_matches_primary_text_exactly() {
+        // Exact accepted primaries.
+        assert_eq!(
+            classify_primary_error(
+                None,
+                "queued wait status 0x1057f is a fork, vfork or clone stop \
+                 superseded by the exit stop; its child PID is no longer readable"
+            ),
+            KillWaitErrorClass::SupersededForkStop
+        );
+        assert_eq!(
+            classify_primary_error(
+                None,
+                "wait after initial tracee resume failed for tracee 7: \
+                 -2 ENOENT (No such file or directory)"
+            ),
+            KillWaitErrorClass::InitialResumeEnoent
+        );
+        // "-2" must not widen to -20..-29, and a bare
+        // ENOENT token without the exact ": -2 ENOENT"
+        // shape must not classify as the resume case.
+        for text in [
+            "wait after initial tracee resume failed for tracee 7: \
+             -22 EINVAL (Invalid argument)",
+            "wait after initial tracee resume failed for tracee 7: \
+             -28 ENOSPC (No space left on device)",
+            "wait after initial tracee resume failed for tracee 7: \
+             ENOENT (No such file or directory)",
+        ] {
+            assert_eq!(
+                classify_primary_error(None, text),
+                KillWaitErrorClass::Other,
+                "{text:?} must not classify as ENOENT"
+            );
+        }
+        // Primary-only input contract: classify_primary_error
+        // receives only the resolved primary's text (see
+        // primary_reverie_error/primary_error_text, which
+        // unwrap LegacyFailureProjection, CleanupUnconfirmed
+        // and LegacyCleanupDiagnostics). NAMED GAP: this
+        // block does not exercise that wrapper stripping —
+        // Reverie's wrapper types have no public constructors
+        // (fields are crate-private), so literoot tests
+        // cannot build a wrapped error whose secondary
+        // mentions superseded/ENOENT, and a full-text
+        // classification mutant survives these tests. The
+        // strings below pin only that a primary with no
+        // trigger text is refused.
+        for primary_only in [
+            "cleanup deadline exceeded",
+            "-1 EPERM (Operation not permitted)",
+            "ordinary ptrace run already failed",
+        ] {
+            assert_eq!(
+                classify_primary_error(None, primary_only),
+                KillWaitErrorClass::Other,
+                "primary {primary_only:?} must be refused regardless of secondaries"
+            );
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+

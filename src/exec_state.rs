@@ -635,6 +635,7 @@ mod tests {
             config_memo: None,
             pending_stack_limit: None,
             initial_stack_limit_consumed: false,
+            kill_registered: false,
         }
     }
 
