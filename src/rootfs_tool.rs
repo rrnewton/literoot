@@ -115,13 +115,136 @@ pub struct LiterootGlobal {
     config: std::sync::OnceLock<RootConfig>,
 }
 
-/// Unused RPC message (GlobalTool requires the types to exist).
+/// A refusal reported to the launcher's side log (`crate::refusal_log`),
+/// which writes one line per refusal, of its closed grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    /// A nested exec refused in-guest (`UnsupportedOperation::Exec`).
+    Exec,
+    /// A fork-like call refused while process forks are not allowed.
+    ForkPolicy(ForkKind),
+    /// A signal handler refused; the kernel signal number, 1..=64.
+    SignalAction(u8),
+    /// An alternate signal stack refused.
+    AlternateStack,
+    /// Another unsupported operation the in-guest host refused.
+    Unsupported(UnsupportedKind),
+    /// A refusal literoot's own Tool makes.
+    Guest(GuestKind),
+}
+
+/// The fork-like kinds of the runtime's record: `clone` split by
+/// `CLONE_THREAD` only, `clone3` unsplit (its flags are not read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForkKind {
+    CloneThread,
+    CloneProcess,
+    Clone3,
+    Fork,
+    Vfork,
+}
+
+/// The in-guest host's `UnsupportedOperation` refusals other than `Exec`
+/// that the side-log grammar names; every other variant, including any
+/// added later (the enum is non-exhaustive), is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnsupportedKind {
+    NativeExec,
+    ThreadCreation,
+    Other,
+}
+
+impl UnsupportedKind {
+    fn token(self) -> &'static str {
+        match self {
+            UnsupportedKind::NativeExec => "native_exec",
+            UnsupportedKind::ThreadCreation => "thread_creation",
+            UnsupportedKind::Other => "other",
+        }
+    }
+}
+
+/// Refusals literoot's own Tool makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuestKind {
+    /// Guest `ptrace` refused with EPERM (in-guest backends).
+    Ptrace,
+    /// A self-SIGSTOP after a refused `PTRACE_TRACEME`, swallowed.
+    SelfStop,
+    SharedRecordPublish,
+    NodenameWrite,
+    DomainnameWrite,
+    /// proot kompat's auxv adjustment under `-k`, which the ptrace backend
+    /// applies at the exec stop, is not implemented in-guest.
+    KompatAuxv,
+}
+
+impl Refusal {
+    /// The side-log line.
+    pub fn line(self) -> String {
+        let kind = |k: ForkKind| match k {
+            ForkKind::CloneThread => "clone_thread",
+            ForkKind::CloneProcess => "clone_process",
+            ForkKind::Clone3 => "clone3",
+            ForkKind::Fork => "fork",
+            ForkKind::Vfork => "vfork",
+        };
+        match self {
+            Refusal::Exec => "literoot: refused exec".into(),
+            Refusal::ForkPolicy(k) => format!("literoot: refused fork_policy {}", kind(k)),
+            Refusal::SignalAction(n @ 1..=64) => format!("literoot: refused signal_action {n}"),
+            Refusal::SignalAction(_) => "literoot: refused unsupported other".into(),
+            Refusal::AlternateStack => "literoot: refused alternate_stack".into(),
+            Refusal::Unsupported(k) => format!("literoot: refused unsupported {}", k.token()),
+            Refusal::Guest(k) => format!(
+                "literoot: refused guest {}",
+                match k {
+                    GuestKind::Ptrace => "ptrace",
+                    GuestKind::SelfStop => "self_stop",
+                    GuestKind::SharedRecordPublish => "shared_record_publish",
+                    GuestKind::NodenameWrite => "nodename_write",
+                    GuestKind::DomainnameWrite => "domainname_write",
+                    GuestKind::KompatAuxv => "kompat_auxv",
+                }
+            ),
+        }
+    }
+}
+
+/// The coordinator request: the refusals one drain found, in the order
+/// drained. The launcher writes them before it answers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NoMsg;
+pub struct Refused(pub Vec<Refusal>);
+
+/// Refusals the Tool made in this process and has not yet reported: one
+/// bit per [`GuestKind`]. The in-guest wiring takes them at its next drain.
+pub(crate) static PENDING_GUEST_REFUSALS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) const GUEST_KINDS: [GuestKind; 6] = [
+    GuestKind::Ptrace,
+    GuestKind::SelfStop,
+    GuestKind::SharedRecordPublish,
+    GuestKind::NodenameWrite,
+    GuestKind::DomainnameWrite,
+    GuestKind::KompatAuxv,
+];
+
+/// Note a refusal the Tool made. Where the Tool runs in the launcher
+/// process (the ptrace backend) the side log is open here and the line is
+/// written at once; in a guest process it waits for the wiring's drain.
+fn note_guest_refusal(kind: GuestKind) {
+    if crate::refusal_log::is_open() {
+        crate::refusal_log::write_line(&Refusal::Guest(kind).line());
+    } else {
+        let bit = 1 << GUEST_KINDS.iter().position(|&k| k == kind).unwrap();
+        PENDING_GUEST_REFUSALS.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[reverie::global_tool]
 impl GlobalTool for LiterootGlobal {
-    type Request = NoMsg;
+    type Request = Refused;
     type Response = ();
     type Config = LiterootConfig;
 
@@ -132,7 +255,11 @@ impl GlobalTool for LiterootGlobal {
         g
     }
 
-    async fn receive_rpc(&self, _from: Pid, _msg: NoMsg) {}
+    async fn receive_rpc(&self, _from: Pid, msg: Refused) {
+        for refusal in msg.0 {
+            crate::refusal_log::write_line(&refusal.line());
+        }
+    }
 }
 
 /// Per-process replicated state (design §6).
@@ -256,6 +383,20 @@ pub struct RootfsThreadState {
     pub pending: Option<ExecState>,
 }
 
+// A wrapping Tool with the same thread state forwards its guest to
+// `RootfsTool` through `Guest::into_guest`, which asks for these.
+impl AsRef<RootfsThreadState> for RootfsThreadState {
+    fn as_ref(&self) -> &RootfsThreadState {
+        self
+    }
+}
+
+impl AsMut<RootfsThreadState> for RootfsThreadState {
+    fn as_mut(&mut self) -> &mut RootfsThreadState {
+        self
+    }
+}
+
 fn refusal_label(category: RefusalCategory) -> &'static str {
     match category {
         RefusalCategory::Publish => "publish",
@@ -328,6 +469,11 @@ fn report_shared_record_refusal(
     // with no persisted count (above all the 5 s lock
     // timeout); in-guest it therefore prints at most once
     // per program image for those.
+    note_guest_refusal(match category {
+        RefusalCategory::Publish => GuestKind::SharedRecordPublish,
+        RefusalCategory::UtsNodename => GuestKind::NodenameWrite,
+        RefusalCategory::UtsDomainname => GuestKind::DomainnameWrite,
+    });
     let message = match err.refusal_count() {
         Some(count) => RefusalReporter::message_for_count(category, count, &detail),
         None => SHARED_RECORD_REFUSALS.message(category, &detail),
@@ -1088,12 +1234,13 @@ impl Tool for RootfsTool {
             .unwrap_or(false);
         let kompat = guest.config().kernel_release.is_some()
             && guest.config().post_exec_at_exec_stop;
-        if guest.config().kernel_release.is_some()
-            && !kompat
-            && !guest.config().post_exec_at_exec_stop
-            && std::env::var_os("LITEROOT_DEBUG").is_some()
-        {
-            eprintln!("literoot-tool: kompat auxv skipped: post-exec not at exec stop");
+        if guest.config().kernel_release.is_some() && !guest.config().post_exec_at_exec_stop {
+            // In-guest: the kompat adjustment is skipped, so the guest's
+            // auxv differs from the ptrace backend's. Keyed once per exec.
+            note_guest_refusal(GuestKind::KompatAuxv);
+            if std::env::var_os("LITEROOT_DEBUG").is_some() {
+                eprintln!("literoot-tool: kompat auxv skipped: post-exec not at exec stop");
+            }
         }
         let kompat_force = kompat && guest.config().kompat_force;
         if fake.is_some() || zero_hwcap || kompat {
@@ -2213,6 +2360,7 @@ impl Tool for RootfsTool {
                     if pt.request() == libc::PTRACE_TRACEME as u32 {
                         self.state.lock().unwrap().swallow_next_self_stop = true;
                     }
+                    note_guest_refusal(GuestKind::Ptrace);
                     Err(reverie::syscalls::Errno::EPERM.into())
                 } else {
                     Ok(guest.inject(pt).await?)
@@ -2239,6 +2387,7 @@ impl Tool for RootfsTool {
                     && k.pid() == guest.pid().as_raw()
                     && k.sig() == libc::SIGSTOP;
                 if swallow_self_stop {
+                    note_guest_refusal(GuestKind::SelfStop);
                     Ok(0)
                 } else {
                     Ok(guest.inject(k).await?)

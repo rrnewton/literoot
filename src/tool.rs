@@ -89,6 +89,40 @@ fn restore_launcher_stack_limit(limits: Option<(u64, u64)>) -> Result<(), String
     Ok(())
 }
 
+/// Set when the guest command cannot be executed at all (not found,
+/// not executable, a directory, a self-referential shebang): the exec
+/// errors real proot raises for the same argv, which the launcher does not
+/// key as a refusal (the suite expects them, e.g. test-rootfs-arg-validation).
+static COMMAND_NOT_RUNNABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn command_not_runnable() {
+    COMMAND_NOT_RUNNABLE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the launch failed because the guest command cannot be executed.
+pub fn command_was_not_runnable() -> bool {
+    COMMAND_NOT_RUNNABLE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Set when an in-guest launch returned an error. Reverie's launch returns
+/// only after every coordinator connection has closed, and fails when one
+/// outlives the root guest past its drain bound, so a guest that may still
+/// be running and reporting is one of these errors; the launcher then ends
+/// its side log `error launch`, which no test name can count.
+static LAUNCH_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+fn launch_error(backend: &str, error: impl std::fmt::Display) -> String {
+    LAUNCH_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+    format!("in-guest ({backend}) run: {error}")
+}
+
+/// Whether an in-guest launch returned an error.
+pub fn launch_failed() -> bool {
+    LAUNCH_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
 /// requested backend. Returns the guest exit code.
 pub fn run_guest(
@@ -180,8 +214,10 @@ pub fn run_guest(
             )
         } else {
             // PATH lookup inside the rootfs (guest PATH dirs).
-            let found = find_guest_in_path(config, cwd_guest, &guest_prog)
-                .ok_or_else(|| format!("literoot: {guest_prog}: not found in rootfs PATH"))?;
+            let found = find_guest_in_path(config, cwd_guest, &guest_prog).ok_or_else(|| {
+                command_not_runnable();
+                format!("literoot: {guest_prog}: not found in rootfs PATH")
+            })?;
             let host = resolve_in_rootfs(config, cwd_guest, Path::new(&found));
             (host, found)
         };
@@ -195,13 +231,18 @@ pub fn run_guest(
         use std::os::unix::fs::PermissionsExt as _;
         match std::fs::metadata(&host_prog) {
             Ok(md) if md.is_dir() => {
+                command_not_runnable();
                 return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
             Ok(md) if md.permissions().mode() & 0o111 == 0 => {
+                command_not_runnable();
                 return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
             Ok(_) => {}
-            Err(e) => return Err(format!("literoot: {guest_prog}: {e}")),
+            Err(e) => {
+                command_not_runnable();
+                return Err(format!("literoot: {guest_prog}: {e}"));
+            }
         }
     }
     // Shebang scripts: exec the guest interpreter with the
@@ -215,6 +256,7 @@ pub fn run_guest(
         // Self-referential shebang: the kernel would ELOOP.
         if resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp)) == host_prog {
             eprintln!("literoot: {guest_prog}: Too many levels of symbolic links");
+            command_not_runnable();
             return Err("Too many levels of symbolic links".into());
         }
         let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp));
@@ -364,6 +406,9 @@ fn run_backend(
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
+    // The launch route, for the refusal side log: in-guest backends start
+    // their initial program through the preload today.
+    crate::side_log::route(if in_guest { "preload" } else { "ptrace" });
     if in_guest {
         // --kill-on-exit is ptrace-only today: an in-guest
         // tree kill needs a launcher-side descent proof the
@@ -405,7 +450,7 @@ fn run_backend(
                     RootfsTool,
                 >(cmd, cfg, preload, selector.clone())
                 .await
-                .map_err(|e| format!("in-guest ({backend}) run: {e}"))
+                .map_err(|e| launch_error(backend, e))
             })?;
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
@@ -442,7 +487,7 @@ fn run_backend(
                     selector.clone(),
                 )
                 .await
-                .map_err(|e| format!("in-guest ({backend}) run: {e}"))
+                .map_err(|e| launch_error(backend, e))
             })?;
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();

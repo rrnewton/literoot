@@ -21,6 +21,9 @@ mod exec_state;
 #[path = "../../src/shared_record.rs"]
 #[allow(dead_code)] // Future shared-record transports are the first production callers.
 mod shared_record;
+#[path = "../../src/refusal_log.rs"]
+mod refusal_log;
+mod reporting;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
 #[path = "../../src/translate.rs"]
@@ -111,7 +114,7 @@ unsafe extern "C" fn initialize(
         let result = match selected.as_str() {
             "literoot" | "literoot-watched" => unsafe {
                 reverie_inguest::guest::tool_install::install_tool_with::<
-                    rootfs_tool::RootfsTool,
+                    reporting::ReportingTool,
                     _,
                 >(
                     &socket,
@@ -160,7 +163,7 @@ unsafe extern "C" fn initialize(
         let socket = bootstrap.coordinator;
         let result = match selected.as_str() {
             "literoot" => unsafe {
-                reverie_liteinst::install_tool_from_bootstrap::<rootfs_tool::RootfsTool>(&socket)
+                reverie_liteinst::install_tool_from_bootstrap::<reporting::ReportingTool>(&socket)
             },
             other => fail(&format!(
                 "unknown tool selector {other:?} (expected \"literoot\")"
@@ -217,12 +220,15 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
 fn decode_successor_state(
     config: &rootfs_tool::LiterootConfig,
     bytes: &[u8],
-) -> std::io::Result<(rootfs_tool::RootfsTool, rootfs_tool::RootfsThreadState)> {
+) -> std::io::Result<(reporting::ReportingTool, rootfs_tool::RootfsThreadState)> {
     let state = crate::exec_state::ExecState::decode(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let tool = rootfs_tool::RootfsTool::from_exec_state(state, &config.to_root_config())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok((tool, rootfs_tool::RootfsThreadState::default()))
+    Ok((
+        reporting::ReportingTool::wrapping(tool),
+        rootfs_tool::RootfsThreadState::default(),
+    ))
 }
 
 // SAFETY: qualify accepts only the exact launched LiterootConfig
@@ -240,16 +246,18 @@ fn decode_successor_state(
 // logs, or DETLOG to freshen — per-process state arrives via
 // decode, shared facts stay on their inherited records, and the
 // successor image's statics are fresh by virtue of the exec.
-// Complete never fabricates an ACK: LiterootGlobal's RPC types
-// (NoMsg/()) define no CompleteNativeExec message, so it always
-// errors and the framework takes its terminal edge. The
+// Complete never fabricates an ACK: it returns Unsupported
+// unconditionally, so the framework takes its terminal edge.
+// LiterootGlobal's only request, Refused (side-log refusal
+// lines, answered with ()), carries no CompleteNativeExec
+// message. The
 // consumer owns only the expected config value — no mappings,
 // FDs, or launch authority — so Drop cannot invalidate retained
 // ownership. Watched-birth/binding authority itself is checked
 // by the framework before decode (check_successor_binding) and
 // is not re-derived here from digests or request IDs.
 #[cfg(feature = "successor")]
-unsafe impl reverie_liteinst::NativeSuccessorConsumer<rootfs_tool::RootfsTool>
+unsafe impl reverie_liteinst::NativeSuccessorConsumer<reporting::ReportingTool>
     for RootfsSuccessorConsumer
 {
     fn qualify_config(&self, config: &rootfs_tool::LiterootConfig) -> std::io::Result<()> {
@@ -268,7 +276,7 @@ unsafe impl reverie_liteinst::NativeSuccessorConsumer<rootfs_tool::RootfsTool>
         config: &rootfs_tool::LiterootConfig,
         state: &reverie_rpc_transport::successor::VerifiedSuccessorState,
         _binding: reverie_inguest::guest::exec_private::SuccessorBinding,
-    ) -> std::io::Result<(rootfs_tool::RootfsTool, rootfs_tool::RootfsThreadState)> {
+    ) -> std::io::Result<(reporting::ReportingTool, rootfs_tool::RootfsThreadState)> {
         decode_successor_state(config, state.bytes())
     }
 

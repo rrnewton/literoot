@@ -11,6 +11,8 @@
 mod arch;
 #[cfg(feature = "tool")]
 mod exec_stage;
+mod refusal_log;
+mod side_log;
 #[cfg(feature = "tool")]
 mod exec_state;
 #[cfg(feature = "tool")]
@@ -200,6 +202,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             "--help" | "-h" => {
                 print_usage();
+                side_log::end(None);
                 std::process::exit(0);
             }
             "--version" => {
@@ -207,6 +210,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 println!(
                     "backend: reverie-ptrace (POC reference); in-guest liteinst/trap: design §3"
                 );
+                side_log::end(None);
                 std::process::exit(0);
             }
             s if s.starts_with('-') && s.len() > 1 => {
@@ -313,7 +317,117 @@ fn launcher_error_exit_code(error: &str) -> u8 {
     }
 }
 
+/// Exit status when the refusal log cannot be opened or a write to it
+/// fails: neither 0 nor 125. A driver decides validity from the log's own
+/// lines (its `end` line), not from this status, which the suite's shell
+/// may hide.
+const REFUSAL_LOG_EXIT: u8 = 3;
+
+/// The side-log key for a launcher error, or `None` for the closed list of
+/// errors real proot also raises for the same argv, each expected by an
+/// upstream suite line (test-rootfs-arg-validation's "no launch" lines).
+/// Guest-command exec errors (not found, not executable) are exempt through
+/// `tool::command_was_not_runnable`, not by their text.
+fn launcher_refusal(error: &str) -> Option<&'static str> {
+    const PROOT_ALSO_RAISES: [&str; 3] = [
+        // `${PROOT} -v`
+        "literoot: -v requires a level argument",
+        // `-r ${ROOTFS} -r ${DONT_EXIST}`, `-r ${DONT_EXIST} ${ROOTFS}`
+        "literoot: rootfs ",
+        // `-r / -b /etc:/`, `-b /etc:/`
+        "literoot: binding over / conflicts with the rootfs",
+    ];
+    if PROOT_ALSO_RAISES.iter().any(|known| error.starts_with(known)) {
+        None
+    } else if error.starts_with("literoot: -q/qemu passthrough") {
+        Some("qemu_passthrough")
+    } else if error.starts_with("literoot: proot extensions") {
+        Some("extension")
+    } else if error.contains("static executables are not supported by the in-guest backend") {
+        Some("static_floor")
+    } else if launcher_error_exit_code(error) == 2 {
+        Some("kill_on_exit")
+    } else {
+        Some("other")
+    }
+}
+
+/// `literoot --check-refusal-log <path>`: exit 0 and print the refused
+/// lines when the log is valid for one test name, else exit 1 with the
+/// reason. A missing log is not valid.
+fn check_refusal_log(args: &[String]) -> ExitCode {
+    let [path] = args else {
+        eprintln!("literoot: --check-refusal-log takes one path");
+        return ExitCode::from(2);
+    };
+    let checked = std::fs::read(path)
+        .map_err(|e| format!("{path}: {e}"))
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|_| format!("{path}: not UTF-8")))
+        .and_then(|text| side_log::validate(&text));
+    match checked {
+        Ok(refused) => {
+            for line in refused {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("literoot: refusal log not valid: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--check-refusal-log") {
+        return check_refusal_log(&argv[1..]);
+    }
+    // The log option is taken before any other option is read: `-q` and
+    // `--extension` return from parsing at once, and they are refusals.
+    let log = side_log::take_from_args(&mut argv);
+    let path = match &log {
+        Ok(path) => path.clone(),
+        Err((first, _)) if first.is_empty() => {
+            eprintln!("literoot: --refusal-log requires a path");
+            return ExitCode::from(125);
+        }
+        Err((first, _)) => Some(first.clone()),
+    };
+    if let Some(path) = &path {
+        if let Err(e) = side_log::open(Path::new(path)) {
+            eprintln!("literoot: --refusal-log {path}: {e}");
+            return ExitCode::from(REFUSAL_LOG_EXIT);
+        }
+        side_log::begin();
+    }
+    let code = match log {
+        Err((_, second)) => {
+            side_log::refused_launcher("refusal_log_repeated");
+            eprintln!("literoot: --refusal-log given twice (also {second:?})");
+            ExitCode::from(125)
+        }
+        Ok(_) => launch(argv),
+    };
+    if refusal_log::is_open() {
+        side_log::end(launch_failed().then_some("launch"));
+        if side_log::failed() {
+            eprintln!("literoot: --refusal-log: a write failed");
+            return ExitCode::from(REFUSAL_LOG_EXIT);
+        }
+    }
+    code
+}
+
+/// Whether the guest's launch itself failed (see `tool::launch_failed`).
+fn launch_failed() -> bool {
+    #[cfg(feature = "tool")]
+    return tool::launch_failed();
+    #[cfg(not(feature = "tool"))]
+    return false;
+}
+
+fn launch(argv: Vec<String>) -> ExitCode {
     // proot's tracer survives SIGTERM sent by the guest to its
     // TracerPid (test-kill-tracer-pid); ignore it in the
     // launcher (guests keep their own disposition via exec).
@@ -334,7 +448,6 @@ fn main() -> ExitCode {
             return ExitCode::from(125);
         }
     }
-    let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() {
         println!("{VERSION_LINE}");
         return ExitCode::SUCCESS;
@@ -342,6 +455,9 @@ fn main() -> ExitCode {
     let cli = match parse_cli(&argv) {
         Ok(c) => c,
         Err(e) => {
+            if let Some(key) = launcher_refusal(&e) {
+                side_log::refused_launcher(key);
+            }
             eprintln!("{e}");
             return ExitCode::from(125);
         }
@@ -366,6 +482,7 @@ fn main() -> ExitCode {
     #[cfg(not(feature = "tool"))]
     {
         let _ = &cli;
+        side_log::refused_launcher("other");
         eprintln!(
             "literoot: built without a backend feature — translation engine only. \
              Rebuild with default features to execute guests."
@@ -378,6 +495,11 @@ fn main() -> ExitCode {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
                 let code = launcher_error_exit_code(&e);
+                if !tool::command_was_not_runnable() {
+                    if let Some(key) = launcher_refusal(&e) {
+                        side_log::refused_launcher(key);
+                    }
+                }
                 eprintln!("literoot: {e}");
                 ExitCode::from(code)
             }
