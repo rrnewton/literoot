@@ -43,6 +43,17 @@ ptrace-only = ["run"]
 # selection at runtime (see rootfs_tool::tool_selector) — the
 # feature alone never arms anything.
 exec-watch = []
+# Row d (P1a): the private runtime package and its custody point,
+# `runtime_package::open_audited`. Default off until row f wires the
+# static route to it.
+private-runtime = [
+    "dep:reverie-inguest",
+    "reverie-inguest/exec-stop-producer",
+    "dep:libc",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "073e61eaa8f45001731613f311cbfbc2287cfa57", optional = true }
@@ -52,6 +63,8 @@ reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "073e61ea
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
+serde_json = { version = "1.0.154", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [profile.release]
 lto = "thin"

@@ -17,6 +17,9 @@ mod side_log;
 mod exec_state;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
+#[cfg(feature = "private-runtime")]
+#[allow(dead_code)] // Row f's static route is the first production caller.
+mod runtime_package;
 #[cfg(feature = "tool")]
 #[allow(dead_code)] // Future shared-record transports are the first production callers.
 mod shared_record;
