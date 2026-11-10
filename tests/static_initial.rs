@@ -17,31 +17,14 @@
 //! runnable explicitly with --ignored, and it is the
 //! first test to un-ignore when static admission lands.
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
-// Resolution follows tool.rs's convention: $LITEROOT_PRELOAD wins,
-// then $CARGO_TARGET_DIR/release, then the preload-local target.
-fn resolve_preload() -> PathBuf {
-    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
-        return PathBuf::from(p);
-    }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
-        let td = PathBuf::from(td);
-        let td = if td.is_absolute() { td } else { root.join(td) };
-        let cand = td.join("release/libliteroot_preload.so");
-        if cand.exists() {
-            return cand;
-        }
-    }
-    root.join("preload/target/release/libliteroot_preload.so")
-}
-
-fn literoot_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
-}
+use common::literoot_bin;
+use common::resolve_preload;
+use common::run_bounded;
 
 const STATIC_GUEST_C: &str = r#"
 #include <fcntl.h>
@@ -76,32 +59,6 @@ fn build_static_guest(dir: &std::path::Path) -> Option<PathBuf> {
         return None;
     }
     Some(bin)
-}
-
-fn run_bounded(mut cmd: Command, what: &str) -> Output {
-    use std::os::unix::process::CommandExt as _;
-    cmd.process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child: Child = cmd.spawn().expect("spawn literoot");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait().expect("try_wait literoot") {
-            Some(_) => return child.wait_with_output().expect("collect output"),
-            None if Instant::now() >= deadline => {
-                extern "C" {
-                    fn kill(pid: i32, sig: i32) -> i32;
-                }
-                unsafe {
-                    kill(-(child.id() as i32), 9);
-                }
-                let _ = child.kill();
-                let out = child.wait_with_output().expect("collect killed output");
-                panic!("{what}: literoot did not finish within 10 s: {out:?}");
-            }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
 }
 
 fn scratch_rootfs_with_guest(bin: &std::path::Path) -> PathBuf {
