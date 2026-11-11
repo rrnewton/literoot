@@ -361,13 +361,15 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
 
 /// The initial script launch must not cap the in-guest process:
 /// its restore cannot run until after glibc has cached the
-/// default thread stack size. The loader image's break layout is
-/// left exactly as the kernel built it; this test pins the
-/// preserved limits and non-zero default thread stack, not brk
-/// growth on that uncapped route. TrapHost at this pin refuses
-/// thread creation by name, so reaching that named EOPNOTSUPP —
-/// rather than glibc's zero-default-stack abort — is the
-/// discriminating pthread outcome.
+/// default thread stack size. But an unlimited stack limit on
+/// AArch64 selects the kernel's legacy layout, in which the
+/// loader image's break cannot grow at all — and silently
+/// launching into that layout is worse than not launching. So
+/// this shape is refused by name before any guest instruction
+/// runs (dh-exsg3): the launcher must fail, the guest must
+/// produce no output, and the refusal must name the shape. The
+/// pthread-stack protection that motivated the no-cap rule is
+/// preserved by never starting glibc in the broken layout.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_initial_script_preserves_pthread_stack() {
@@ -400,23 +402,20 @@ fn trap_initial_script_preserves_pthread_stack() {
             &work,
             &script_arg,
         ])
-        .env("BRK_ALLOW_ZERO_DELTA", "1")
-        .env("BRK_EXPECT_THREAD_REFUSED", "1")
         .output()
         .expect("run literoot trap initial script guest");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        out.status.success()
-            && stdout.contains(
-                "rlim_cur=18446744073709551615 rlim_max=18446744073709551615",
-            )
-            && stdout.contains("default_stack=")
-            && !stdout.contains("default_stack=0\n")
-            && stdout.contains("pthread_create_rc=95")
-            && stdout.contains("pthread=refused-eopnotsupp")
-            && stderr.contains("clone injection requires ptrace fallback"),
-        "literoot trap initial script output: {out:?}"
+        !out.status.success()
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap initial script must be refused by name \
+         with no guest output: {out:?}"
     );
 }
