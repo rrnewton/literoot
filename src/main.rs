@@ -380,6 +380,8 @@ fn launcher_token(error: &str) -> &'static str {
         "qemu_passthrough"
     } else if error.starts_with("literoot: proot extensions") {
         "extension"
+    } else if error.contains("aarch64 in-guest initial loader-as-main launch") {
+        "unlimited_stack_loader"
     } else if error.contains("static executables are not supported by the in-guest backend") {
         "static_floor"
     } else if launcher_error_exit_code(error) == 2 {

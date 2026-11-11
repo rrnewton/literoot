@@ -55,7 +55,7 @@ fn refuse_unlimited_in_guest_loader(
         let old = read_initial_stack_limit()?;
         if old.rlim_cur == libc::RLIM64_INFINITY {
             return Err(
-                "literoot: aarch64 in-guest initial loader-as-main launch \
+                "aarch64 in-guest initial loader-as-main launch \
                  with unlimited RLIMIT_STACK has no growable break; \
                  refusing before guest execution"
                     .into(),
@@ -65,30 +65,107 @@ fn refuse_unlimited_in_guest_loader(
     Ok(())
 }
 
+/// Read a file's PT_INTERP with bounded I/O. The path comes from
+/// a guest-controlled argument, so it is never opened unless it is
+/// a regular file (a FIFO would block the open, `/dev/zero` would
+/// read forever), and only the ELF header, the program-header
+/// table, and the interpreter string (capped at 4096 bytes, as in
+/// the pinned backend's reader) are read — never the whole file.
+fn read_elf_interp_bounded(path: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"\x7fELF" || header[4] != 2 {
+        return None;
+    }
+    let le = header[5] == 1;
+    let rd16 = |b: &[u8]| -> u16 {
+        if le {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }
+    };
+    let rd32 = |b: &[u8]| -> u32 {
+        let bytes: [u8; 4] = b[..4].try_into().unwrap();
+        if le {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+    let rd64 = |b: &[u8]| -> u64 {
+        if le {
+            u64::from_le_bytes(b.try_into().unwrap())
+        } else {
+            u64::from_be_bytes(b.try_into().unwrap())
+        }
+    };
+    let phoff = rd64(&header[32..40]);
+    let phentsize = rd16(&header[54..56]) as u64;
+    let phnum = rd16(&header[56..58]) as u64;
+    if phoff == 0 || phnum == 0 || phnum > 1024 || !(48..=256).contains(&phentsize) {
+        return None;
+    }
+    let table_len = phnum.checked_mul(phentsize)?;
+    if table_len > 65536 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(phoff)).ok()?;
+    let mut table = vec![0u8; table_len as usize];
+    file.read_exact(&mut table).ok()?;
+    const PT_INTERP: u32 = 3;
+    for i in 0..phnum as usize {
+        let off = i * phentsize as usize;
+        let entry = table.get(off..off + phentsize as usize)?;
+        if rd32(&entry[0..4]) != PT_INTERP {
+            continue;
+        }
+        let p_offset = rd64(&entry[8..16]);
+        let p_filesz = rd64(&entry[32..40]);
+        if p_filesz == 0 || p_filesz > 4096 {
+            return None;
+        }
+        file.seek(SeekFrom::Start(p_offset)).ok()?;
+        let mut raw = vec![0u8; p_filesz as usize];
+        file.read_exact(&mut raw).ok()?;
+        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        return String::from_utf8(raw[..end].to_vec()).ok();
+    }
+    None
+}
+
 /// Whether a direct-program spawn is really an explicit
 /// linker-as-main launch: the program has no PT_INTERP of its own
 /// (checked by the caller), and its first non-option argument is a
-/// dynamic program whose PT_INTERP names the program — string-equal
-/// to the program's guest spelling, or canonical-equal through the
-/// rootfs. That is the exact shape the pinned in-guest launcher
-/// admits as a dynamic linker run as a program (Reverie's
-/// `linker_target`), and its kernel exec is the same loader-as-main
-/// exec as the synthesized PT_INTERP route, so it takes the same
-/// cap/refusal classification. Ordinary dynamic programs carry
-/// their own PT_INTERP and never reach here; a target naming a
-/// different linker does not match either.
-fn explicit_linker_as_main(
-    config: &RootConfig,
-    cwd_guest: &Path,
-    host_prog: &Path,
-    guest_prog: &str,
-    guest_found: &str,
-    args: &[String],
-) -> bool {
-    // ld.so option grammar (glibc): only these spellings, each
-    // value as the next argument, no `--opt=value` form, and `--`
-    // is not an end-of-options marker; an unrecognised `--` token
-    // means no target was named.
+/// dynamic program whose PT_INTERP names the program. Recognition
+/// uses the effective HOST view the pinned in-guest launcher's
+/// admission inspects (Reverie's `linker_target`): the host program
+/// path, the raw argument resolved only against the command's host
+/// current directory, and the target's PT_INTERP compared to the
+/// host program (string-equal or canonical-equal). Rootfs and bind
+/// translations deliberately do NOT apply here: the backend passes
+/// the argument unchanged, so a bind that remaps the guest view of
+/// the target cannot hide the launch the backend admits. Ordinary
+/// dynamic programs carry their own PT_INTERP and never reach
+/// here; a target naming a different linker does not match either.
+/// The target argument of an explicit linker launch, parsed with
+/// glibc ld.so's option grammar (mirrors the pinned backend's
+/// `linker_target`): only these spellings, each value as the next
+/// argument, no `--opt=value` form, and `--` is not an
+/// end-of-options marker; an unrecognised `--` token, a value
+/// option with no value, or a slashless target (glibc looks those
+/// up through its library search, never the working directory)
+/// means no target was named.
+fn linker_target_arg(args: &[String]) -> Option<&str> {
     const VALUE_OPTIONS: &[&str] = &[
         "--argv0",
         "--audit",
@@ -109,35 +186,70 @@ fn explicit_linker_as_main(
     ];
     let mut tokens = args.iter();
     let target = loop {
-        let Some(token) = tokens.next() else {
-            return false;
-        };
+        let token = tokens.next()?;
         if !token.starts_with("--") {
-            break token;
+            break token.as_str();
         }
         if VALUE_OPTIONS.contains(&token.as_str()) {
-            if tokens.next().is_none() {
-                return false;
-            }
+            tokens.next()?;
         } else if !FLAG_OPTIONS.contains(&token.as_str()) {
-            return false;
+            return None;
         }
     };
-    let target_host = resolve_in_rootfs(config, cwd_guest, Path::new(target));
-    let Some(interp) = std::fs::read(&target_host)
-        .ok()
-        .and_then(|img| crate::translate::elf_interp(&img))
-    else {
+    if !target.contains('/') {
+        return None;
+    }
+    Some(target)
+}
+
+fn explicit_linker_as_main(
+    host_prog: &Path,
+    host_cwd: &Path,
+    args: &[String],
+) -> bool {
+    // Both consumers of this classification (the aarch64 refusal
+    // and the aarch64 ptrace cap) act only on AArch64 with an
+    // unlimited soft stack limit, so the guest-controlled target
+    // is not even inspected anywhere else (in particular, never on
+    // x86). A failed limit read still classifies: the bounded
+    // reader below is safe on any path.
+    #[cfg(target_arch = "aarch64")]
+    let gate_open = match read_initial_stack_limit() {
+        Ok(limits) => limits.rlim_cur == libc::RLIM64_INFINITY,
+        Err(_) => true,
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let gate_open = false;
+    if !gate_open {
+        return false;
+    }
+    let Some(target) = linker_target_arg(args) else {
         return false;
     };
-    if interp == guest_prog || interp == guest_found {
-        return true;
-    }
-    let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&interp));
-    matches!(
-        (interp_host.canonicalize(), host_prog.canonicalize()),
-        (Ok(a), Ok(b)) if a == b
-    )
+    // The backend resolves the raw target argument only against
+    // the command's host current directory (Reverie `resolve_in`);
+    // no rootfs or bind translation is applied to it.
+    let target_path = Path::new(target);
+    let target_host = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        host_cwd.join(target_path)
+    };
+    let Some(interp) = read_elf_interp_bounded(&target_host) else {
+        return false;
+    };
+    interp_names_program(&interp, host_prog)
+}
+
+/// Whether an interpreter string names the program: string-equal
+/// to the host program path, or canonical-equal (the pinned
+/// backend's `linker_target` equality).
+fn interp_names_program(interp: &str, host_prog: &Path) -> bool {
+    Path::new(interp) == host_prog
+        || matches!(
+            (Path::new(interp).canonicalize(), host_prog.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Cap this launcher process's soft stack limit for one initial
@@ -422,7 +534,7 @@ pub fn run_guest(
         let interp_interp = std::fs::read(&interp_host)
             .ok()
             .and_then(|img| crate::translate::elf_interp(&img));
-        let has_loader = interp_interp.is_some();
+        let mut has_loader = interp_interp.is_some();
         let mut cmd = match interp_interp {
             Some(ld) => {
                 let ld_host = resolve_in_rootfs(config, cwd_guest, Path::new(&ld));
@@ -454,6 +566,19 @@ pub fn run_guest(
         } else {
             config.rootfs.clone()
         };
+        // A script naming ld.so itself as its interpreter
+        // (`#!<ld.so> <dynamic-program>`) is explicit linker-as-main
+        // too: classify it in the same host view, over the exact
+        // argument vector the backend receives.
+        if !has_loader {
+            let mut backend_args: Vec<String> = Vec::new();
+            if let Some(opt) = &script_opt {
+                backend_args.push(opt.clone());
+            }
+            backend_args.push(guest_found.clone());
+            backend_args.extend(command.iter().skip(1).cloned());
+            has_loader = explicit_linker_as_main(&interp_host, &host_cwd, &backend_args);
+        }
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
         refuse_unlimited_in_guest_loader(has_loader, in_guest)?;
@@ -474,14 +599,19 @@ pub fn run_guest(
         .and_then(|img| crate::translate::elf_interp(&img));
     // An explicitly supplied linker (`ld.so <dynamic-program>`)
     // has no PT_INTERP of its own, so it lands in the direct arm
-    // below; classify it as loader-as-main too (dh-exsg3).
+    // below; classify it as loader-as-main too (dh-exsg3), in the
+    // effective host view the backend admission uses (the host
+    // current directory the command below is given).
+    let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
+    let host_cwd = if host_cwd.is_dir() {
+        host_cwd
+    } else {
+        config.rootfs.clone()
+    };
     let explicit_linker = prog_interp.is_none()
         && explicit_linker_as_main(
-            config,
-            cwd_guest,
             &host_prog,
-            &guest_prog,
-            &guest_found,
+            &host_cwd,
             command.get(1..).unwrap_or(&[]),
         );
     let interp_guest = prog_interp
@@ -1208,6 +1338,134 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     Some((interp, opt))
+}
+
+#[cfg(test)]
+mod explicit_linker_tests {
+    use super::{interp_names_program, linker_target_arg, read_elf_interp_bounded};
+    use std::path::PathBuf;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    // Independent copies of the pinned grammar: deleting an entry
+    // from the classifier's own lists must fail these tests.
+    const VALUE_OPTIONS: &[&str] = &[
+        "--argv0",
+        "--audit",
+        "--glibc-hwcaps-mask",
+        "--glibc-hwcaps-prepend",
+        "--inhibit-rpath",
+        "--library-path",
+        "--preload",
+    ];
+    const FLAG_OPTIONS: &[&str] = &[
+        "--help",
+        "--inhibit-cache",
+        "--list",
+        "--list-diagnostics",
+        "--list-tunables",
+        "--verify",
+        "--version",
+    ];
+
+    #[test]
+    fn grammar_value_options_consume_one_argument() {
+        for opt in VALUE_OPTIONS {
+            assert_eq!(
+                linker_target_arg(&args(&[opt, "value", "/tmp/target"])),
+                Some("/tmp/target"),
+                "{opt} must consume its value"
+            );
+            assert_eq!(
+                linker_target_arg(&args(&[opt])),
+                None,
+                "{opt} with no value names no target"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_flag_options_take_no_argument() {
+        for flag in FLAG_OPTIONS {
+            assert_eq!(
+                linker_target_arg(&args(&[flag, "/tmp/target"])),
+                Some("/tmp/target"),
+                "{flag} must not consume the target"
+            );
+        }
+    }
+
+    #[test]
+    fn grammar_rejections() {
+        assert_eq!(linker_target_arg(&args(&["--unknown", "/tmp/t"])), None);
+        assert_eq!(linker_target_arg(&args(&["--"])), None);
+        assert_eq!(linker_target_arg(&args(&["--preload=/lib/x.so"])), None);
+        assert_eq!(linker_target_arg(&args(&[])), None);
+        // Slashless: glibc searches its library paths, never the cwd.
+        assert_eq!(linker_target_arg(&args(&["target"])), None);
+        assert_eq!(linker_target_arg(&args(&["./target"])), Some("./target"));
+        assert_eq!(linker_target_arg(&args(&["/abs/target"])), Some("/abs/target"));
+    }
+
+    fn synthetic_elf(interp: &str) -> Vec<u8> {
+        let mut img = vec![0u8; 120 + interp.len() + 1];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2; // ELF64
+        img[5] = 1; // little-endian
+        img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        img[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        img[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        img[96..104].copy_from_slice(&((interp.len() + 1) as u64).to_le_bytes()); // p_filesz
+        img[120..120 + interp.len()].copy_from_slice(interp.as_bytes());
+        img
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("literoot-linker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn bounded_reader_reads_synthetic_interp() {
+        let target = temp_file("target", &synthetic_elf("/lib64/ld.so"));
+        assert_eq!(
+            read_elf_interp_bounded(&target).as_deref(),
+            Some("/lib64/ld.so")
+        );
+        let plain = temp_file("plain", b"not an ELF image");
+        assert_eq!(read_elf_interp_bounded(&plain), None);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_non_regular_files() {
+        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/dev/null")), None);
+        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/dev/zero")), None);
+        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/")), None);
+    }
+
+    #[test]
+    fn interp_equality_string_canonical_and_other() {
+        let prog = temp_file("real-ld", b"linker");
+        // String equality needs no file at the program path.
+        assert!(interp_names_program(
+            "/nonexistent/ld.so",
+            std::path::Path::new("/nonexistent/ld.so")
+        ));
+        // Canonical equality through a symlink alias.
+        let alias = prog.with_file_name("alias-ld");
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&prog, &alias).unwrap();
+        assert!(interp_names_program(alias.to_str().unwrap(), &prog));
+        // A different linker does not name the program.
+        assert!(!interp_names_program("/other/ld.so", &prog));
+    }
 }
 
 #[cfg(test)]
