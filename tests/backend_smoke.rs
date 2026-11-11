@@ -546,6 +546,62 @@ fn trap_explicit_linker_initial_refused_by_name() {
     );
 }
 
+/// The bind-mapping case: a bind remaps the guest view of the
+/// target (`/dev/null` over the fixture path), but the backend
+/// passes the target argument unchanged and admits the real host
+/// file. Recognition must use that effective host view, so the
+/// same named refusal applies (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_explicit_linker_bound_target_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-ldso-bind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = compile_brk_guest(&dir);
+    let ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    let work = dir.to_string_lossy().into_owned();
+    let guest_arg = guest.to_string_lossy().into_owned();
+    let bind = format!("/dev/null:{guest_arg}");
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-b",
+            &bind,
+            "-w",
+            &work,
+            ld,
+            &guest_arg,
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot trap explicit linker bound-target guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap explicit linker launch with a bound target \
+         must be refused by name with no guest output: {out:?}"
+    );
+}
+
 /// Control: an ordinary dynamic program executed directly is not
 /// loader-as-main — it carries its own PT_INTERP and the kernel
 /// loads its interpreter. Under the same unlimited stack limit it
@@ -588,6 +644,64 @@ fn trap_direct_dynamic_initial_still_launches() {
             ),
         "literoot trap direct dynamic guest must still launch \
          with a growable break: {out:?}"
+    );
+}
+
+/// A script naming ld.so itself as interpreter
+/// (`#!<ld.so> <dynamic-program>`) is explicit linker-as-main at
+/// the shebang site and must get the same named refusal
+/// (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_shebang_linker_initial_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-shebang-ld-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = compile_brk_guest(&dir);
+    let ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    let script = dir.join("ld-script");
+    std::fs::write(&script, format!("#!{ld} {}\n", guest.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    let work = dir.to_string_lossy().into_owned();
+    let script_arg = script.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &script_arg,
+        ])
+        .output()
+        .expect("run literoot trap shebang linker guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap shebang linker launch must be refused by \
+         name with no guest output: {out:?}"
     );
 }
 
@@ -655,5 +769,47 @@ fn trap_ptinterp_unlimited_stack_refused_by_name() {
             ),
         "literoot trap PT_INTERP launch must be refused by name \
          with no guest output: {out:?}"
+    );
+}
+
+/// The explicit-linker classifier inspects a guest-controlled
+/// argument path. A non-regular target (here a FIFO) must be
+/// rejected by metadata, promptly: opening it would hang the
+/// launcher before any guest runs (dh-exsg3). This test completing
+/// at all is the assertion; before the bounded reader it blocked.
+/// Runs on every architecture and backend path — here ptrace.
+#[test]
+fn explicit_linker_fifo_target_returns_promptly() {
+    let dir = std::env::temp_dir().join(format!("literoot-fifo-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let prog = dir.join("not-an-elf");
+    std::fs::write(&prog, "not an ELF image\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&prog).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&prog, permissions).unwrap();
+    }
+    let fifo = dir.join("target-fifo");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&fifo)
+        .output()
+        .expect("create FIFO target");
+    assert!(mkfifo.status.success(), "mkfifo failed: {mkfifo:?}");
+    let work = dir.to_string_lossy().into_owned();
+    let prog_arg = prog.to_string_lossy().into_owned();
+    let fifo_arg = fifo.to_string_lossy().into_owned();
+    let out = Command::new(literoot_bin())
+        .args([
+            "--backend", "ptrace", "-r", "/", "-w", &work, &prog_arg, &fifo_arg,
+        ])
+        .output()
+        .expect("run literoot with FIFO target argument");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success() && out.stdout.is_empty(),
+        "literoot with a FIFO target argument must return \
+         promptly, never hang in the classifier: {out:?}"
     );
 }

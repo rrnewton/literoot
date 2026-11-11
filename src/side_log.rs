@@ -65,6 +65,7 @@ pub const GUEST: &[&str] = &[
 ];
 /// `launcher` tokens: launcher errors that refuse a run.
 pub const LAUNCHER: &[&str] = &[
+    "unlimited_stack_loader",
     "static_floor",
     "qemu_passthrough",
     "extension",
