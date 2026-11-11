@@ -263,7 +263,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
                 } else if s == "-0" {
                     fake_root = true;
                 } else {
-                    return Err(format!("literoot: unknown option {s} (try --help)"));
+                    return Err(format!("literoot: unknown option {s} (try --help)").into());
                 }
             }
             _ => {
