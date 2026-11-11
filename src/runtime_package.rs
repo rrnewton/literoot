@@ -12,8 +12,12 @@
 //! The producer can check that the facts match the bytes, not that the pair
 //! is authentic (`RuntimeImageFacts`, Reverie producer.rs). Authenticating it
 //! is this module's job: both files are opened O_NOFOLLOW, must be regular
-//! files owned by the effective user, are read once and kept open for the
-//! run, and must not change identity or bytes (`RuntimePackage::verify`).
+//! files owned by the effective user and not writable by group or others
+//! (checked with fstat on the opened descriptor, not the path), are read once
+//! and kept open for the run, and must not change identity or bytes
+//! (`RuntimePackage::verify`). The trusted writers are therefore the
+//! installer and the effective user; nobody else can have replaced the
+//! bytes in place, with a matching digest, before the open.
 //! Facts come only from the package, never from argv or the environment.
 //! [`open_audited`] is the only caller of `AuditedRuntimeImage::new` in
 //! literoot; a test pins that.
@@ -119,19 +123,30 @@ fn parse_data(bytes: &[u8]) -> io::Result<PackageData> {
 
 /// One package file, opened once and kept open for the run.
 struct RetainedFile {
+    path: PathBuf,
     file: File,
     bytes: Vec<u8>,
     state: [u64; 8],
 }
 
-fn state(file: &File) -> io::Result<[u64; 8]> {
+/// The identity of an opened package file, from fstat on its descriptor.
+/// Refuses anything but a regular file owned by the effective user and not
+/// writable by group or others.
+fn state(path: &Path, file: &File) -> io::Result<[u64; 8]> {
     let m = file.metadata()?;
     if !m.is_file() {
-        return Err(refused("a package file is not a regular file"));
+        return Err(refused(format!("{}: not a regular file", path.display())));
     }
     // SAFETY: geteuid takes no arguments and only reads the caller's identity.
     if m.uid() != unsafe { libc::geteuid() } {
-        return Err(refused("a package file is not owned by the effective user"));
+        return Err(refused(format!("{}: not owned by the effective user", path.display())));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(refused(format!(
+            "{}: mode {:o} is writable by group or others",
+            path.display(),
+            m.mode() & 0o7777
+        )));
     }
     Ok([
         m.dev(),
@@ -154,16 +169,17 @@ impl RetainedFile {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)
             .map_err(|e| refused(format!("{}: {e}", path.display())))?;
-        let before = state(&file)?;
+        let before = state(path, &file)?;
         if before[2] == 0 || before[2] > limit {
             return Err(refused(format!("{}: size out of range", path.display())));
         }
         let mut bytes = vec![0; usize::try_from(before[2]).map_err(refused)?];
         file.read_exact_at(&mut bytes, 0)?;
-        if state(&file)? != before {
+        if state(path, &file)? != before {
             return Err(refused(format!("{}: changed while read", path.display())));
         }
         Ok(Self {
+            path: path.to_path_buf(),
             file,
             bytes,
             state: before,
@@ -171,12 +187,12 @@ impl RetainedFile {
     }
 
     fn verify(&self) -> io::Result<()> {
-        if state(&self.file)? != self.state {
+        if state(&self.path, &self.file)? != self.state {
             return Err(refused("a retained package file changed identity"));
         }
         let mut bytes = vec![0; self.bytes.len()];
         self.file.read_exact_at(&mut bytes, 0)?;
-        if bytes != self.bytes || state(&self.file)? != self.state {
+        if bytes != self.bytes || state(&self.path, &self.file)? != self.state {
             return Err(refused("a retained package file changed bytes"));
         }
         Ok(())
@@ -245,10 +261,11 @@ pub fn open_audited(dir: &Path) -> io::Result<RuntimePackage> {
     let parsed = parse_data(&data.bytes)?;
     let elf = RetainedFile::open(&dir.join(ELF_FILE), MAX_IMAGE)?;
     let image_sha256 = digest(&parsed.image.sha256)?;
-    if elf.state[2] != parsed.image.bytes
-        || <[u8; 32]>::from(Sha256::digest(&elf.bytes)) != image_sha256
-    {
-        return Err(refused("the ELF's size or SHA-256 differs from the package data"));
+    if elf.state[2] != parsed.image.bytes {
+        return Err(refused("the ELF's size differs from the package data"));
+    }
+    if <[u8; 32]>::from(Sha256::digest(&elf.bytes)) != image_sha256 {
+        return Err(refused("the ELF's SHA-256 differs from the package data"));
     }
     let observed = parsed.observed;
     let facts = RuntimeImageFacts {
@@ -296,11 +313,14 @@ pub fn open_audited(dir: &Path) -> io::Result<RuntimePackage> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
 
     use super::*;
 
     const ELF: &[u8] = b"\x7fELF not really a runtime image";
+    /// Same length as `ELF`, different bytes.
+    const SAME_LEN_ELF: &[u8] = b"\x7fELF not really a runtime IMAGE";
 
     struct Dir(PathBuf);
 
@@ -349,9 +369,19 @@ mod tests {
         })
     }
 
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Writes both files afresh with mode 0644, whatever the umask or the
+    /// mode an earlier case left (a 0400 file cannot be rewritten).
     fn write(d: &Dir, data: &serde_json::Value, elf: &[u8]) {
+        let _ = std::fs::remove_file(d.0.join(ELF_FILE));
+        let _ = std::fs::remove_file(d.0.join(DATA_FILE));
         std::fs::write(d.0.join(ELF_FILE), elf).unwrap();
         std::fs::write(d.0.join(DATA_FILE), serde_json::to_vec(data).unwrap()).unwrap();
+        chmod(&d.0.join(ELF_FILE), 0o644);
+        chmod(&d.0.join(DATA_FILE), 0o644);
     }
 
     fn refusal(d: &Dir) -> String {
@@ -380,14 +410,52 @@ mod tests {
     }
 
     #[test]
-    fn an_elf_that_differs_from_its_data_is_refused() {
+    fn a_same_size_elf_with_a_stale_digest_is_refused() {
+        // Same length, different bytes: only the SHA-256 comparison can
+        // refuse this, before the audit.
+        assert_eq!(SAME_LEN_ELF.len(), ELF.len());
+        assert_ne!(SAME_LEN_ELF, ELF);
         let d = dir("sha");
-        write(&d, &data(), b"\x7fELF other bytes of the same len!");
-        assert!(refusal(&d).contains("size or SHA-256 differs"));
-        let mut short = data();
-        short["image"]["bytes"] = serde_json::json!(ELF.len() + 1);
-        write(&d, &short, ELF);
-        assert!(refusal(&d).contains("size or SHA-256 differs"));
+        write(&d, &data(), SAME_LEN_ELF);
+        let why = refusal(&d);
+        assert!(why.contains("the ELF's SHA-256 differs"), "{why}");
+    }
+
+    #[test]
+    fn an_elf_whose_size_differs_from_its_data_is_refused() {
+        let d = dir("size");
+        let mut long = data();
+        long["image"]["bytes"] = serde_json::json!(ELF.len() + 1);
+        write(&d, &long, ELF);
+        let why = refusal(&d);
+        assert!(why.contains("the ELF's size differs"), "{why}");
+    }
+
+    #[test]
+    fn a_group_or_other_writable_package_file_is_refused_by_name() {
+        let d = dir("mode");
+        for file in [DATA_FILE, ELF_FILE] {
+            for mode in [0o664, 0o646, 0o666] {
+                write(&d, &data(), ELF);
+                chmod(&d.0.join(file), mode);
+                let why = refusal(&d);
+                let named = format!("{file}: mode {mode:o} is writable by group or others");
+                assert!(why.contains(&named), "{file} {mode:o}: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn safe_package_file_modes_pass_custody() {
+        // Not writable by group or others: the refusal is the audit's.
+        let d = dir("safe-mode");
+        for mode in [0o644, 0o640, 0o600, 0o444, 0o400] {
+            write(&d, &data(), ELF);
+            chmod(&d.0.join(DATA_FILE), mode);
+            chmod(&d.0.join(ELF_FILE), mode);
+            let why = refusal(&d);
+            assert!(why.contains("private runtime package: audit:"), "{mode:o}: {why}");
+        }
     }
 
     #[test]
@@ -397,6 +465,7 @@ mod tests {
         let d = dir("changed");
         let path = d.0.join(ELF_FILE);
         std::fs::write(&path, ELF).unwrap();
+        chmod(&path, 0o644);
         let retained = RetainedFile::open(&path, MAX_IMAGE).unwrap();
         retained.verify().unwrap();
         std::fs::write(&path, b"\x7fELF grown after the package was opened").unwrap();
