@@ -17,6 +17,22 @@ fn initial_loader_cap_needed(has_loader: bool, in_guest: bool) -> bool {
     has_loader && !in_guest
 }
 
+/// Read this launcher process's own initial stack limit.
+#[cfg(target_arch = "aarch64")]
+fn read_initial_stack_limit() -> Result<libc::rlimit64, String> {
+    let mut old: libc::rlimit64 = unsafe { std::mem::zeroed() };
+    let get = unsafe {
+        libc::prlimit64(0, libc::RLIMIT_STACK, std::ptr::null(), &mut old)
+    };
+    if get != 0 {
+        return Err(format!(
+            "literoot: read initial RLIMIT_STACK: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(old)
+}
+
 /// Whether an in-guest initial loader-as-main spawn must be
 /// refused by name. On AArch64 an unlimited soft stack limit
 /// selects the kernel's legacy bottom-up mmap layout, so the
@@ -36,16 +52,7 @@ fn refuse_unlimited_in_guest_loader(
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let mut old: libc::rlimit64 = unsafe { std::mem::zeroed() };
-        let get = unsafe {
-            libc::prlimit64(0, libc::RLIMIT_STACK, std::ptr::null(), &mut old)
-        };
-        if get != 0 {
-            return Err(format!(
-                "literoot: read initial RLIMIT_STACK: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let old = read_initial_stack_limit()?;
         if old.rlim_cur == libc::RLIM64_INFINITY {
             return Err(
                 "literoot: aarch64 in-guest initial loader-as-main launch \
@@ -58,6 +65,81 @@ fn refuse_unlimited_in_guest_loader(
     Ok(())
 }
 
+/// Whether a direct-program spawn is really an explicit
+/// linker-as-main launch: the program has no PT_INTERP of its own
+/// (checked by the caller), and its first non-option argument is a
+/// dynamic program whose PT_INTERP names the program — string-equal
+/// to the program's guest spelling, or canonical-equal through the
+/// rootfs. That is the exact shape the pinned in-guest launcher
+/// admits as a dynamic linker run as a program (Reverie's
+/// `linker_target`), and its kernel exec is the same loader-as-main
+/// exec as the synthesized PT_INTERP route, so it takes the same
+/// cap/refusal classification. Ordinary dynamic programs carry
+/// their own PT_INTERP and never reach here; a target naming a
+/// different linker does not match either.
+fn explicit_linker_as_main(
+    config: &RootConfig,
+    cwd_guest: &Path,
+    host_prog: &Path,
+    guest_prog: &str,
+    guest_found: &str,
+    args: &[String],
+) -> bool {
+    // ld.so option grammar (glibc): only these spellings, each
+    // value as the next argument, no `--opt=value` form, and `--`
+    // is not an end-of-options marker; an unrecognised `--` token
+    // means no target was named.
+    const VALUE_OPTIONS: &[&str] = &[
+        "--argv0",
+        "--audit",
+        "--glibc-hwcaps-mask",
+        "--glibc-hwcaps-prepend",
+        "--inhibit-rpath",
+        "--library-path",
+        "--preload",
+    ];
+    const FLAG_OPTIONS: &[&str] = &[
+        "--help",
+        "--inhibit-cache",
+        "--list",
+        "--list-diagnostics",
+        "--list-tunables",
+        "--verify",
+        "--version",
+    ];
+    let mut tokens = args.iter();
+    let target = loop {
+        let Some(token) = tokens.next() else {
+            return false;
+        };
+        if !token.starts_with("--") {
+            break token;
+        }
+        if VALUE_OPTIONS.contains(&token.as_str()) {
+            if tokens.next().is_none() {
+                return false;
+            }
+        } else if !FLAG_OPTIONS.contains(&token.as_str()) {
+            return false;
+        }
+    };
+    let target_host = resolve_in_rootfs(config, cwd_guest, Path::new(target));
+    let Some(interp) = std::fs::read(&target_host)
+        .ok()
+        .and_then(|img| crate::translate::elf_interp(&img))
+    else {
+        return false;
+    };
+    if interp == guest_prog || interp == guest_found {
+        return true;
+    }
+    let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&interp));
+    matches!(
+        (interp_host.canonicalize(), host_prog.canonicalize()),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
 /// Cap this launcher process's soft stack limit for one initial
 /// loader-as-main spawn, recording the exact original pair in the
 /// Tool config for post-exec restore in the guest. AArch64-only
@@ -68,16 +150,7 @@ fn cap_initial_stack_limit(
 ) -> Result<Option<(u64, u64)>, String> {
     #[cfg(target_arch = "aarch64")]
     {
-        let mut old: libc::rlimit64 = unsafe { std::mem::zeroed() };
-        let get = unsafe {
-            libc::prlimit64(0, libc::RLIMIT_STACK, std::ptr::null(), &mut old)
-        };
-        if get != 0 {
-            return Err(format!(
-                "literoot: read initial RLIMIT_STACK: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        let old = read_initial_stack_limit()?;
         if old.rlim_cur != libc::RLIM64_INFINITY {
             return Ok(None);
         }
@@ -309,15 +382,29 @@ pub fn run_guest(
     // PT_INTERP: run the program through the rootfs's dynamic
     // linker (design §4.7) — the kernel would otherwise open the
     // interp path on the host (absent for e.g. musl rootfses).
-    let interp_guest = std::fs::read(&host_prog)
+    let prog_interp = std::fs::read(&host_prog)
         .ok()
-        .and_then(|img| crate::translate::elf_interp(&img))
+        .and_then(|img| crate::translate::elf_interp(&img));
+    // An explicitly supplied linker (`ld.so <dynamic-program>`)
+    // has no PT_INTERP of its own, so it lands in the direct arm
+    // below; classify it as loader-as-main too (dh-exsg3).
+    let explicit_linker = prog_interp.is_none()
+        && explicit_linker_as_main(
+            config,
+            cwd_guest,
+            &host_prog,
+            &guest_prog,
+            &guest_found,
+            command.get(1..).unwrap_or(&[]),
+        );
+    let interp_guest = prog_interp
         // In-guest: when the host interp exists, let the kernel
         // load it and the preload arm inside the program itself.
         // Exec'ing ld.so as the program makes ld.so open the
         // target before the preload constructor arms (measured:
         // ET_EXEC guests then fail to load in-guest).
         .filter(|interp| !in_guest || !Path::new(interp).exists());
+    let has_loader = interp_guest.is_some() || explicit_linker;
     let mut cmd = match &interp_guest {
         Some(interp) => {
             let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(interp));
@@ -351,8 +438,8 @@ pub fn run_guest(
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
     // agrees — test-bind-cwd-bash-pwd).
     cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-    refuse_unlimited_in_guest_loader(interp_guest.is_some(), in_guest)?;
-    let initial_restore = if initial_loader_cap_needed(interp_guest.is_some(), in_guest) {
+    refuse_unlimited_in_guest_loader(has_loader, in_guest)?;
+    let initial_restore = if initial_loader_cap_needed(has_loader, in_guest) {
         cap_initial_stack_limit(&mut cfg)?
     } else {
         None

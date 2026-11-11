@@ -182,7 +182,7 @@ int main(int argc, char *argv[]) {
             rl.rlim_max != RLIM_INFINITY)
             return 15;
     }
-    if (!getenv("BRK_ALLOW_ZERO_DELTA") && brk2 - brk1 != 1024 * 1024)
+    if (brk2 - brk1 != 1024 * 1024)
         return 13;
 
     pthread_attr_t attr;
@@ -220,12 +220,24 @@ int main(int argc, char *argv[]) {
 
 #[cfg(target_arch = "aarch64")]
 fn compile_brk_guest(dir: &std::path::Path) -> std::path::PathBuf {
+    compile_brk_guest_with_linker(dir, None)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn compile_brk_guest_with_linker(
+    dir: &std::path::Path,
+    dynamic_linker: Option<&str>,
+) -> std::path::PathBuf {
     let source = dir.join("brk_after_exec.c");
     let guest = dir.join("brk_after_exec");
     std::fs::write(&source, BRK_AFTER_EXEC_C).unwrap();
-    let cc = Command::new("cc")
-        .args(["-std=gnu11", "-O2", "-fno-pie", "-no-pie", "-pthread", "-o"])
-        .arg(&guest)
+    let mut cc = Command::new("cc");
+    cc.args(["-std=gnu11", "-O2", "-fno-pie", "-no-pie", "-pthread", "-o"])
+        .arg(&guest);
+    if let Some(linker) = dynamic_linker {
+        cc.arg(format!("-Wl,--dynamic-linker,{linker}"));
+    }
+    let cc = cc
         .arg(&source)
         .output()
         .expect("compile brk-after-exec guest");
@@ -372,7 +384,7 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
 /// preserved by never starting glibc in the broken layout.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
-fn trap_initial_script_preserves_pthread_stack() {
+fn trap_initial_script_unlimited_stack_refused_by_name() {
     let dir = std::env::temp_dir().join(format!("literoot-brk-trap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -408,7 +420,7 @@ fn trap_initial_script_preserves_pthread_stack() {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !out.status.success()
+        out.status.code() == Some(125)
             && stdout.is_empty()
             && stderr.contains(
                 "aarch64 in-guest initial loader-as-main launch with \
@@ -416,6 +428,232 @@ fn trap_initial_script_preserves_pthread_stack() {
                  refusing before guest execution",
             ),
         "literoot trap initial script must be refused by name \
+         with no guest output: {out:?}"
+    );
+}
+
+/// The qualifying case: an in-guest loader-as-main launch with a
+/// finite soft stack limit (8 MiB, hard unlimited) must still
+/// launch, preserve its exact limit, keep a growable break, and
+/// reach the named TrapHost thread refusal (dh-exsg3). A guard
+/// mutant that refuses every in-guest loader-as-main launch,
+/// whatever the limit, fails this test.
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_initial_script_finite_stack_preserves_pthread_stack() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-finite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = compile_brk_guest(&dir);
+    let script = dir.join("brk-script");
+    std::fs::write(&script, format!("#!{}\n", guest.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    let work = dir.to_string_lossy().into_owned();
+    let script_arg = script.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -H -s unlimited; ulimit -S -s 8192; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &script_arg,
+        ])
+        .env("BRK_SET_8MIB", "1")
+        .env("BRK_EXPECT_THREAD_REFUSED", "1")
+        .output()
+        .expect("run literoot trap finite-limit initial script guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=8388608 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("default_stack=")
+            && !stdout.contains("default_stack=0\n")
+            && stdout.contains("pthread_create_rc=95")
+            && stdout.contains("pthread=refused-eopnotsupp")
+            && stderr.contains("clone injection requires ptrace fallback"),
+        "literoot trap finite-limit initial script output: {out:?}"
+    );
+}
+
+/// An explicitly supplied linker (`ld.so <dynamic-program>`) is
+/// loader-as-main too: the linker has no PT_INTERP, so it lands in
+/// the direct-program arm, but its kernel exec is the same
+/// loader-as-main exec as the script route above. Under an
+/// unlimited stack limit on AArch64 it must get the same named
+/// refusal with no guest output (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_explicit_linker_initial_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-ldso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = compile_brk_guest(&dir);
+    let ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    let work = dir.to_string_lossy().into_owned();
+    let guest_arg = guest.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            ld,
+            &guest_arg,
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot trap explicit linker guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap explicit linker launch must be refused by \
+         name with no guest output: {out:?}"
+    );
+}
+
+/// Control: an ordinary dynamic program executed directly is not
+/// loader-as-main — it carries its own PT_INTERP and the kernel
+/// loads its interpreter. Under the same unlimited stack limit it
+/// must still launch with a growable break (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_direct_dynamic_initial_still_launches() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-direct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = compile_brk_guest(&dir);
+    let work = dir.to_string_lossy().into_owned();
+    let guest_arg = guest.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &guest_arg,
+            "stage2",
+        ])
+        .env("BRK_EXPECT_THREAD_REFUSED", "1")
+        .output()
+        .expect("run literoot trap direct dynamic guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            ),
+        "literoot trap direct dynamic guest must still launch \
+         with a growable break: {out:?}"
+    );
+}
+
+/// The PT_INTERP spawn site: when the guest program's interpreter
+/// exists only inside the rootfs (not on the host), literoot
+/// synthesizes loader-as-main itself. That site must apply the
+/// same named refusal under an unlimited stack limit (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_ptinterp_unlimited_stack_refused_by_name() {
+    const GUEST_INTERP: &str = "/opt/literoot-ptinterp/ld.so";
+    assert!(
+        !std::path::Path::new(GUEST_INTERP).exists(),
+        "guest interpreter path must be absent on the host"
+    );
+    let dir = std::env::temp_dir().join(format!("literoot-brk-ptinterp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let interp_dir = rootfs.join("opt/literoot-ptinterp");
+    let lib_dir = rootfs.join("lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [interp_dir.as_path(), lib_dir.as_path(), work_dir.as_path()] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, interp_dir.join("ld.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some(GUEST_INTERP));
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            &root_arg,
+            "-w",
+            "/work",
+            "/work/brk_after_exec",
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot trap PT_INTERP guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap PT_INTERP launch must be refused by name \
          with no guest output: {out:?}"
     );
 }

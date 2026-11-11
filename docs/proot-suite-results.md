@@ -257,11 +257,7 @@ semantics and guest composition — not by patch-vs-trap.
   `test-exec-proc-self-exe-null-argv` (/proc/self/exe fidelity
   after exec under the in-guest launcher), `test-rlimit-stack-brk`
   (stack rlimit/brk handling). These connected and ran; they are
-  the genuine in-guest fidelity frontier. Note: the unlimited-
-  stack in-guest initial-launch shape behind this row is now
-  refused by name before guest execution (dh-exsg3), so on that
-  shape the expected outcome is the named refusal, not a
-  tolerated FAILED with delta=0.
+  the genuine in-guest fidelity frontier.
 - Coexistence names in FAILED: `test-gdb-breakpoint-run`,
   `test-strace-execve-count`, `test-strace-fork-wait` (shell-driven;
   in the static-utility bucket above — they never reach a ptrace
@@ -311,3 +307,19 @@ have to be supported:
 Logs: slot `w1/evidence/suite-liteinst.log`, `suite-trap.log`
 (pre-alignment run, identical counts) — aligned rerun logs retained
 with the lane status file references in the commit message.
+
+## aarch64 policy — refused by name (current, not a suite measurement)
+
+Separate from the historical x86_64 suite results above: on
+aarch64 only, the unlimited-stack in-guest initial loader-as-main
+shape (including an explicitly supplied `ld.so <dynamic-program>`)
+is refused by name before guest execution (dh-exsg3). The refusal
+exits 125; the suite counts exit 125 as "skipped" wherever a
+refusal is what a case hits. No suite row is known to exercise
+this initial-launch shape: `test-rlimit-stack-brk` in particular
+is not affected, since it starts with a finite limit and reaches
+any unlimited limit only at a successor exec (dh-75m98), and its
+initial launch takes the direct-program route. The guard is
+compiled out on x86_64 and the historical counts above are
+unaffected; this section records current policy, not a measured
+suite result.
