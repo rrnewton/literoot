@@ -105,7 +105,43 @@ fn parse_bind(spec: &str) -> Result<Bind, String> {
     }
 }
 
-fn parse_cli(args: &[String]) -> Result<Cli, String> {
+/// An argument error from `parse_cli`, typed by where it was raised: the
+/// side-log key follows the variant, never the text, whose words can come
+/// from the command line (review of g2 8b480bd0 by rev-g2d2-cx).
+#[derive(Debug)]
+enum CliError {
+    /// One of the closed list of argument errors real proot also raises for
+    /// the same argv, each expected by an upstream suite line
+    /// (test-rootfs-arg-validation's "no launch" lines): no side-log key.
+    /// Built only at those call sites: `-v` without a level, binding over
+    /// `/`, and the rootfs canonicalization (narrowing that one by errno is
+    /// dh-38junr).
+    ProotAlsoRaises(String),
+    /// Every other argument error: keyed by `launcher_token`.
+    Other(String),
+}
+
+impl From<String> for CliError {
+    fn from(error: String) -> Self {
+        CliError::Other(error)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(error: &str) -> Self {
+        CliError::Other(error.to_owned())
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::ProotAlsoRaises(e) | CliError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     let mut rootfs: Option<PathBuf> = std::env::var_os("PROOT_ROOTFS").map(PathBuf::from);
     let mut binds: Vec<Bind> = Vec::new();
     let mut root_bind_before_rootfs = false;
@@ -185,9 +221,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                             verbose = level > 0;
                             i += 1;
                         }
-                        Err(_) => return Err("literoot: -v requires a level argument".into()),
+                        Err(_) => return Err(CliError::ProotAlsoRaises("literoot: -v requires a level argument".into())),
                     },
-                    _ => return Err("literoot: -v requires a level argument".into()),
+                    _ => return Err(CliError::ProotAlsoRaises("literoot: -v requires a level argument".into())),
                 }
             }
             "-q" => {
@@ -246,13 +282,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     if binds.iter().any(|b| b.guest == Path::new("/")) {
         let ok = root_bind_before_rootfs && saw_explicit_rootfs && rootfs == Path::new("/");
         if !ok {
-            return Err("literoot: binding over / conflicts with the rootfs".into());
+            return Err(CliError::ProotAlsoRaises(
+                "literoot: binding over / conflicts with the rootfs".into(),
+            ));
         }
         binds.retain(|b| b.guest != Path::new("/"));
     }
     let rootfs = rootfs
         .canonicalize()
-        .map_err(|e| format!("literoot: rootfs {}: {e}", rootfs.display()))?;
+        .map_err(|e| {
+            CliError::ProotAlsoRaises(format!("literoot: rootfs {}: {e}", rootfs.display()))
+        })?;
     // proot preserves the host cwd when -w is absent: the guest
     // cwd is the host cwd seen from inside the rootfs (binds
     // included, e.g. -b . makes it the bind's guest spelling).
@@ -321,32 +361,31 @@ fn launcher_error_exit_code(error: &str) -> u8 {
 /// may hide.
 const REFUSAL_LOG_EXIT: u8 = 3;
 
-/// The side-log key for a launcher error, or `None` for the closed list of
-/// errors real proot also raises for the same argv, each expected by an
-/// upstream suite line (test-rootfs-arg-validation's "no launch" lines).
-/// Guest-command exec errors (not found, not executable) are exempt through
-/// `tool::command_was_not_runnable`, not by their text.
-fn launcher_refusal(error: &str) -> Option<&'static str> {
-    const PROOT_ALSO_RAISES: [&str; 3] = [
-        // `${PROOT} -v`
-        "literoot: -v requires a level argument",
-        // `-r ${ROOTFS} -r ${DONT_EXIST}`, `-r ${DONT_EXIST} ${ROOTFS}`
-        "literoot: rootfs ",
-        // `-r / -b /etc:/`, `-b /etc:/`
-        "literoot: binding over / conflicts with the rootfs",
-    ];
-    if PROOT_ALSO_RAISES.iter().any(|known| error.starts_with(known)) {
-        None
-    } else if error.starts_with("literoot: -q/qemu passthrough") {
-        Some("qemu_passthrough")
+/// The side-log key for an argument error from `parse_cli`: `None` for the
+/// closed list (`CliError::ProotAlsoRaises`), chosen by the variant the call
+/// site built, never by the text.
+fn launcher_refusal(error: &CliError) -> Option<&'static str> {
+    match error {
+        CliError::ProotAlsoRaises(_) => None,
+        CliError::Other(e) => Some(launcher_token(e)),
+    }
+}
+
+/// The side-log key for any launcher error that is not one of `parse_cli`'s
+/// closed-list argument errors: never `None`. Guest-command exec errors (not
+/// found, not executable) are exempt through `tool::command_was_not_runnable`,
+/// by their origin, not by their text.
+fn launcher_token(error: &str) -> &'static str {
+    if error.starts_with("literoot: -q/qemu passthrough") {
+        "qemu_passthrough"
     } else if error.starts_with("literoot: proot extensions") {
-        Some("extension")
+        "extension"
     } else if error.contains("static executables are not supported by the in-guest backend") {
-        Some("static_floor")
+        "static_floor"
     } else if launcher_error_exit_code(error) == 2 {
-        Some("kill_on_exit")
+        "kill_on_exit"
     } else {
-        Some("other")
+        "other"
     }
 }
 
@@ -472,9 +511,7 @@ fn launch(argv: Vec<String>) -> ExitCode {
         });
         if ok.is_err() {
             let e = format!("literoot: PROOT_TMP_DIR {tmp:?} is not a writable directory");
-            if let Some(key) = launcher_refusal(&e) {
-                side_log::refused_launcher(key);
-            }
+            side_log::refused_launcher(launcher_token(&e));
             eprintln!("{e}");
             return ExitCode::from(125);
         }
@@ -527,9 +564,7 @@ fn launch(argv: Vec<String>) -> ExitCode {
             Err(e) => {
                 let code = launcher_error_exit_code(&e);
                 if !tool::command_was_not_runnable() {
-                    if let Some(key) = launcher_refusal(&e) {
-                        side_log::refused_launcher(key);
-                    }
+                    side_log::refused_launcher(launcher_token(&e));
                 }
                 eprintln!("literoot: {e}");
                 ExitCode::from(code)

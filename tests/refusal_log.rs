@@ -484,7 +484,7 @@ fn guest_ptrace_and_self_stop_are_keyed_in_guest() {
     }
 }
 
-/// C4's closed list (main.rs `PROOT_ALSO_RAISES`) and the not-runnable
+/// C4's closed list (main.rs `CliError::ProotAlsoRaises`) and the not-runnable
 /// exemption: these launcher errors, which real proot also raises for the
 /// same argv, leave a valid log with no `refused` line; any other launcher
 /// error is keyed, here `launcher other` (review of g2 38e83d31, finding 3).
@@ -700,12 +700,12 @@ fn an_unexpected_command_lookup_error_is_keyed_on_path_search_and_command_path()
     if !fixture_or_skip(&built, "statx shim") {
         return;
     }
-    let run = |label: &str, path: &str, command: &str| -> (Option<i32>, Result<Vec<String>, String>, String) {
+    let run = |label: &str, path: &str, command: &[&str]| -> (Option<i32>, Result<Vec<String>, String>, String) {
         let log = scratch.0.join(format!("logs/{label}"));
         let out = Command::new(literoot_bin())
             .arg("--refusal-log")
             .arg(&log)
-            .arg(command)
+            .args(command)
             .env("PATH", path)
             .env("LD_PRELOAD", &shim)
             .stdin(Stdio::null())
@@ -714,11 +714,24 @@ fn an_unexpected_command_lookup_error_is_keyed_on_path_search_and_command_path()
         (out.status.code(), check(&log), String::from_utf8_lossy(&out.stderr).into_owned())
     };
     let keyed = Ok(vec!["refused launcher other".to_owned()]);
-    let (code, refused, stderr) = run("path-eio", "/literoot-eio-marker", "literoot-no-such-prog");
+    let (code, refused, stderr) = run("path-eio", "/literoot-eio-marker", &["literoot-no-such-prog"]);
     assert_eq!((code, &refused), (Some(125), &keyed), "PATH search: {stderr}");
     assert!(stderr.contains("Input/output error"), "{stderr}");
-    let (code, refused, stderr) = run("path-missing", "/nonexistent-literoot-dir", "literoot-no-such-prog");
+    let (code, refused, stderr) = run("path-missing", "/nonexistent-literoot-dir", &["literoot-no-such-prog"]);
     assert_eq!((code, refused), (Some(125), Ok(Vec::new())), "missing on PATH: {stderr}");
-    let (code, refused, stderr) = run("command-eio", "/usr/bin:/bin", "/literoot-eio-marker/prog");
+    let (code, refused, stderr) = run("command-eio", "/usr/bin:/bin", &["/literoot-eio-marker/prog"]);
     assert_eq!((code, &refused), (Some(125), &keyed), "command path: {stderr}");
+    // The key follows where the error came from, not its text: command names
+    // that spell the start of a closed-list argument error are still keyed
+    // (review of g2 8b480bd0 by rev-g2d2-cx; a text match on
+    // "literoot: rootfs " exempted the first).
+    for (label, path, command) in [
+        ("named-rootfs-path", "/literoot-eio-marker", &["rootfs helper"][..]),
+        ("named-rootfs-command", "/usr/bin:/bin", &["rootfs helper/../literoot-eio-marker"][..]),
+        ("named-v-path", "/literoot-eio-marker", &["--", "-v requires a level argument"][..]),
+    ] {
+        let (code, refused, stderr) = run(label, path, command);
+        assert_eq!((code, &refused), (Some(125), &keyed), "{label}: {stderr}");
+        assert!(stderr.contains("Input/output error"), "{label}: {stderr}");
+    }
 }

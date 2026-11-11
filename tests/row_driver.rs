@@ -92,6 +92,31 @@ fn the_free_space_guard_refuses_what_it_cannot_measure() {
     );
     assert_eq!(out.status.code(), Some(64), "{out:?}");
 
+    // The cap is 18 digits, which bash's 64-bit integers always hold: the
+    // largest 18-digit floor is accepted (and, being far above any real
+    // free space, makes the name not measured); the smallest 19-digit one
+    // is a usage error (coord7, review of g2 8b480bd0).
+    let out = row(
+        root,
+        "floor18",
+        &[("LITEROOT_SIDELOG_MIN_FREE_KB", "999999999999999999")],
+        None,
+        &[],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        pername(root, "floor18"),
+        "test-one.sh not-measured free-space keys: none\n"
+    );
+    let out = row(
+        root,
+        "floor19",
+        &[("LITEROOT_SIDELOG_MIN_FREE_KB", "1000000000000000000")],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(64), "{out:?}");
+
     // 2^64: all digits, but too large for bash's integers (review of g2
     // 98d28848 by rev5338-cx, F1).
     let out = row(

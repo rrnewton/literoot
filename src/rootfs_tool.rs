@@ -1252,10 +1252,11 @@ impl Tool for RootfsTool {
             && guest.config().post_exec_at_exec_stop;
         if !guest.config().post_exec_at_exec_stop {
             // In-guest: post-exec runs at the first trapped syscall, so the
-            // initial-stack walk below cannot reach the auxv and none of its
-            // patches takes effect (it still runs, from the live stack; gating
-            // it is dh-3j72e6); the guest's auxv differs from the ptrace
-            // backend's. Each is keyed once per exec (C3 amendments
+            // initial-stack walk below does not patch the guest's auxv, which
+            // therefore differs from the ptrace backend's. The walk still runs,
+            // from the live stack pointer, and can write the word after any
+            // 11/12/13/14 (16 with zero_hwcap) it meets there (dh-3j72e6:
+            // gate it). Each is keyed once per exec (C3 amendments
             // kompat_auxv and fake_id_auxv). `zero_hwcap` needs `-k`, so
             // kompat_auxv covers it.
             if guest.config().kernel_release.is_some() {
@@ -1270,9 +1271,10 @@ impl Tool for RootfsTool {
         }
         let kompat_force = kompat && guest.config().kompat_force;
         // C4: the initial-stack walk. It patches the auxv only at the ptrace
-        // exec stop; in-guest it still runs, from the live stack, and does
-        // not reach the auxv (dh-3j72e6). Every disjunct below is keyed in
-        // the in-guest branch above (tests/c4_backend_branches.rs).
+        // exec stop; in-guest it still runs, from the live stack, does not
+        // patch the auxv, and can write live stack words (dh-3j72e6). Every
+        // disjunct below is keyed in the in-guest branch above
+        // (tests/c4_backend_branches.rs).
         if fake.is_some() || zero_hwcap || kompat {
             use reverie::syscalls::MemoryAccess as _;
             {
