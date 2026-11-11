@@ -217,17 +217,39 @@ impl RootfsSuccessorConsumer {
 fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -> bool {
     // Field-exact identity (LiterootConfig has no PartialEq and
     // must not be compared after to_root_config normalization:
-    // binds/fake ids collapse there). Every field counts.
-    a.rootfs == b.rootfs
-        && a.binds == b.binds
-        && a.cwd == b.cwd
-        && a.fake_root == b.fake_root
-        && a.fake_uid == b.fake_uid
-        && a.fake_gid == b.fake_gid
-        && a.kernel_release == b.kernel_release
-        && a.initial_exe == b.initial_exe
-        && a.initial_argv == b.initial_argv
-        && a.initial_stack_limit == b.initial_stack_limit
+    // binds/fake ids collapse there). Every field counts: the
+    // destructuring names them all, so a new field does not
+    // compile here until it is compared.
+    let rootfs_tool::LiterootConfig {
+        rootfs,
+        binds,
+        cwd,
+        fake_root,
+        fake_uid,
+        fake_gid,
+        kernel_release,
+        kill_on_exit,
+        kompat_force,
+        post_exec_at_exec_stop,
+        refuse_guest_ptrace,
+        initial_exe,
+        initial_argv,
+        initial_stack_limit,
+    } = a;
+    *rootfs == b.rootfs
+        && *binds == b.binds
+        && *cwd == b.cwd
+        && *fake_root == b.fake_root
+        && *fake_uid == b.fake_uid
+        && *fake_gid == b.fake_gid
+        && *kernel_release == b.kernel_release
+        && *kill_on_exit == b.kill_on_exit
+        && *kompat_force == b.kompat_force
+        && *post_exec_at_exec_stop == b.post_exec_at_exec_stop
+        && *refuse_guest_ptrace == b.refuse_guest_ptrace
+        && *initial_exe == b.initial_exe
+        && *initial_argv == b.initial_argv
+        && *initial_stack_limit == b.initial_stack_limit
 }
 
 #[cfg(feature = "successor")]
@@ -438,6 +460,10 @@ mod successor_tests {
             fake_uid: Some(0),
             fake_gid: Some(0),
             kernel_release: Some("6.0-literoot".to_string()),
+            kill_on_exit: false,
+            kompat_force: false,
+            post_exec_at_exec_stop: false,
+            refuse_guest_ptrace: true,
             initial_exe: "/bin/sh".to_string(),
             initial_argv: vec!["sh".to_string()],
             initial_stack_limit: None,
@@ -468,6 +494,18 @@ mod successor_tests {
         mutations.push(c);
         let mut c = launched_config();
         c.initial_stack_limit = Some((8388608, 8388608));
+        mutations.push(c);
+        let mut c = launched_config();
+        c.kill_on_exit = true;
+        mutations.push(c);
+        let mut c = launched_config();
+        c.kompat_force = true;
+        mutations.push(c);
+        let mut c = launched_config();
+        c.post_exec_at_exec_stop = true;
+        mutations.push(c);
+        let mut c = launched_config();
+        c.refuse_guest_ptrace = false;
         mutations.push(c);
         for (i, mutant) in mutations.iter().enumerate() {
             assert!(
