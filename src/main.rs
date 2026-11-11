@@ -580,7 +580,20 @@ fn launch(argv: Vec<String>) -> ExitCode {
 
 #[cfg(test)]
 mod kill_on_exit_parse_tests {
-    use super::{launcher_error_exit_code, parse_cli};
+    use super::{launcher_error_exit_code, launcher_token, parse_cli};
+
+    #[test]
+    fn unlimited_stack_refusal_has_its_own_side_log_key() {
+        assert_eq!(
+            launcher_token(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution"
+            ),
+            "unlimited_stack_loader"
+        );
+        assert_eq!(launcher_token("some other launcher error"), "other");
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

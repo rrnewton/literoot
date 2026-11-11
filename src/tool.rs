@@ -65,33 +65,57 @@ fn refuse_unlimited_in_guest_loader(
     Ok(())
 }
 
-/// Read a file's PT_INTERP with bounded I/O. The path comes from
-/// a guest-controlled argument, so it is never opened unless it is
-/// a regular file (a FIFO would block the open, `/dev/zero` would
-/// read forever), and only the ELF header, the program-header
-/// table, and the interpreter string (capped at 4096 bytes, as in
-/// the pinned backend's reader) are read — never the whole file.
-fn read_elf_interp_bounded(path: &Path) -> Option<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+/// Outcome of inspecting a possible linker target's PT_INTERP.
+enum InterpRead {
+    /// Not an ELF image, not a regular file, or no PT_INTERP: the
+    /// backend cannot admit this as a dynamic target either.
+    NotElf,
+    /// The file's PT_INTERP string.
+    Named(String),
+    /// An ELF image whose interpreter could not be determined
+    /// within the inspection bounds. Uncertainty is never treated
+    /// as "not a linker": the classifier refuses by name instead
+    /// of silently exempting a shape the backend might admit.
+    Uncertain,
+}
 
-    if !std::fs::metadata(path).ok()?.is_file() {
-        return None;
+/// Read a file's PT_INTERP with bounded, non-blocking I/O. The
+/// path comes from a guest-controlled argument: it is opened only
+/// as a regular file, with `O_NONBLOCK | O_NOCTTY` and a
+/// descriptor re-check (the pinned backend's `open_regular`
+/// protocol, which also closes the stat/open replacement race),
+/// and only the ELF header, the program-header table (capped at
+/// 64 KiB, the kernel's own table bound), and the interpreter
+/// string (capped at 4096 bytes) are read — never the whole file.
+/// Both ELF classes are read.
+fn read_elf_interp_bounded(path: &Path) -> InterpRead {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return InterpRead::NotElf;
     }
-    let mut file = std::fs::File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    else {
+        return InterpRead::NotElf;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return InterpRead::NotElf;
     }
     let mut header = [0u8; 64];
-    file.read_exact(&mut header).ok()?;
-    if &header[0..4] != b"\x7fELF" || header[4] != 2 {
-        return None;
+    if file.read_exact(&mut header).is_err() || &header[0..4] != b"\x7fELF" {
+        return InterpRead::NotElf;
     }
     let le = header[5] == 1;
     let rd16 = |b: &[u8]| -> u16 {
+        let bytes: [u8; 2] = b[..2].try_into().unwrap();
         if le {
-            u16::from_le_bytes([b[0], b[1]])
+            u16::from_le_bytes(bytes)
         } else {
-            u16::from_be_bytes([b[0], b[1]])
+            u16::from_be_bytes(bytes)
         }
     };
     let rd32 = |b: &[u8]| -> u32 {
@@ -103,60 +127,81 @@ fn read_elf_interp_bounded(path: &Path) -> Option<String> {
         }
     };
     let rd64 = |b: &[u8]| -> u64 {
+        let bytes: [u8; 8] = b[..8].try_into().unwrap();
         if le {
-            u64::from_le_bytes(b.try_into().unwrap())
+            u64::from_le_bytes(bytes)
         } else {
-            u64::from_be_bytes(b.try_into().unwrap())
+            u64::from_be_bytes(bytes)
         }
     };
-    let phoff = rd64(&header[32..40]);
-    let phentsize = rd16(&header[54..56]) as u64;
-    let phnum = rd16(&header[56..58]) as u64;
-    if phoff == 0 || phnum == 0 || phnum > 1024 || !(48..=256).contains(&phentsize) {
-        return None;
+    // ELF64 and ELF32 header/program-header layouts.
+    let (phoff, phentsize, phnum, offset_at, filesz_at): (u64, u64, u64, usize, usize) =
+        match header[4] {
+            2 => (
+                rd64(&header[32..40]),
+                rd16(&header[54..56]) as u64,
+                rd16(&header[56..58]) as u64,
+                8,
+                32,
+            ),
+            1 => (
+                rd32(&header[28..32]) as u64,
+                rd16(&header[42..44]) as u64,
+                rd16(&header[44..46]) as u64,
+                4,
+                16,
+            ),
+            _ => return InterpRead::Uncertain,
+        };
+    let entry_min = (filesz_at + 8) as u64;
+    if phoff == 0 || phnum == 0 || phentsize < entry_min || phentsize > 256 {
+        return InterpRead::Uncertain;
     }
-    let table_len = phnum.checked_mul(phentsize)?;
-    if table_len > 65536 {
-        return None;
+    let Some(table_len) = phnum.checked_mul(phentsize) else {
+        return InterpRead::Uncertain;
+    };
+    if table_len > 65536 || file.seek(SeekFrom::Start(phoff)).is_err() {
+        return InterpRead::Uncertain;
     }
-    file.seek(SeekFrom::Start(phoff)).ok()?;
     let mut table = vec![0u8; table_len as usize];
-    file.read_exact(&mut table).ok()?;
+    if file.read_exact(&mut table).is_err() {
+        return InterpRead::Uncertain;
+    }
     const PT_INTERP: u32 = 3;
     for i in 0..phnum as usize {
         let off = i * phentsize as usize;
-        let entry = table.get(off..off + phentsize as usize)?;
+        let Some(entry) = table.get(off..off + phentsize as usize) else {
+            return InterpRead::Uncertain;
+        };
         if rd32(&entry[0..4]) != PT_INTERP {
             continue;
         }
-        let p_offset = rd64(&entry[8..16]);
-        let p_filesz = rd64(&entry[32..40]);
-        if p_filesz == 0 || p_filesz > 4096 {
-            return None;
+        let p_offset = if header[4] == 2 {
+            rd64(&entry[offset_at..offset_at + 8])
+        } else {
+            rd32(&entry[offset_at..offset_at + 4]) as u64
+        };
+        let p_filesz = if header[4] == 2 {
+            rd64(&entry[filesz_at..filesz_at + 8])
+        } else {
+            rd32(&entry[filesz_at..filesz_at + 4]) as u64
+        };
+        if p_filesz == 0 || p_filesz > 4096 || file.seek(SeekFrom::Start(p_offset)).is_err() {
+            return InterpRead::Uncertain;
         }
-        file.seek(SeekFrom::Start(p_offset)).ok()?;
         let mut raw = vec![0u8; p_filesz as usize];
-        file.read_exact(&mut raw).ok()?;
+        if file.read_exact(&mut raw).is_err() {
+            return InterpRead::Uncertain;
+        }
         let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        return String::from_utf8(raw[..end].to_vec()).ok();
+        return match String::from_utf8(raw[..end].to_vec()) {
+            Ok(interp) => InterpRead::Named(interp),
+            Err(_) => InterpRead::Uncertain,
+        };
     }
-    None
+    InterpRead::NotElf
 }
 
-/// Whether a direct-program spawn is really an explicit
-/// linker-as-main launch: the program has no PT_INTERP of its own
-/// (checked by the caller), and its first non-option argument is a
-/// dynamic program whose PT_INTERP names the program. Recognition
-/// uses the effective HOST view the pinned in-guest launcher's
-/// admission inspects (Reverie's `linker_target`): the host program
-/// path, the raw argument resolved only against the command's host
-/// current directory, and the target's PT_INTERP compared to the
-/// host program (string-equal or canonical-equal). Rootfs and bind
-/// translations deliberately do NOT apply here: the backend passes
-/// the argument unchanged, so a bind that remaps the guest view of
-/// the target cannot hide the launch the backend admits. Ordinary
-/// dynamic programs carry their own PT_INTERP and never reach
-/// here; a target naming a different linker does not match either.
 /// The target argument of an explicit linker launch, parsed with
 /// glibc ld.so's option grammar (mirrors the pinned backend's
 /// `linker_target`): only these spellings, each value as the next
@@ -202,6 +247,20 @@ fn linker_target_arg(args: &[String]) -> Option<&str> {
     Some(target)
 }
 
+/// Whether a direct-program spawn is really an explicit
+/// linker-as-main launch: the program has no PT_INTERP of its own
+/// (checked by the caller), and its first non-option argument is a
+/// dynamic program whose PT_INTERP names the program. Recognition
+/// uses the effective HOST view the pinned in-guest launcher's
+/// admission inspects (Reverie's `linker_target`): the host program
+/// path, the raw argument resolved only against the command's host
+/// current directory, and the target's PT_INTERP compared to the
+/// host program (string-equal or canonical-equal). Rootfs and bind
+/// translations deliberately do NOT apply here: the backend passes
+/// the argument unchanged, so a bind that remaps the guest view of
+/// the target cannot hide the launch the backend admits. Ordinary
+/// dynamic programs carry their own PT_INTERP and never reach
+/// here; a target naming a different linker does not match either.
 fn explicit_linker_as_main(
     host_prog: &Path,
     host_cwd: &Path,
@@ -235,10 +294,51 @@ fn explicit_linker_as_main(
     } else {
         host_cwd.join(target_path)
     };
-    let Some(interp) = read_elf_interp_bounded(&target_host) else {
+    match read_elf_interp_bounded(&target_host) {
+        InterpRead::Named(interp) => interp_names_program(&interp, host_prog),
+        // Never silently exempt a possible linker launch.
+        InterpRead::Uncertain => true,
+        InterpRead::NotElf => false,
+    }
+}
+
+/// The guest-view twin of `explicit_linker_as_main`, used only for
+/// the ptrace cap: under ptrace the target that actually loads is
+/// the guest-view file after rootfs and bind translation (there is
+/// no backend admission step), so a launch the host view misses
+/// must still be capped. An extra match here only adds a cap and
+/// restore the guest never observes.
+fn explicit_linker_as_main_guest_view(
+    config: &RootConfig,
+    cwd_guest: &Path,
+    host_prog: &Path,
+    guest_prog: &str,
+    guest_found: &str,
+    args: &[String],
+) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    let gate_open = match read_initial_stack_limit() {
+        Ok(limits) => limits.rlim_cur == libc::RLIM64_INFINITY,
+        Err(_) => true,
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let gate_open = false;
+    if !gate_open {
+        return false;
+    }
+    let Some(target) = linker_target_arg(args) else {
         return false;
     };
-    interp_names_program(&interp, host_prog)
+    let target_host = resolve_in_rootfs(config, cwd_guest, Path::new(target));
+    match read_elf_interp_bounded(&target_host) {
+        InterpRead::Named(interp) => {
+            interp == guest_prog
+                || interp == guest_found
+                || interp_names_program(&interp, host_prog)
+        }
+        InterpRead::Uncertain => true,
+        InterpRead::NotElf => false,
+    }
 }
 
 /// Whether an interpreter string names the program: string-equal
@@ -571,13 +671,22 @@ pub fn run_guest(
         // too: classify it in the same host view, over the exact
         // argument vector the backend receives.
         if !has_loader {
-            let mut backend_args: Vec<String> = Vec::new();
-            if let Some(opt) = &script_opt {
-                backend_args.push(opt.clone());
-            }
-            backend_args.push(guest_found.clone());
-            backend_args.extend(command.iter().skip(1).cloned());
-            has_loader = explicit_linker_as_main(&interp_host, &host_cwd, &backend_args);
+            // Read the exact argument vector the backend receives
+            // from the built command, not a reconstruction of it.
+            let backend_args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            has_loader = explicit_linker_as_main(&interp_host, &host_cwd, &backend_args)
+                || (!in_guest
+                    && explicit_linker_as_main_guest_view(
+                        config,
+                        cwd_guest,
+                        &interp_host,
+                        &script_interp,
+                        &script_interp,
+                        &backend_args,
+                    ));
         }
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
@@ -609,11 +718,19 @@ pub fn run_guest(
         config.rootfs.clone()
     };
     let explicit_linker = prog_interp.is_none()
-        && explicit_linker_as_main(
+        && (explicit_linker_as_main(
             &host_prog,
             &host_cwd,
             command.get(1..).unwrap_or(&[]),
-        );
+        ) || (!in_guest
+            && explicit_linker_as_main_guest_view(
+                config,
+                cwd_guest,
+                &host_prog,
+                &guest_prog,
+                &guest_found,
+                command.get(1..).unwrap_or(&[]),
+            )));
     let interp_guest = prog_interp
         // In-guest: when the host interp exists, let the kernel
         // load it and the preload arm inside the program itself.
@@ -639,17 +756,9 @@ pub fn run_guest(
     for a in command.iter().skip(1) {
         cmd.arg(a);
     }
-    // Guest starts with host cwd = translated guest cwd so real
-    // relative syscalls the Tool passes through still land right
-    // during early ld.so execution.
-    let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
-    // proot falls back to the guest root when -w names a missing
-    // directory (test-bind-chdir-getcwd expects cwd "/").
-    let host_cwd = if host_cwd.is_dir() {
-        host_cwd
-    } else {
-        config.rootfs.clone()
-    };
+    // Guest starts with the host cwd computed above (the same one
+    // the classifier saw) so real relative syscalls the Tool
+    // passes through still land right during early ld.so execution.
     cmd.current_dir(&host_cwd);
     // proot rewrites $PWD to the guest cwd at exec (observed:
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
@@ -1342,7 +1451,7 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
 
 #[cfg(test)]
 mod explicit_linker_tests {
-    use super::{interp_names_program, linker_target_arg, read_elf_interp_bounded};
+    use super::{interp_names_program, linker_target_arg, read_elf_interp_bounded, InterpRead};
     use std::path::PathBuf;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1410,17 +1519,41 @@ mod explicit_linker_tests {
     }
 
     fn synthetic_elf(interp: &str) -> Vec<u8> {
-        let mut img = vec![0u8; 120 + interp.len() + 1];
+        synthetic_elf_phnum(interp, 1)
+    }
+
+    fn synthetic_elf_phnum(interp: &str, phnum: u16) -> Vec<u8> {
+        let phoff = 64usize;
+        let table_len = phnum as usize * 56;
+        let interp_off = phoff + table_len;
+        let mut img = vec![0u8; interp_off + interp.len() + 1];
         img[0..4].copy_from_slice(b"\x7fELF");
         img[4] = 2; // ELF64
         img[5] = 1; // little-endian
-        img[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        img[32..40].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
         img[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        img[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-        img[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
-        img[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        img[56..58].copy_from_slice(&phnum.to_le_bytes()); // e_phnum
+        img[64..68].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP (first entry)
+        img[72..80].copy_from_slice(&(interp_off as u64).to_le_bytes()); // p_offset
         img[96..104].copy_from_slice(&((interp.len() + 1) as u64).to_le_bytes()); // p_filesz
-        img[120..120 + interp.len()].copy_from_slice(interp.as_bytes());
+        img[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
+        img
+    }
+
+    fn synthetic_elf32(interp: &str) -> Vec<u8> {
+        let phoff = 52usize;
+        let interp_off = phoff + 32;
+        let mut img = vec![0u8; interp_off + interp.len() + 1];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 1; // ELF32
+        img[5] = 1; // little-endian
+        img[28..32].copy_from_slice(&(phoff as u32).to_le_bytes()); // e_phoff
+        img[42..44].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
+        img[44..46].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        img[52..56].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        img[56..60].copy_from_slice(&(interp_off as u32).to_le_bytes()); // p_offset
+        img[68..72].copy_from_slice(&((interp.len() + 1) as u32).to_le_bytes()); // p_filesz
+        img[interp_off..interp_off + interp.len()].copy_from_slice(interp.as_bytes());
         img
     }
 
@@ -1435,19 +1568,61 @@ mod explicit_linker_tests {
     #[test]
     fn bounded_reader_reads_synthetic_interp() {
         let target = temp_file("target", &synthetic_elf("/lib64/ld.so"));
-        assert_eq!(
-            read_elf_interp_bounded(&target).as_deref(),
-            Some("/lib64/ld.so")
-        );
+        assert!(matches!(
+            read_elf_interp_bounded(&target),
+            InterpRead::Named(ref s) if s == "/lib64/ld.so"
+        ));
         let plain = temp_file("plain", b"not an ELF image");
-        assert_eq!(read_elf_interp_bounded(&plain), None);
+        assert!(matches!(read_elf_interp_bounded(&plain), InterpRead::NotElf));
+    }
+
+    #[test]
+    fn bounded_reader_reads_many_headers_and_elf32() {
+        let many = temp_file("many", &synthetic_elf_phnum("/lib64/ld.so", 1025));
+        assert!(matches!(
+            read_elf_interp_bounded(&many),
+            InterpRead::Named(ref s) if s == "/lib64/ld.so"
+        ));
+        let elf32 = temp_file("elf32", &synthetic_elf32("/lib/ld.so"));
+        assert!(matches!(
+            read_elf_interp_bounded(&elf32),
+            InterpRead::Named(ref s) if s == "/lib/ld.so"
+        ));
     }
 
     #[test]
     fn bounded_reader_rejects_non_regular_files() {
-        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/dev/null")), None);
-        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/dev/zero")), None);
-        assert_eq!(read_elf_interp_bounded(std::path::Path::new("/")), None);
+        assert!(matches!(
+            read_elf_interp_bounded(std::path::Path::new("/dev/null")),
+            InterpRead::NotElf
+        ));
+        assert!(matches!(
+            read_elf_interp_bounded(std::path::Path::new("/dev/zero")),
+            InterpRead::NotElf
+        ));
+        assert!(matches!(
+            read_elf_interp_bounded(std::path::Path::new("/")),
+            InterpRead::NotElf
+        ));
+        // A FIFO is rejected by metadata/descriptor, never opened
+        // in a blocking way. Call the reader on a thread with a
+        // deadline so a blocking regression fails this test
+        // instead of stalling the suite.
+        let fifo = temp_file("fifo-target", b"");
+        let _ = std::fs::remove_file(&fifo);
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .output()
+            .unwrap();
+        assert!(mkfifo.status.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_elf_interp_bounded(&fifo));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("bounded reader blocked on a FIFO target");
+        assert!(matches!(outcome, InterpRead::NotElf));
     }
 
     #[test]

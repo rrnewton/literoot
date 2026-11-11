@@ -772,12 +772,148 @@ fn trap_ptinterp_unlimited_stack_refused_by_name() {
     );
 }
 
+/// A target with more than 1024 program headers (table still
+/// within the kernel's 64 KiB bound) naming the supplied linker
+/// must still be classified: no narrower reader cutoff may
+/// silently exempt it (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
+#[test]
+fn trap_explicit_linker_many_headers_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("literoot-brk-phnum-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    // Synthetic ELF64: 1025 program headers, PT_INTERP first.
+    let phnum: usize = 1025;
+    let interp_off = 64 + phnum * 56;
+    let mut img = vec![0u8; interp_off + ld.len() + 1];
+    img[0..4].copy_from_slice(b"\x7fELF");
+    img[4] = 2;
+    img[5] = 1;
+    img[32..40].copy_from_slice(&64u64.to_le_bytes());
+    img[54..56].copy_from_slice(&56u16.to_le_bytes());
+    img[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+    img[64..68].copy_from_slice(&3u32.to_le_bytes());
+    img[72..80].copy_from_slice(&(interp_off as u64).to_le_bytes());
+    img[96..104].copy_from_slice(&((ld.len() + 1) as u64).to_le_bytes());
+    img[interp_off..interp_off + ld.len()].copy_from_slice(ld.as_bytes());
+    let target = dir.join("many-headers");
+    std::fs::write(&target, &img).unwrap();
+    let work = dir.to_string_lossy().into_owned();
+    let target_arg = target.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "trap",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            ld,
+            &target_arg,
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot trap many-headers linker guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stdout.is_empty()
+            && stderr.contains(
+                "aarch64 in-guest initial loader-as-main launch with \
+                 unlimited RLIMIT_STACK has no growable break; \
+                 refusing before guest execution",
+            ),
+        "literoot trap many-headers linker launch must be refused \
+         by name with no guest output: {out:?}"
+    );
+}
+
+/// Under ptrace there is no backend admission step: the target
+/// that loads is the guest-view file. An explicit linker whose
+/// target exists only inside the rootfs must still be capped, so
+/// the guest keeps a growable break and its exact (unlimited)
+/// limit after restore (dh-exsg3).
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn ptrace_explicit_linker_guest_view_capped() {
+    const GUEST_INTERP: &str = "/opt/literoot-ptinterp/ld.so";
+    let dir = std::env::temp_dir().join(format!("literoot-ptrace-ldso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let interp_dir = rootfs.join("opt/literoot-ptinterp");
+    let lib_dir = rootfs.join("lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [interp_dir.as_path(), lib_dir.as_path(), work_dir.as_path()] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, interp_dir.join("ld.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some(GUEST_INTERP));
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    // A remapping bind: the target is named /bound/... in the
+    // guest, bound from the rootfs work directory on the host.
+    let bind = format!("{}:/bound", work_dir.display());
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            &root_arg,
+            "-b",
+            &bind,
+            "-w",
+            "/work",
+            GUEST_INTERP,
+            "/bound/brk_after_exec",
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot ptrace explicit linker guest-view guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("pthread=ok"),
+        "literoot ptrace explicit linker guest-view launch must \
+         be capped with a growable break: {out:?}"
+    );
+}
+
 /// The explicit-linker classifier inspects a guest-controlled
 /// argument path. A non-regular target (here a FIFO) must be
-/// rejected by metadata, promptly: opening it would hang the
-/// launcher before any guest runs (dh-exsg3). This test completing
-/// at all is the assertion; before the bounded reader it blocked.
-/// Runs on every architecture and backend path — here ptrace.
+/// rejected without a blocking open: opening it would hang the
+/// launcher before any guest runs (dh-exsg3). Runs under an
+/// unlimited stack limit so the classifier gate is open where it
+/// can be, and under a hard deadline so a blocking regression
+/// fails this test instead of stalling the suite.
 #[test]
 fn explicit_linker_fifo_target_returns_promptly() {
     let dir = std::env::temp_dir().join(format!("literoot-fifo-target-{}", std::process::id()));
@@ -800,15 +936,46 @@ fn explicit_linker_fifo_target_returns_promptly() {
     let work = dir.to_string_lossy().into_owned();
     let prog_arg = prog.to_string_lossy().into_owned();
     let fifo_arg = fifo.to_string_lossy().into_owned();
-    let out = Command::new(literoot_bin())
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let mut child = Command::new("/bin/bash")
         .args([
-            "--backend", "ptrace", "-r", "/", "-w", &work, &prog_arg, &fifo_arg,
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &prog_arg,
+            &fifo_arg,
         ])
-        .output()
-        .expect("run literoot with FIFO target argument");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn literoot with FIFO target argument");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().expect("poll literoot child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("literoot with a FIFO target argument hung past 15s");
+            }
+        }
+    };
+    let out = child
+        .wait_with_output()
+        .expect("collect literoot FIFO-target output");
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !out.status.success() && out.stdout.is_empty(),
+        !status.success() && out.stdout.is_empty(),
         "literoot with a FIFO target argument must return \
          promptly, never hang in the classifier: {out:?}"
     );
