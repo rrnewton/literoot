@@ -257,7 +257,11 @@ semantics and guest composition — not by patch-vs-trap.
   `test-exec-proc-self-exe-null-argv` (/proc/self/exe fidelity
   after exec under the in-guest launcher), `test-rlimit-stack-brk`
   (stack rlimit/brk handling). These connected and ran; they are
-  the genuine in-guest fidelity frontier.
+  the genuine in-guest fidelity frontier. Note: the unlimited-
+  stack in-guest initial-launch shape behind this row is now
+  refused by name before guest execution (dh-exsg3), so on that
+  shape the expected outcome is the named refusal, not a
+  tolerated FAILED with delta=0.
 - Coexistence names in FAILED: `test-gdb-breakpoint-run`,
   `test-strace-execve-count`, `test-strace-fork-wait` (shell-driven;
   in the static-utility bucket above — they never reach a ptrace
