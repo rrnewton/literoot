@@ -432,9 +432,26 @@ mod tests {
         for bad in ["%2f", "%41", "%+F", "a%", "%2", "%zz"] {
             assert_eq!(decode_program(bad), None, "{bad}");
         }
+        // Lowercase hex is non-canonical even for bytes outside
+        // the safe set, where the safe-byte check cannot reject
+        // it; uppercase for the same byte is canonical.
+        assert_eq!(decode_program("%0a"), None);
+        assert_eq!(decode_program("%ff"), None);
+        assert_eq!(decode_program("%e9"), None);
+        assert_eq!(decode_program("%0A"), Some(vec![0x0a]));
+        assert_eq!(decode_program("%FF"), Some(vec![0xff]));
+        assert_eq!(decode_program("%E9"), Some(vec![0xe9]));
         // An encoded byte outside the safe set is canonical.
         assert_eq!(decode_program("%25"), Some(vec![b'%']));
         assert_eq!(decode_program("%20"), Some(vec![b' ']));
+        // The capped-record grammar path rejects the lowercase
+        // forms and accepts the uppercase ones.
+        let bad_line = "literoot: capped initial_stack loader_identity 1 2 1 %0a";
+        assert!(parse(bad_line).is_err(), "{bad_line}");
+        let good_line = "literoot: capped initial_stack loader_identity 1 2 1 %0A";
+        assert!(parse(good_line).is_ok(), "{good_line}");
+        let log = format!("literoot: begin 42\n{good_line}\nliteroot: end 42 ok\n");
+        assert_eq!(validate(&log), Ok(vec![]));
     }
 
     #[test]
