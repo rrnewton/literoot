@@ -65,6 +65,30 @@ fn refuse_unlimited_in_guest_loader(
     Ok(())
 }
 
+/// Layer 1 of the target-open protocol: the pathname names a
+/// regular file (never opens anything).
+fn path_is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Layer 2 of the target-open protocol: open with
+/// `O_NONBLOCK | O_NOCTTY` and re-check the opened descriptor.
+/// A FIFO swapped in after layer 1 cannot block this open, and a
+/// non-regular descriptor is rejected here.
+fn open_regular_nonblocking(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .ok()?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    Some(file)
+}
+
 /// Outcome of inspecting a possible linker target's PT_INTERP.
 enum InterpRead {
     /// Not an ELF image, not a regular file, or no PT_INTERP: the
@@ -90,21 +114,13 @@ enum InterpRead {
 /// Both ELF classes are read.
 fn read_elf_interp_bounded(path: &Path) -> InterpRead {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    use std::os::unix::fs::OpenOptionsExt as _;
 
-    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+    if !path_is_regular_file(path) {
         return InterpRead::NotElf;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-    else {
+    let Some(mut file) = open_regular_nonblocking(path) else {
         return InterpRead::NotElf;
     };
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return InterpRead::NotElf;
-    }
     // Read up to a full header; a recognised ELF that is too
     // short to inspect is Uncertain, never NotElf.
     let mut header = [0u8; 64];
@@ -1479,7 +1495,10 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
 
 #[cfg(test)]
 mod explicit_linker_tests {
-    use super::{interp_names_program, linker_target_arg, read_elf_interp_bounded, InterpRead};
+    use super::{
+        interp_names_program, linker_target_arg, open_regular_nonblocking, path_is_regular_file,
+        read_elf_interp_bounded, InterpRead,
+    };
     use std::path::PathBuf;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1653,6 +1672,49 @@ mod explicit_linker_tests {
         img[5] = 1; // little-endian
         let target = temp_file("no-phdr", &img);
         assert!(matches!(read_elf_interp_bounded(&target), InterpRead::NotElf));
+    }
+
+    fn make_fifo(name: &str) -> PathBuf {
+        let fifo = temp_file(name, b"");
+        let _ = std::fs::remove_file(&fifo);
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .output()
+            .unwrap();
+        assert!(mkfifo.status.success());
+        fifo
+    }
+
+    #[test]
+    fn is_file_layer_rejects_fifo_and_devices() {
+        // Layer 1 alone (no open of any kind): a mutant that makes
+        // this check always-true fails here even though layer 2
+        // would still save the full reader.
+        let fifo = make_fifo("fifo-layer1");
+        assert!(!path_is_regular_file(&fifo));
+        assert!(!path_is_regular_file(std::path::Path::new("/dev/zero")));
+        assert!(!path_is_regular_file(std::path::Path::new("/dev/null")));
+        let regular = temp_file("regular-layer1", b"x");
+        assert!(path_is_regular_file(&regular));
+    }
+
+    #[test]
+    fn nonblock_open_layer_rejects_fifo_promptly() {
+        // Layer 2 alone (no pre-open check): a mutant that opens
+        // blocking fails here by deadline even though layer 1
+        // would still save the full reader.
+        let fifo = make_fifo("fifo-layer2");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_regular_nonblocking(&fifo));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("non-blocking open layer blocked on a FIFO");
+        assert!(outcome.is_none());
+        assert!(open_regular_nonblocking(std::path::Path::new("/dev/zero")).is_none());
+        let regular = temp_file("regular-layer2", b"x");
+        assert!(open_regular_nonblocking(&regular).is_some());
     }
 
     #[test]
