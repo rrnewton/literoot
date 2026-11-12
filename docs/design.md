@@ -1,6 +1,6 @@
 # literoot design: a fast drop-in proot replacement
 
-Status: DESIGN + M1 POC BRIEF, 2026-11-05. Author: museproot (under museli-lt).
+Status: DESIGN + M1 POC BRIEF, 2026-11-05.
 This note is the contract for the POC branch and the M1–M3 milestones. Claims
 about existing code are labelled **Verified-current** (read in pinned code),
 **Partial**, **Design-only**, or **Unmeasured**. Nothing here claims an
@@ -539,7 +539,7 @@ is staged. That gap is stated in every results table until closed.
 
 ## 10. Dependencies: unreleased pieces vs published 0.2.x
 
-**Verified-current pins (slot, 2026-11-05):**
+**Verified-current pins (2026-11-05):**
 
 | Crate | What literoot needs | Published | POC pin |
 |---|---|---|---|
@@ -578,7 +578,7 @@ is staged. That gap is stated in every results table until closed.
 POC dependency rule: pin **git revs** (above) so the POC builds
 today; flip each edge to a crates.io version as the corresponding
 release lands, one edge per commit, oracle green at each flip. The
-POC branch's `Cargo.lock` is committed — "builds on my slot" is not
+POC branch's `Cargo.lock` is committed — "builds on my machine" is not
 a reproducibility story.
 
 ## 11. Packaging: one static binary
@@ -600,9 +600,8 @@ a reproducibility story.
 
 ## 12. M1 POC scope and exit criteria
 
-Branch `museproot/literoot-20261105` (standalone tree `literoot/`
-in this slot until the `rrnewton/literoot` repo is routed through
-the coordinator; see first report). POC = minimum `-r/-b/-w` +
+The POC began as a standalone tree, before the `rrnewton/literoot`
+repository existed. POC = minimum `-r/-b/-w` +
 Tool (§4.1 core subset: `openat/newfstatat/access/readlinkat/
 execve/chdir/getcwd` + fd table) + seccomp-trap net + oracle
 harness (§9 comparators 1-subset + 3, comparator 2 vs
@@ -733,10 +732,10 @@ unasked. First smoke target when unblocked: `wine cmd /c echo`
 class builtin-free PE (avoids net/registry writes), ptrace
 backend first (in-guest additionally gated on stage-1b exec).
 
-## 14. Open questions (for museli-lt / owner)
+## 14. Open questions (for project review)
 
-1. Name: `literoot` pending musearch name-check; crates.io/repo
-   writes routed via museli-lt (this lane makes none).
+1. Name: `literoot`, pending a name check; crates.io and repository
+   writes go through project review (this work makes none).
 2. Placeholder `Cargo.toml`/stub line: prepared per §10 conventions;
    confirm exact owner-specified wording before any publish.
 3. `-R` default binding set: copy proot's documented set verbatim,

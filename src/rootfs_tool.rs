@@ -347,8 +347,8 @@ pub(crate) struct ProcState {
     /// unsubscribed syscalls (read/write/getpid/... never
     /// reach this Tool), so a later legitimate self-stop
     /// after only unsubscribed syscalls is still
-    /// swallowed — the accepted leftover window tracked at
-    /// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-e4jcb.md
+    /// swallowed — the accepted leftover window, a known
+    /// limitation.
     pub(crate) swallow_next_self_stop: bool,
 }
 
@@ -1260,8 +1260,8 @@ impl Tool for RootfsTool {
             // initial-stack walk below does not patch the guest's auxv, which
             // therefore differs from the ptrace backend's. The walk still runs,
             // from the live stack pointer, and can write the word after any
-            // 11/12/13/14 (16 with zero_hwcap) it meets there (dh-3j72e6:
-            // gate it). Each is keyed once per exec (C3 amendments
+            // 11/12/13/14 (16 with zero_hwcap) it meets there (a follow-up
+            // gates it). Each is keyed once per exec (C3 amendments
             // kompat_auxv and fake_id_auxv). `zero_hwcap` needs `-k`, so
             // kompat_auxv covers it.
             if guest.config().kernel_release.is_some() {
@@ -1277,7 +1277,7 @@ impl Tool for RootfsTool {
         let kompat_force = kompat && guest.config().kompat_force;
         // C4: the initial-stack walk. It patches the auxv only at the ptrace
         // exec stop; in-guest it still runs, from the live stack, does not
-        // patch the auxv, and can write live stack words (dh-3j72e6). Every
+        // patch the auxv, and can write live stack words. Every
         // disjunct below is keyed in the in-guest branch above
         // (tests/c4_backend_branches.rs).
         if fake.is_some() || zero_hwcap || kompat {
@@ -2416,8 +2416,7 @@ impl Tool for RootfsTool {
                 // syscall and on exec — unsubscribed
                 // syscalls (getpid, write, nanosleep, ...)
                 // do not clear it, which is the accepted
-                // leftover window tracked at
-                // https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-e4jcb.md
+                // leftover window (a known limitation).
                 // This is the one place kill() reports
                 // success without delivering the signal.
                 let swallow_self_stop = swallow_armed

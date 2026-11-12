@@ -250,7 +250,7 @@ fn coordinator_fd_move_refuses_with_no_free_number() {
     });
 }
 
-/// Condition 1 (rl-lt, coord7): the placement records nothing, so Reverie's
+/// Condition 1 (review): the placement records nothing, so Reverie's
 /// installation is the single reservation, of the placed number. Installation
 /// reserves `rpc.raw_fd()` after `from_live_client` (reverie-liteinst
 /// tool_host.rs:1598), which is this same stream; that call runs only in a

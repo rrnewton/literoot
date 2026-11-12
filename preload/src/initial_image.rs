@@ -1,6 +1,6 @@
 //! The mapped first image's initializer (row d addendum, revision 3).
 //!
-//! The G2 C-ABI entry (`literoot_mapped_initial_entry`, dh-tc7os) will live
+//! The G2 C-ABI entry (`literoot_mapped_initial_entry`, later work) will live
 //! in `mapped_entry.rs` and call this after capture, private libc
 //! initialization, region adoption and tool-init enablement. Every decision
 //! is in `initial_packet::admit_initial`, which host tests reach; this is a
