@@ -90,6 +90,7 @@ fn open_regular_nonblocking(path: &Path) -> Option<std::fs::File> {
 }
 
 /// Outcome of inspecting a possible linker target's PT_INTERP.
+#[derive(Debug, PartialEq, Eq)]
 enum InterpRead {
     /// Not an ELF image, not a regular file, or no PT_INTERP: the
     /// backend cannot admit this as a dynamic target either.
@@ -112,6 +113,42 @@ enum InterpRead {
 /// 64 KiB, the kernel's own table bound), and the interpreter
 /// string (capped at 4096 bytes) are read — never the whole file.
 /// Both ELF classes are read.
+/// Read an ELF header prefix from `reader`: retries
+/// `Interrupted`, and once the ELF magic has been seen, any other
+/// read error (or a short EOF) is `Uncertain`, never `NotElf` —
+/// inspection uncertainty must fail closed. Factored over `Read`
+/// so unit tests can inject exact read sequences.
+fn read_elf_header<R: std::io::Read>(reader: &mut R) -> Result<[u8; 64], InterpRead> {
+    let mut header = [0u8; 64];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(if filled >= 4 && &header[0..4] == b"\x7fELF" {
+                    InterpRead::Uncertain
+                } else {
+                    InterpRead::NotElf
+                });
+            }
+        }
+    }
+    if filled < 4 || &header[0..4] != b"\x7fELF" {
+        return Err(InterpRead::NotElf);
+    }
+    let header_needed = match header.get(4) {
+        Some(2) => 58,
+        Some(1) => 46,
+        _ => return Err(InterpRead::Uncertain),
+    };
+    if filled < header_needed {
+        return Err(InterpRead::Uncertain);
+    }
+    Ok(header)
+}
+
 fn read_elf_interp_bounded(path: &Path) -> InterpRead {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
@@ -121,28 +158,10 @@ fn read_elf_interp_bounded(path: &Path) -> InterpRead {
     let Some(mut file) = open_regular_nonblocking(path) else {
         return InterpRead::NotElf;
     };
-    // Read up to a full header; a recognised ELF that is too
-    // short to inspect is Uncertain, never NotElf.
-    let mut header = [0u8; 64];
-    let mut filled = 0usize;
-    while filled < header.len() {
-        match file.read(&mut header[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return InterpRead::NotElf,
-        }
-    }
-    if filled < 4 || &header[0..4] != b"\x7fELF" {
-        return InterpRead::NotElf;
-    }
-    let header_needed = match header.get(4) {
-        Some(2) => 58,
-        Some(1) => 46,
-        _ => return InterpRead::Uncertain,
+    let header = match read_elf_header(&mut file) {
+        Ok(header) => header,
+        Err(outcome) => return outcome,
     };
-    if filled < header_needed {
-        return InterpRead::Uncertain;
-    }
     let le = header[5] == 1;
     let rd16 = |b: &[u8]| -> u16 {
         let bytes: [u8; 2] = b[..2].try_into().unwrap();
@@ -1497,7 +1516,7 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
 mod explicit_linker_tests {
     use super::{
         interp_names_program, linker_target_arg, open_regular_nonblocking, path_is_regular_file,
-        read_elf_interp_bounded, InterpRead,
+        read_elf_header, read_elf_interp_bounded, InterpRead,
     };
     use std::path::PathBuf;
 
@@ -1659,6 +1678,84 @@ mod explicit_linker_tests {
             read_elf_interp_bounded(&target),
             InterpRead::Named(ref s) if s == interp
         ));
+    }
+
+    struct SeqReader {
+        chunks: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl std::io::Read for SeqReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.chunks.pop_front() {
+                None => Ok(0),
+                Some(Err(error)) => Err(error),
+                Some(Ok(bytes)) => {
+                    if bytes.len() > buf.len() {
+                        buf.copy_from_slice(&bytes[..buf.len()]);
+                        self.chunks.push_front(Ok(bytes[buf.len()..].to_vec()));
+                        Ok(buf.len())
+                    } else {
+                        buf[..bytes.len()].copy_from_slice(&bytes);
+                        Ok(bytes.len())
+                    }
+                }
+            }
+        }
+    }
+
+    fn elf64_prefix() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes
+    }
+
+    #[test]
+    fn header_read_retries_interrupted() {
+        let full = elf64_prefix();
+        let mut reader = SeqReader {
+            chunks: [
+                Ok(full[..10].to_vec()),
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Ok(full[10..].to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let header = read_elf_header(&mut reader).expect("interrupted read must be retried");
+        assert_eq!(&header[0..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn header_read_error_after_magic_is_uncertain() {
+        let full = elf64_prefix();
+        let mut reader = SeqReader {
+            chunks: [
+                Ok(full[..10].to_vec()),
+                Err(std::io::Error::other("injected failure")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(read_elf_header(&mut reader), Err(InterpRead::Uncertain));
+        let mut reader = SeqReader {
+            chunks: [Err(std::io::Error::other("injected failure"))]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(read_elf_header(&mut reader), Err(InterpRead::NotElf));
+    }
+
+    #[test]
+    fn header_read_short_eof_is_uncertain() {
+        // A recognised ELF that ends before the class header
+        // floor (58 bytes for ELF64) is Uncertain, never NotElf.
+        let full = elf64_prefix();
+        let mut reader = SeqReader {
+            chunks: [Ok(full[..40].to_vec())].into_iter().collect(),
+        };
+        assert_eq!(read_elf_header(&mut reader), Err(InterpRead::Uncertain));
     }
 
     #[test]
