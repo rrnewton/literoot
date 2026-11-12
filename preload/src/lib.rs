@@ -11,13 +11,13 @@
 //!   runs through the fallback continuation, zero ptrace and no
 //!   reverie-liteinst in the graph at all.
 
-// The mapped first image (initial generation) is dh-tc7os work: Reverie's
+// The mapped first image (initial generation) is later work: Reverie's
 // factory descriptor for literoot has no first generation yet
 // (`MappedConsumer::Literoot`, `first: None`), so a literoot first image
 // cannot link, and nothing supervises one. The entry fails here by name
-// until dh-tc7os defines it. scripts/check-mapped-initial-refusal.sh pins
+// until that work defines it. scripts/check-mapped-initial-refusal.sh pins
 // this message. The mapped successor (`mapped-successor`) compiles against
-// Reverie main; running it also waits on dh-tc7os.
+// Reverie main; running it also waits on that work.
 #[cfg(feature = "mapped-initial")]
 compile_error!(
     "literoot-preload: the mapped-initial entry needs dh-tc7os (the factory's \

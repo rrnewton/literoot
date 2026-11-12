@@ -22,12 +22,12 @@
 #     mapped-successor-image enables (Reverie 52fcfde3,
 #     https://github.com/rrnewton/reverie/pull/1500, private libc exports
 #     gated on a feature);
-#   - no literoot_mapped_initial_entry (the first generation is dh-tc7os);
+#   - no literoot_mapped_initial_entry (the first generation is later work);
 #   - no LITEROOT_INIT, the preload's .init_array constructor, which the
 #     musl mapped-successor build leaves out (preload/src/lib.rs;
 #     scripts/check-preload-constructor.sh checks the LD_PRELOAD build keeps it).
 # Linking and publishing a literoot image through the factory is NOT done
-# here: it refuses by name until dh-tc7os (Reverie's factory has no literoot
+# here: it refuses by name until later work (Reverie's factory has no literoot
 # first generation, and nothing supervises a literoot image yet). --link
 # asks for that step and gets the refusal (exit 3).
 set -uo pipefail

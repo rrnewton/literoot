@@ -38,7 +38,7 @@ mapped-successor = [
     "reverie-inguest/loader-private-runtime",
     "dep:sha2",
 ]
-# Mapped first image (initial generation): dh-tc7os work. Enabling it fails
+# Mapped first image (initial generation): later work. Enabling it fails
 # to compile by name (src/lib.rs) until Reverie's factory defines literoot's
 # first generation; scripts/check-mapped-initial-refusal.sh pins that. So
 # `cargo ... --all-features` on this crate fails by design: that is the refusal,

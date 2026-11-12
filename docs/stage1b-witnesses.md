@@ -1,6 +1,6 @@
-# Stage-1b acceptance witnesses (for musegate's S2)
+# Stage-1b acceptance witnesses (for the gate side's S2)
 
-Consumer-side witness list from literoot: musegate's successor
+Consumer-side witness list from literoot: the gate side's successor
 arming (S2, convergence-plan engine) is judged against these.
 Scope/interface: docs/stage1b-scope.md. All witnesses run the
 *same* literoot Tool on in-guest vs ptrace and require

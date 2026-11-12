@@ -166,13 +166,13 @@ Suite: proot-me/proot v5.5.0 `test/` (94 shell + 38 C, 25dc6a3), GNUmakefile, CA
 
 Classification of the remaining 14: guest-ptrace/gdb/strace coexistence (11) is inherent to the ptrace backend (single tracer) and resolves only post stage-1b in-guest; foreign-binary (2) needs qemu (design out-of-scope); test-execve-sysexit-seccomp was a literoot -k kompat auxv gap (AT_SYSINFO* not discarded), fixed on the ptrace backend by 58bf5a51 as scoped by its successor, in-guest not implemented; test-execve-eacces-enoexec is an upstream test bug (reclassified 2026-11-06, see below; retained by name).
 
-## Reclassification: test-execve-eacces-enoexec (2026-11-06, museport/W1)
+## Reclassification: test-execve-eacces-enoexec (2026-11-06, W1)
 
 The upstream test declares `extern char *environ[];` (array, not
 pointer-to-pointer), so both execve calls receive the address of the
 `environ` variable as `envp`. Whether the kernel's envp walk then faults
 depends on static-glibc copy-relocation/layout: with gcc 11.5 / glibc
-2.34 (devbig030) the second execve returns EFAULT **natively, with no
+2.34 (the development host) the second execve returns EFAULT **natively, with no
 tracer**, at -O0/-O1/-O2 and any environment size; correcting the
 declaration to `extern char **environ;` makes the verbatim test pass
 both natively and under literoot-ptrace. Frame-independent asm repros
@@ -188,7 +188,7 @@ failed-exec-atomicity oracle candidate for stage-1b (it passes on
 ptrace today, so S2 inherits a real gate). Docs/execve-eacces-evidence.md
 retains the original characterization for history.
 
-## Local reproduction baseline (devbig030) and run rules
+## Local reproduction baseline and run rules
 
 Reproduced 2026-11-06 (EPYC 9D85, kernel 7.1.3, literoot @ PR#1 head
 031dc11, reverie @ ac71ee9c): **97 ok / 25 FAILED / 10 skipped** — the
@@ -202,17 +202,17 @@ deltas, both proven environmental, must not be re-derived as bugs:
 - Keep the suite rootfs at a **short host path**: translated AF_UNIX
   socket paths must fit `sun_path` (107 bytes);
   `test-unix-socket-bind-getsockname` fails with ENAMETOOLONG when
-  `<rootfs>/test-nnnnnnnn-socket` exceeds it (110 bytes at this slot's
+  `<rootfs>/test-nnnnnnnn-socket` exceeds it (110 bytes at this checkout's
   depth).
 
-## In-guest backends — first scores (2026-11-06, museport/W1)
+## In-guest backends — first scores (2026-11-06, W1)
 
-Date: 2026-11-06 (museport, W1). Host: devbig030, AMD EPYC 9D85,
+Date: 2026-11-06 (W1). Host: AMD EPYC 9D85,
 kernel 7.1.3, gcc 11.5/glibc 2.34.
 
 Versions (aligned run — launcher and preload from the same Reverie):
 
-- literoot: branch `museport/w1-x86-literoot` @ `3e25697` (PR #1 head
+- literoot: `3e25697` (PR #1 head
   `031dc11` + docs/pin commits; src identical to PR head)
 - Reverie (launcher libs + preload): `778a446cd3283ecd1c220792071a84b27c14db56`
   for both `literoot/Cargo.toml` and `literoot/preload/Cargo.toml`
@@ -298,27 +298,27 @@ have to be supported:
   syscall, not the exec stop, so the initial-stack walk
   does not run for it).
 - `test-unix-socket-bind-getsockname`: translated socket path is
-  110 bytes at this slot depth (> 107-byte `sun_path`) —
+  110 bytes at this checkout depth (> 107-byte `sun_path`) —
   **environment** (suite-rootfs path length).
 - `test-execve-eacces-enoexec`: upstream test bug
   (`extern char *environ[]`), fails natively on this toolchain;
   see the reclassification note in this doc's history (PR #1 doc).
 
-Logs: slot `w1/evidence/suite-liteinst.log`, `suite-trap.log`
-(pre-alignment run, identical counts) — aligned rerun logs retained
-with the lane status file references in the commit message.
+Logs (kept outside the repository): `suite-liteinst.log`,
+`suite-trap.log` (pre-alignment run, identical counts) and the aligned
+rerun logs.
 
 ## aarch64 policy — refused by name (current, not a suite measurement)
 
 Separate from the historical x86_64 suite results above: on
 aarch64 only, the unlimited-stack in-guest initial loader-as-main
 shape (including an explicitly supplied `ld.so <dynamic-program>`)
-is refused by name before guest execution (dh-exsg3). The refusal
+is refused by name before guest execution. The refusal
 exits 125; the suite counts exit 125 as "skipped" wherever a
 refusal is what a case hits. No suite row is known to exercise
 this initial-launch shape: `test-rlimit-stack-brk` in particular
 is not affected, since it starts with a finite limit and reaches
-any unlimited limit only at a successor exec (dh-75m98), and its
+any unlimited limit only at a successor exec (a separate follow-up), and its
 initial launch takes the direct-program route. The guard is
 compiled out on x86_64 and the historical counts above are
 unaffected; this section records current policy, not a measured

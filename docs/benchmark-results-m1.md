@@ -1,6 +1,6 @@
 # literoot M1 benchmark results (design §8.2 cells)
 
-Machine: AMD EPYC 9D85 158-Core, Linux 7.1.3-0_fbk0, x86-64.
+Machine: AMD EPYC 9D85 158-Core, Linux 7.1.3 (vendor build), x86-64.
 Runners: native = bubblewrap bind of the same rootfs (kernel path
 resolution); proot = official 5.5.0 static binary (sha256
 db185300a9daabbce86aca7632d8c7fdc4249f6f153171954013b70c5f491ec0);
@@ -64,7 +64,7 @@ each runner is future work, listed here so the gap is explicit.
 
 ## Addendum 2026-11-05: seccomp value + ptrace-stop anatomy
 
-Same stat cell (20k stats), literoot slot `b4b81ae92`,
+Same stat cell (20k stats), literoot at `b4b81ae92`,
 export head `b231b65a`. Commands:
 `proot -r ROOT /bin/statloop 20000 /etc/os-release` with and
 without `PROOT_NO_SECCOMP=1`.

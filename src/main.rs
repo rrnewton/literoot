@@ -115,7 +115,7 @@ fn parse_bind(spec: &str) -> Result<Bind, String> {
 
 /// An argument error from `parse_cli`, typed by where it was raised: the
 /// side-log key follows the variant, never the text, whose words can come
-/// from the command line (review of g2 8b480bd0 by rev-g2d2-cx).
+/// from the command line (review of g2 8b480bd0).
 #[derive(Debug)]
 enum CliError {
     /// One of the closed list of argument errors real proot also raises for
@@ -123,7 +123,7 @@ enum CliError {
     /// (test-rootfs-arg-validation's "no launch" lines): no side-log key.
     /// Built only at those call sites: `-v` without a level, binding over
     /// `/`, and the rootfs canonicalization (narrowing that one by errno is
-    /// dh-38junr).
+    /// a separate follow-up).
     ProotAlsoRaises(String),
     /// Every other argument error: keyed by `launcher_token`.
     Other(String),

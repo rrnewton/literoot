@@ -1,6 +1,6 @@
 # proot benchmark and syscall survey for a literoot design note
 
-Survey 2026-11-06, host `M1 dev host (x86-64 Linux)`. Route 1 `with-proxy curl/git` succeeded for every fetch, so nothing is reported blocked and Route 2 `herdr-run` was not needed. Source read: `proot-me/proot` `v5.5.0`, `25dc6a3134891f98a79f57ce1c2c1b23ff15cad1`, 2026-10-02. [Verified: https://github.com/proot-me/proot/releases/tag/v5.5.0]
+Survey 2026-11-06, host `M1 dev host (x86-64 Linux)`. Every fetch succeeded, so nothing is reported blocked. Source read: `proot-me/proot` `v5.5.0`, `25dc6a3134891f98a79f57ce1c2c1b23ff15cad1`, 2026-10-02. [Verified: https://github.com/proot-me/proot/releases/tag/v5.5.0]
 
 ## 1. Path-translating syscalls and slow paths (upstream `v5.5.0`)
 

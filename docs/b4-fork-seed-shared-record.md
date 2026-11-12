@@ -144,8 +144,8 @@ probe-generation descriptor is narrower: `translate.rs`
 already falls back when its env is scrubbed or the fd was
 closed before first use, and after the first-use mmap the
 fd number no longer matters. It does not identity-check a
-replacement made before that mmap; that is follow-up
-`dh-n6pie`, not part of this slice.
+replacement made before that mmap; that is a separate
+follow-up, not part of this slice.
 
 Publication is from the Tool's current accessor-materialized
 argv and its canonical exe (`canonical_exe(exe_guest())`),

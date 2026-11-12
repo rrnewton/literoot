@@ -1,6 +1,6 @@
 # L5 record: W6a ptrace re-bootstrap coverage of the 11 coexistence failures
 
-Status: RECORD ONLY (2026-11-06, museport/W1). No implementation.
+Status: RECORD ONLY (2026-11-06, W1). No implementation.
 Update (koe10): until W6a lands, in-guest backends refuse guest ptrace
 by name (EPERM; RootfsTool refuse_guest_ptrace) because seccomp
 SIGSYS interposition livelocks with a guest tracer; the ptrace

@@ -1,4 +1,4 @@
-//! Backend smoke gate (coord7 2026-11-07 gate-gap ruling after the
+//! Backend smoke gate (2026-11-07 gate-gap ruling after the
 //! ec3c0164 merge shipped `--backend liteinst` unable to install):
 //! every backend literoot claims must at least start a trivial
 //! dynamic guest. The liteinst flavour is the discriminating one:
@@ -666,7 +666,7 @@ fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
 /// loader image's break cannot grow at all — and silently
 /// launching into that layout is worse than not launching. So
 /// this shape is refused by name before any guest instruction
-/// runs (dh-exsg3): the launcher must fail, the guest must
+/// runs: the launcher must fail, the guest must
 /// produce no output, and the refusal must name the shape. The
 /// pthread-stack protection that motivated the no-cap rule is
 /// preserved by never starting glibc in the broken layout.
@@ -723,7 +723,7 @@ fn trap_initial_script_unlimited_stack_refused_by_name() {
 /// The qualifying case: an in-guest loader-as-main launch with a
 /// finite soft stack limit (8 MiB, hard unlimited) must still
 /// launch, preserve its exact limit, keep a growable break, and
-/// reach the named TrapHost thread refusal (dh-exsg3). A guard
+/// reach the named TrapHost thread refusal. A guard
 /// mutant that refuses every in-guest loader-as-main launch,
 /// whatever the limit, fails this test.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
@@ -785,7 +785,7 @@ fn trap_initial_script_finite_stack_preserves_pthread_stack() {
 /// the direct-program arm, but its kernel exec is the same
 /// loader-as-main exec as the script route above. Under an
 /// unlimited stack limit on AArch64 it must get the same named
-/// refusal with no guest output (dh-exsg3).
+/// refusal with no guest output.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_explicit_linker_initial_refused_by_name() {
@@ -838,7 +838,7 @@ fn trap_explicit_linker_initial_refused_by_name() {
 /// target (`/dev/null` over the fixture path), but the backend
 /// passes the target argument unchanged and admits the real host
 /// file. Recognition must use that effective host view, so the
-/// same named refusal applies (dh-exsg3).
+/// same named refusal applies.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_explicit_linker_bound_target_refused_by_name() {
@@ -893,7 +893,7 @@ fn trap_explicit_linker_bound_target_refused_by_name() {
 /// Control: an ordinary dynamic program executed directly is not
 /// loader-as-main — it carries its own PT_INTERP and the kernel
 /// loads its interpreter. Under the same unlimited stack limit it
-/// must still launch with a growable break (dh-exsg3).
+/// must still launch with a growable break.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_direct_dynamic_initial_still_launches() {
@@ -937,8 +937,7 @@ fn trap_direct_dynamic_initial_still_launches() {
 
 /// A script naming ld.so itself as interpreter
 /// (`#!<ld.so> <dynamic-program>`) is explicit linker-as-main at
-/// the shebang site and must get the same named refusal
-/// (dh-exsg3).
+/// the shebang site and must get the same named refusal.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_shebang_linker_initial_refused_by_name() {
@@ -996,7 +995,7 @@ fn trap_shebang_linker_initial_refused_by_name() {
 /// The PT_INTERP spawn site: when the guest program's interpreter
 /// exists only inside the rootfs (not on the host), literoot
 /// synthesizes loader-as-main itself. That site must apply the
-/// same named refusal under an unlimited stack limit (dh-exsg3).
+/// same named refusal under an unlimited stack limit.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_ptinterp_unlimited_stack_refused_by_name() {
@@ -1063,7 +1062,7 @@ fn trap_ptinterp_unlimited_stack_refused_by_name() {
 /// A target with more than 1024 program headers (table still
 /// within the kernel's 64 KiB bound) naming the supplied linker
 /// must still be classified: no narrower reader cutoff may
-/// silently exempt it (dh-exsg3).
+/// silently exempt it.
 #[cfg(all(target_arch = "aarch64", feature = "inguest-trap"))]
 #[test]
 fn trap_explicit_linker_many_headers_refused_by_name() {
@@ -1131,7 +1130,7 @@ fn trap_explicit_linker_many_headers_refused_by_name() {
 /// that loads is the guest-view file. An explicit linker whose
 /// target exists only inside the rootfs must still be capped, so
 /// the guest keeps a growable break and its exact (unlimited)
-/// limit after restore (dh-exsg3). Gated on the `run` feature:
+/// limit after restore. Gated on the `run` feature:
 /// that is the configuration that compiles the ptrace backend in.
 #[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
@@ -1200,8 +1199,7 @@ fn ptrace_explicit_linker_guest_view_capped() {
 /// invoked through a symlink alias of the loader inside the
 /// rootfs, while the target's PT_INTERP names the real loader
 /// path. The guest-view comparison must resolve the interpreter
-/// through the rootfs so the alias still classifies and caps
-/// (dh-exsg3).
+/// through the rootfs so the alias still classifies and caps.
 #[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
 fn ptrace_explicit_linker_guest_alias_capped() {
@@ -1268,7 +1266,7 @@ fn ptrace_explicit_linker_guest_alias_capped() {
 /// The shebang-arm twin of the ptrace guest-view test: a script
 /// naming the rootfs loader as its interpreter, with the dynamic
 /// target named through a remapping bind, must still be capped
-/// under ptrace (dh-exsg3).
+/// under ptrace.
 #[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
 fn ptrace_shebang_linker_guest_view_capped() {
@@ -1341,7 +1339,7 @@ fn ptrace_shebang_linker_guest_view_capped() {
 /// it (usrmerge); the target's PT_INTERP uses the /lib spelling
 /// while the program is invoked by its /usr/lib spelling. Both
 /// sides canonicalise inside the rootfs, so it still classifies
-/// and caps (dh-exsg3).
+/// and caps.
 #[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
 fn ptrace_explicit_linker_guest_usrmerge_capped() {
@@ -1611,7 +1609,7 @@ fn ptrace_static_pie_not_capped() {
 /// The explicit-linker classifier inspects a guest-controlled
 /// argument path. A non-regular target (here a FIFO) must be
 /// rejected without a blocking open: opening it would hang the
-/// launcher before any guest runs (dh-exsg3). Runs under an
+/// launcher before any guest runs. Runs under an
 /// unlimited stack limit so the classifier gate is open where it
 /// can be, and under a hard deadline so a blocking regression
 /// fails this test instead of stalling the suite.

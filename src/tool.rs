@@ -40,9 +40,9 @@ fn read_initial_stack_limit() -> Result<libc::rlimit64, String> {
 /// restored before glibc has cached its default thread stack
 /// size, so capping is not an option there either. Refusing
 /// before any guest instruction runs beats silently launching
-/// with a non-growable break (dh-exsg3). Only the stack-limit
+/// with a non-growable break. Only the stack-limit
 /// trigger is covered; ADDR_COMPAT_LAYOUT and
-/// vm.legacy_va_layout=1 select the same layout (dh-c1i03h).
+/// vm.legacy_va_layout=1 select the same layout and are not covered yet.
 fn refuse_unlimited_in_guest_loader(
     has_loader: bool,
     in_guest: bool,
@@ -963,7 +963,7 @@ pub fn run_guest(
         .and_then(|img| crate::translate::elf_interp(&img));
     // An explicitly supplied linker (`ld.so <dynamic-program>`)
     // has no PT_INTERP of its own, so it lands in the direct arm
-    // below; classify it as loader-as-main too (dh-exsg3), in the
+    // below; classify it as loader-as-main too, in the
     // effective host view the backend admission uses (the host
     // current directory the command below is given).
     let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
@@ -2430,9 +2430,8 @@ mod kill_wait_acceptance_tests {
         // mentions superseded/ENOENT, and a full-text
         // classification mutant survives these tests. The
         // strings below pin only that a primary with no
-        // trigger text is refused. Tracking issue for a
-        // Reverie test constructor:
-        // https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-d1lza.md
+        // trigger text is refused. A Reverie test constructor
+        // for it is a tracked follow-up.
         for primary_only in [
             "cleanup deadline exceeded",
             "-1 EPERM (Operation not permitted)",

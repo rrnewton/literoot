@@ -2,8 +2,8 @@
 //! --per-name`), against a one-name fake suite and the real literoot:
 //! a floor that is not a number is a usage error; a free-space reading
 //! that is not a number, or one below the floor, makes the name not
-//! measured, with the keys its log holds (review of g2 38e83d31 by
-//! rev5338-cx, finding P2-4). A name with no refusal and a measurable floor
+//! measured, with the keys its log holds (review of g2 38e83d31,
+//! finding P2-4). A name with no refusal and a measurable floor
 //! is counted, so the guard is not simply always on.
 
 mod common;
@@ -95,7 +95,7 @@ fn the_free_space_guard_refuses_what_it_cannot_measure() {
     // The cap is 18 digits, which bash's 64-bit integers always hold: the
     // largest 18-digit floor is accepted (and, being far above any real
     // free space, makes the name not measured); the smallest 19-digit one
-    // is a usage error (coord7, review of g2 8b480bd0).
+    // is a usage error (review of g2 8b480bd0).
     let out = row(
         root,
         "floor18",
@@ -118,7 +118,7 @@ fn the_free_space_guard_refuses_what_it_cannot_measure() {
     assert_eq!(out.status.code(), Some(64), "{out:?}");
 
     // 2^64: all digits, but too large for bash's integers (review of g2
-    // 98d28848 by rev5338-cx, F1).
+    // 98d28848, F1).
     let out = row(
         root,
         "hugefloor",

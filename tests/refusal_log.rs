@@ -339,7 +339,7 @@ fn a_nested_literoot_writes_its_own_pair() {
     assert!(check(&log).is_ok(), "{text:?}");
 }
 
-/// The `kompat_auxv` key (coord7's ruling on the C3 grammar, 2026-11-10):
+/// The `kompat_auxv` key (the review ruling on the C3 grammar, 2026-11-10):
 /// under `-k`, the in-guest backends skip proot kompat's auxv adjustment,
 /// which the ptrace backend applies at the exec stop, and say so exactly
 /// once per exec; ptrace writes no such line, and nor does a run without
@@ -404,7 +404,7 @@ fn key_lines(label: &str, backend: &str, options: &[&str], key: &str) -> usize {
     refused.iter().filter(|l| *l == key).count()
 }
 
-/// The `fake_id_auxv` key (coord7's ruling on the C3 grammar, 2026-11-10,
+/// The `fake_id_auxv` key (the review ruling on the C3 grammar, 2026-11-10,
 /// review of g2 38e83d31, finding 1): under `-0` or `-i`, the in-guest
 /// backends skip the fake-identity auxv patch that the ptrace backend
 /// applies at the exec stop, and say so exactly once per exec; ptrace
@@ -537,8 +537,8 @@ int main(void) {
 "#;
 
 /// A raw execveat is keyed `refused exec` on the in-guest backends, and the
-/// guest continues past it with EOPNOTSUPP (review of g2 38e83d31 by
-/// rev5338-cx, finding P1-1: unsubscribed, the in-guest runtime refused it
+/// guest continues past it with EOPNOTSUPP (review of g2 38e83d31,
+/// finding P1-1: unsubscribed, the in-guest runtime refused it
 /// with no record). The ptrace control execs `/bin/true` and refuses nothing.
 #[test]
 fn a_raw_execveat_is_keyed_in_guest_and_runs_under_ptrace() {
@@ -582,7 +582,7 @@ fn a_raw_execveat_is_keyed_in_guest_and_runs_under_ptrace() {
 /// the pin parent 2dbd5c52 installs the bare Tool under the same Reverie
 /// pin, configuration and selector. The launcher must end its log
 /// `error reporter` and say why on stderr, so no test name counts a run
-/// whose refusals could not be seen (review of g2 38e83d31 by rev5338-cx,
+/// whose refusals could not be seen (review of g2 38e83d31,
 /// finding P1-2). `LITEROOT_STALE_PRELOAD` names such a preload; unset,
 /// this is a skip, never a pass, and under LITEROOT_REQUIRE_FIXTURES a
 /// failure.
@@ -618,8 +618,8 @@ fn a_preload_without_the_reporter_ends_the_log_in_error() {
 }
 
 /// An unwritable `PROOT_TMP_DIR` is a launcher refusal outside C4's closed
-/// list, so it is keyed `launcher other` (review of g2 38e83d31 by
-/// rev5338-cx, finding P2-5); the exit status stays proot's 125.
+/// list, so it is keyed `launcher other` (review of g2 38e83d31,
+/// finding P2-5); the exit status stays proot's 125.
 #[test]
 fn an_unwritable_proot_tmp_dir_is_keyed() {
     let Some((scratch, _guest)) = scratch("tmpdir") else {
@@ -641,8 +641,8 @@ fn an_unwritable_proot_tmp_dir_is_keyed() {
 }
 
 /// C1: a failed side-log write exits nonzero, including on the help and
-/// version exits, which leave from argument parsing (review of g2 38e83d31
-/// by rev5338-cx, P3). Every write to /dev/full fails.
+/// version exits, which leave from argument parsing (review of g2 38e83d31,
+/// P3). Every write to /dev/full fails.
 #[test]
 fn a_failed_log_write_exits_nonzero_from_help_and_version_too() {
     for args in [&["--help"][..], &["--version"], &["-r", "/", "/bin/true"]] {
@@ -679,7 +679,7 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask, struct stat
 /// An unexpected error while looking up the guest command is a keyed
 /// launcher refusal, through the PATH search as on the command path; a
 /// candidate that is simply missing stays unkeyed, as real proot also fails
-/// there (review of g2 98d28848 by rev5338-cx, F2). EIO comes from a statx
+/// there (review of g2 98d28848, F2). EIO comes from a statx
 /// shim in the launcher, so the witness runs through the real search,
 /// caller and log finalization.
 #[test]
@@ -723,7 +723,7 @@ fn an_unexpected_command_lookup_error_is_keyed_on_path_search_and_command_path()
     assert_eq!((code, &refused), (Some(125), &keyed), "command path: {stderr}");
     // The key follows where the error came from, not its text: command names
     // that spell the start of a closed-list argument error are still keyed
-    // (review of g2 8b480bd0 by rev-g2d2-cx; a text match on
+    // (review of g2 8b480bd0; a text match on
     // "literoot: rootfs " exempted the first).
     for (label, path, command) in [
         ("named-rootfs-path", "/literoot-eio-marker", &["rootfs helper"][..]),

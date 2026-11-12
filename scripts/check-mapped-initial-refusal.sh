@@ -1,7 +1,7 @@
 #!/bin/bash
 # The preload's mapped-initial feature must fail to compile with exactly one
-# error, the named dh-tc7os refusal (preload/src/lib.rs), until dh-tc7os
-# defines literoot's first generation in Reverie's factory. Any other error,
+# error, the named first-generation refusal (preload/src/lib.rs), until
+# later work defines literoot's first generation in Reverie's factory. Any other error,
 # or a success, fails this check.
 #
 # usage: scripts/check-mapped-initial-refusal.sh
