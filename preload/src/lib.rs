@@ -29,11 +29,10 @@ mod arch;
 mod exec_stage;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 mod mapped_entry;
-// The initial-image packet: the image decodes and admits; the encoder and
-// the launcher-side helpers are row e/f's.
+// The initial-image packet: the image decodes and admits. The encoder is
+// row e/f's; it carries its own item-level allow(dead_code).
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 #[path = "../../src/initial_packet.rs"]
-#[allow(dead_code)]
 mod initial_packet;
 // `pub` so the initializer is reachable from the crate root, which keeps it
 // out of the dead-code lint before the G2 entry calls it.

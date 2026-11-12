@@ -104,6 +104,9 @@ impl fmt::Display for DecodeError {
 }
 
 /// The refusals of [`encode`].
+// The launcher's side (rows e/f): the preload's image decodes and never
+// encodes, so this and `encode` are its only unused items.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodeError {
     /// E1: the path is not 2 to 107 bytes.
@@ -180,6 +183,7 @@ pub fn decode(bytes: &[u8]) -> Result<Packet<'_>, DecodeError> {
 
 /// Encodes a packet (the launcher's side). Refuses exactly what [`decode`]
 /// would refuse (E1-E3), so it never emits a packet the image refuses.
+#[allow(dead_code)] // No caller in the preload's image; see `EncodeError`.
 pub fn encode(
     nonce: &[u8; NONCE_LEN],
     config_digest: &[u8; 32],
@@ -995,7 +999,7 @@ mod tests {
     #[test]
     fn digest_mismatch_texts_are_reveries() {
         // reverie-rpc-transport initial_image.rs:97 and blocking_client.rs:410
-        // at ac8b35c2. A rewording there fails this, rather than silently
+        // at c5eff334 (unchanged since ac8b35c2). A rewording there fails this, rather than silently
         // turning the refusal into Transport.
         let ack = classify(RpcError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1341,6 +1345,134 @@ mod tests {
             } else {
                 assert!(matches!(r, Err(AdmitError::GuestPtraceNotRefused)));
             }
+        }
+    }
+
+    #[test]
+    fn a_malformed_packet_is_refused_by_name_before_anything_else() {
+        let config = in_guest_config();
+        let good = packet_for(&config);
+        let flip = |at: usize, value: u8| {
+            let mut p = good.clone();
+            p[at] = value;
+            p
+        };
+        let magic = flip(0, b'M');
+        let version = flip(9, 0);
+        let length = flip(PATH_LEN_AT + 1, good[PATH_LEN_AT + 1] ^ 1);
+        let path = flip(HEADER_LEN, b'x');
+        let fingerprint = flip(FINGERPRINT_AT, b'G');
+        for (bytes, class) in [
+            (&good[..0], DecodeError::Size),
+            (&good[..93], DecodeError::Size),
+            (&magic[..], DecodeError::Magic),
+            (&version[..], DecodeError::Version),
+            (&length[..], DecodeError::Length),
+            (&path[..], DecodeError::Path),
+            (&fingerprint[..], DecodeError::Fingerprint),
+        ] {
+            // A disagreeing carriage too: A1 answers before A3.
+            let mut called = None;
+            let r = admit(
+                bytes,
+                Carriage::Present(b"/elsewhere"),
+                Ok(coordinator(&config, digest_of(&config), Script::Full)),
+                &mut called,
+            );
+            assert!(
+                matches!(r, Err(AdmitError::Decode(c)) if c == class),
+                "{class:?}"
+            );
+            assert_eq!(called, None, "{class:?}");
+        }
+    }
+
+    /// Every combination of eight faults, one per admission check in A1-A6
+    /// order: the refusal is always the earliest fault present, and connect
+    /// runs exactly when A1-A3 pass.
+    #[test]
+    fn refusal_precedence_is_the_check_order_for_every_fault_combination() {
+        const FAULTS: [&str; 8] = [
+            "decode",
+            "fingerprint",
+            "carriage",
+            "connect",
+            "close",
+            "ack",
+            "config",
+            "qualify",
+        ];
+        let ptrace_only = || LiterootConfig {
+            post_exec_at_exec_stop: true,
+            ..in_guest_config()
+        };
+        for mask in 0u32..1 << FAULTS.len() {
+            let has =
+                |name: &str| mask & (1 << FAULTS.iter().position(|f| *f == name).unwrap()) != 0;
+            // The packet's Config: one that fails qualification for "qualify".
+            let config = if has("qualify") {
+                ptrace_only()
+            } else {
+                in_guest_config()
+            };
+            let fingerprint = if has("fingerprint") {
+                *b"0000000000000000"
+            } else {
+                fp()
+            };
+            let mut p =
+                encode(&[0x5a; NONCE_LEN], &digest_of(&config), &fingerprint, PATH).unwrap();
+            if has("decode") {
+                p[0] = b'M';
+            }
+            let carriage = if has("carriage") {
+                Carriage::Present(b"/elsewhere")
+            } else {
+                Carriage::Absent
+            };
+            // "config": the coordinator sends the other Config, whose digest
+            // differs from the one acknowledged.
+            let sent = match (has("config"), has("qualify")) {
+                (false, _) => config.clone(),
+                (true, true) => in_guest_config(),
+                (true, false) => ptrace_only(),
+            };
+            let ack = if has("ack") {
+                [0x77; 32]
+            } else {
+                digest_of(&config)
+            };
+            let script = if has("close") {
+                Script::CloseBeforeAck
+            } else {
+                Script::Full
+            };
+            let stream = if has("connect") {
+                Err(ConnectError::Unreachable(111))
+            } else {
+                Ok(coordinator(&sent, ack, script))
+            };
+            let mut called = None;
+            let got = match admit(&p, carriage, stream, &mut called) {
+                Ok(_) => "admitted",
+                Err(AdmitError::Decode(DecodeError::Magic)) => "decode",
+                Err(AdmitError::FingerprintMismatch { .. }) => "fingerprint",
+                Err(AdmitError::CoordinatorCarriageDisagrees { .. }) => "carriage",
+                Err(AdmitError::CoordinatorUnreachable { errno: 111, .. }) => "connect",
+                Err(AdmitError::CoordinatorClosedDuringHandshake) => "close",
+                Err(AdmitError::ConfigDigestMismatch(DigestCheck::Ack)) => "ack",
+                Err(AdmitError::ConfigDigestMismatch(DigestCheck::Config)) => "config",
+                Err(AdmitError::PtraceOnlyConfig) => "qualify",
+                Err(e) => panic!("faults {mask:#010b}: unexpected refusal {e}"),
+            };
+            let want = FAULTS
+                .iter()
+                .copied()
+                .find(|f| has(f))
+                .unwrap_or("admitted");
+            assert_eq!(got, want, "faults {mask:#010b}");
+            let connects = !(has("decode") || has("fingerprint") || has("carriage"));
+            assert_eq!(called.is_some(), connects, "faults {mask:#010b}");
         }
     }
 
