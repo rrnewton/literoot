@@ -1,4 +1,4 @@
-//! The refusal side log, launcher side (`--refusal-log <path>`): one file
+//! The launcher side log (`--refusal-log <path>`): one file
 //! the launcher owns, into which every literoot refusal is written as one line of a
 //! closed grammar, so a suite driver can tell "nothing was refused" from
 //! "something was refused" and from "not measured".
@@ -25,6 +25,8 @@
 //! - `literoot: refused unsupported <kind>`, kind in [`UNSUPPORTED`]
 //! - `literoot: refused guest <kind>`, kind in [`GUEST`]
 //! - `literoot: refused launcher <token>`, token in [`LAUNCHER`]
+//! - `literoot: capped initial_stack <reason> <old_cur> <old_max>
+//!   <new_cur> <program>`, reason in [`CAP_REASONS`] (not a refusal)
 //!
 //! A log is valid for one test name only if every line parses, there is at
 //! least one `begin`, and every `begin` has a matching `end <pid> ok`.
@@ -63,6 +65,10 @@ pub const GUEST: &[&str] = &[
     "kompat_auxv",
     "fake_id_auxv",
 ];
+/// `capped initial_stack` reasons: why the initial stack cap was
+/// applied (not a refusal; the run proceeds with the limit
+/// restored after spawn).
+pub const CAP_REASONS: &[&str] = &["exact_interp", "loader_identity"];
 /// `launcher` tokens: launcher errors that refuse a run.
 pub const LAUNCHER: &[&str] = &[
     "unlimited_stack_loader",
@@ -125,6 +131,79 @@ pub fn refused_launcher(token: &'static str) {
     refusal_log::write_line(&format!("literoot: refused launcher {token}"));
 }
 
+/// Percent-encode a program path for the capped record: every
+/// byte outside `[A-Za-z0-9._/-]` becomes `%XX`, so a path with
+/// spaces, newlines, or non-ASCII bytes stays one ASCII token and
+/// can never forge another record.
+fn encode_program(program: &str) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    if program.is_empty() {
+        return "%".to_string();
+    }
+    let mut out = String::new();
+    for byte in std::ffi::OsStr::new(program).as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'/' | b'-' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn decode_program(token: &str) -> Option<Vec<u8>> {
+    if token == "%" {
+        return Some(Vec::new());
+    }
+    let bytes = token.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let pair = bytes.get(i + 1..i + 3)?;
+                if !pair.iter().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F')) {
+                    return None;
+                }
+                let hex = std::str::from_utf8(pair).ok()?;
+                let byte = u8::from_str_radix(hex, 16).ok()?;
+                // Canonical form only: a safe-set byte is never
+                // written encoded, so reject its encoded form.
+                if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'/' | b'-') {
+                    return None;
+                }
+                out.push(byte);
+                i += 3;
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'/' | b'-' => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// `literoot: capped initial_stack <reason> <old_cur> <old_max>
+/// <new_cur> <program>`: an initial stack cap was applied (and is
+/// restored after the spawn). The program is percent-encoded.
+/// Goes only to the side log, never to the guest's stderr.
+pub fn capped_initial_stack(
+    token: &'static str,
+    program: &str,
+    original: (u64, u64),
+    new_cur: u64,
+) {
+    refusal_log::write_line(&format!(
+        "literoot: capped initial_stack {token} {} {} {new_cur} {}",
+        original.0,
+        original.1,
+        encode_program(program)
+    ));
+}
+
 /// One parsed side-log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
@@ -132,6 +211,7 @@ pub enum Line {
     End(u32, Option<String>),
     Route(String),
     Refused(String),
+    Capped(String),
 }
 
 /// Parse one line (without its `\n`) under the closed grammar. Anything
@@ -174,6 +254,15 @@ pub fn parse(line: &str) -> Result<Line, String> {
         }
         ["refused", "guest", k] if one_of(k, GUEST) => Ok(Line::Refused(rest.to_owned())),
         ["refused", "launcher", t] if one_of(t, LAUNCHER) => Ok(Line::Refused(rest.to_owned())),
+        ["capped", "initial_stack", t, oc, om, nc, prog]
+            if one_of(t, CAP_REASONS)
+                && [oc, om, nc]
+                    .iter()
+                    .all(|n| n.parse::<u64>().is_ok_and(|v| v.to_string() == **n))
+                && decode_program(prog).is_some() =>
+        {
+            Ok(Line::Capped(rest.to_owned()))
+        }
         _ => bad(),
     }
 }
@@ -210,6 +299,8 @@ pub fn validate(contents: &str) -> Result<Vec<String>, String> {
                 }
             }
             Line::Route(_) => {}
+            // A cap record is not a refusal: the run proceeds.
+            Line::Capped(_) => {}
             Line::Refused(r) => refused.push(r),
         }
     }
@@ -292,6 +383,39 @@ const VALUE_OPTIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_records_round_trip_and_validate() {
+        // Whitespace, newline, and non-ASCII bytes encode to one
+        // ASCII token that decodes back byte-for-byte, and can
+        // never forge a second record.
+        let program = "/tmp/weird dir/ld.so\nliteroot: refused exec \u{e9}";
+        let encoded = encode_program(program);
+        assert!(encoded.is_ascii() && !encoded.contains([' ', '\n']));
+        assert_eq!(
+            decode_program(&encoded).as_deref(),
+            Some(program.as_bytes())
+        );
+        let line = format!(
+            "literoot: capped initial_stack loader_identity 18446744073709551615 18446744073709551615 18446744073709551614 {encoded}"
+        );
+        assert!(parse(&line).is_ok(), "{line}");
+        let log = format!("literoot: begin 42\n{line}\nliteroot: end 42 ok\n");
+        assert_eq!(validate(&log), Ok(vec![]));
+        // A cap record does not hide a real refusal.
+        let log = format!("literoot: begin 42\n{line}\nliteroot: refused exec\nliteroot: end 42 ok\n");
+        assert_eq!(validate(&log), Ok(vec!["refused exec".to_string()]));
+        // Missing/extra fields and malformed numbers are refused.
+        for bad in [
+            "literoot: capped initial_stack loader_identity 1 2 3",
+            "literoot: capped initial_stack loader_identity 1 2 3 /a extra",
+            "literoot: capped initial_stack loader_identity 01 2 3 /a",
+            "literoot: capped initial_stack loader_identity 1 2 3 %zz",
+            "literoot: capped initial_stack other 1 2 3 /a",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn the_grammar_accepts_exactly_its_lines() {
