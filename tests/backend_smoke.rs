@@ -1117,6 +1117,210 @@ fn ptrace_explicit_linker_guest_usrmerge_capped() {
     );
 }
 
+/// Loader-identity cap: under ptrace the cap also classifies by loader
+/// identity. Here the target names a DIFFERENT loader copy than
+/// the program invoked, so the exact PT_INTERP match misses; the
+/// program's loader SONAME must still cap it, with the guest's
+/// exact (unlimited) limit restored after spawn.
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn ptrace_loader_identity_different_loader_capped() {
+    let dir = std::env::temp_dir().join(format!("literoot-ptrace-identity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let ld_a = rootfs.join("opt/ld-a");
+    let ld_b = rootfs.join("opt/ld-b");
+    let lib_dir = rootfs.join("lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [
+        ld_a.as_path(),
+        ld_b.as_path(),
+        lib_dir.as_path(),
+        work_dir.as_path(),
+    ] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, ld_a.join("ld.so")).unwrap();
+    std::fs::copy(host_ld, ld_b.join("ld.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some("/opt/ld-b/ld.so"));
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    let bind = format!("{}:/bound", work_dir.display());
+    let side_log_path = dir.join("refusal.log");
+    let side_log = side_log_path.to_string_lossy().into_owned();
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "--refusal-log",
+            &side_log,
+            "-r",
+            &root_arg,
+            "-b",
+            &bind,
+            "-w",
+            "/work",
+            "/opt/ld-a/ld.so",
+            "/bound/brk_after_exec",
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot ptrace loader-identity guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let check = Command::new(literoot_bin())
+        .args(["--check-refusal-log"])
+        .arg(&side_log_path)
+        .output()
+        .expect("validate capped side log");
+    assert!(
+        check.status.success() && String::from_utf8_lossy(&check.stdout).is_empty(),
+        "capped side log must validate with no refusals: {check:?}"
+    );
+    let capped = std::fs::read_to_string(&side_log_path).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("pthread=ok")
+            && capped.contains("capped initial_stack loader_identity"),
+        "literoot ptrace loader-identity launch must be capped \
+         with limits restored: {out:?} side_log={capped:?}"
+    );
+}
+
+/// Loader-identity negative: a non-loader ET_DYN program without
+/// PT_INTERP (a static-pie guest) is not a loader and must not be
+/// capped, even with a positional argument.
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn ptrace_static_pie_not_capped() {
+    let dir =
+        std::env::temp_dir().join(format!("literoot-ptrace-staticpie-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("brk_after_exec.c");
+    std::fs::write(&source, BRK_AFTER_EXEC_C).unwrap();
+    let guest = dir.join("brk_after_exec_static");
+    let cc = Command::new("cc")
+        .args([
+            "-std=gnu11",
+            "-O2",
+            "-fPIE",
+            "-static-pie",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("compile static-pie brk guest");
+    assert!(
+        cc.status.success(),
+        "cc static-pie failed: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+    // The fixture really is ET_DYN with no PT_INTERP.
+    let image = std::fs::read(&guest).unwrap();
+    assert!(&image[0..4] == b"\x7fELF" && image[4] == 2);
+    assert_eq!(
+        u16::from_le_bytes(image[16..18].try_into().unwrap()),
+        3,
+        "guest must be ET_DYN"
+    );
+    let phoff = u64::from_le_bytes(image[32..40].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(image[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(image[56..58].try_into().unwrap()) as usize;
+    let mut types: Vec<u32> = Vec::new();
+    for i in 0..phnum {
+        let at = phoff + i * phentsize;
+        types.push(u32::from_le_bytes(image[at..at + 4].try_into().unwrap()));
+    }
+    assert!(
+        types.contains(&1) && !types.contains(&3),
+        "guest must be loadable ET segments without PT_INTERP: {types:?}"
+    );
+    let work = dir.to_string_lossy().into_owned();
+    let guest_arg = guest.to_string_lossy().into_owned();
+    let side_log_path = dir.join("refusal.log");
+    let side_log = side_log_path.to_string_lossy().into_owned();
+    // Native control: same guest, same limits, no literoot. It
+    // must actually reach the probe (the limit line) before any
+    // comparison means anything.
+    let native = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &guest_arg,
+            "stage2",
+        ])
+        .output()
+        .expect("run native static-pie control");
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("rlim_cur="),
+        "native control must reach the measured probe: {native:?}"
+    );
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "--refusal-log",
+            &side_log,
+            "-r",
+            "/",
+            "-w",
+            &work,
+            &guest_arg,
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot ptrace static-pie guest");
+    let check = Command::new(literoot_bin())
+        .args(["--check-refusal-log"])
+        .arg(&side_log_path)
+        .output()
+        .expect("validate static-pie side log");
+    assert!(
+        check.status.success() && String::from_utf8_lossy(&check.stdout).is_empty(),
+        "static-pie side log must validate with no refusals: {check:?}"
+    );
+    let logged = std::fs::read_to_string(&side_log_path)
+        .expect("side log must exist for the uncapped check");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Uncapped means indistinguishable from native: same exit
+    // status, same stdout (the limit pair it prints), a valid
+    // side log, and no cap record in it.
+    assert!(
+        out.status == native.status
+            && out.stdout == native.stdout
+            && logged.contains("literoot: begin")
+            && !logged.contains("capped initial_stack"),
+        "literoot ptrace static-pie launch must match the native \
+         control uncapped: literoot={out:?} native={native:?} side_log={logged:?}"
+    );
+}
+
 /// The explicit-linker classifier inspects a guest-controlled
 /// argument path. A non-regular target (here a FIFO) must be
 /// rejected without a blocking open: opening it would hang the
