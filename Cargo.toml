@@ -44,11 +44,13 @@ ptrace-only = ["run"]
 # feature alone never arms anything.
 exec-watch = []
 # Row d (P1a): the private runtime package and its custody point,
-# `runtime_package::open_audited`. Default off until row f wires the
-# static route to it.
+# `runtime_package::open_audited`, and (with `tool`) the initial-image
+# packet, `initial_packet`. Default off until row f wires the static
+# route to them.
 private-runtime = [
     "dep:reverie-inguest",
     "reverie-inguest/exec-stop-producer",
+    "dep:reverie-rpc-transport",
     "dep:libc",
     "dep:serde",
     "dep:serde_json",
@@ -58,6 +60,7 @@ private-runtime = [
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", optional = true }
 reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", optional = true }
+reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", optional = true }
 reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", default-features = false, features = ["liteinst"], optional = true }
 reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
 libc = { version = "0.2.186", optional = true }
