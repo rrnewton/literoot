@@ -190,8 +190,9 @@ retains the original characterization for history.
 
 ## Local reproduction baseline and run rules
 
-Reproduced 2026-11-06 (EPYC 9D85, kernel 7.1.3, literoot @ PR#1 head
-031dc11, reverie @ ac71ee9c): **97 ok / 25 FAILED / 10 skipped** — the
+Reproduced 2026-11-06 (EPYC 9D85, kernel 7.1.3, literoot @
+https://github.com/rrnewton/literoot/pull/1 head 031dc11, reverie @
+ac71ee9c): **97 ok / 25 FAILED / 10 skipped** — the
 b17 set plus `test-unix-socket-bind-getsockname`. Two host-environment
 deltas, both proven environmental, must not be re-derived as bugs:
 
