@@ -1,4 +1,4 @@
-//! In-guest mapped-successor staging client.
+//! In-guest staging client for the mapped exec route.
 //!
 //! On the mapped route the predecessor stages its framed
 //! `ExecState` into the host birth authority's one-slot mailbox
@@ -8,6 +8,10 @@
 //! connection. Staging is enabled only when the mapped entry
 //! records the coordinator endpoint; on every other route this
 //! module is inert and the pending slot remains the carrier.
+//!
+//! The client is built with the `exec-stage` feature, which both `successor`
+//! and the TrapHost `watched-initial` build enable; without it every entry
+//! point here is the inert path.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -24,7 +28,7 @@ pub fn set_coordinator_path(path: PathBuf) {
     let _ = COORDINATOR.set(path);
 }
 
-#[cfg(feature = "successor")]
+#[cfg(feature = "exec-stage")]
 fn map_control_error(
     error: reverie_rpc_transport::exec_ticket::ExecControlError,
 ) -> reverie::syscalls::Errno {
@@ -47,7 +51,7 @@ fn map_control_error(
 /// nothing. On an ambiguous error, run `invalidate`; if that
 /// also fails, leave `staged` set so a later invalidate retries
 /// instead of treating the mailbox as clear.
-#[cfg(feature = "successor")]
+#[cfg(feature = "exec-stage")]
 fn note_stage_error(
     staged: &std::sync::atomic::AtomicBool,
     error: reverie_rpc_transport::exec_ticket::ExecControlError,
@@ -65,14 +69,14 @@ fn note_stage_error(
     reverie::syscalls::Errno::EIO
 }
 
-#[cfg(feature = "successor")]
+#[cfg(feature = "exec-stage")]
 fn invalidate_now() -> Result<(), reverie::syscalls::Errno> {
     client()?.invalidate().map_err(map_control_error)?;
     STAGED.store(false, Ordering::SeqCst);
     Ok(())
 }
 
-#[cfg(feature = "successor")]
+#[cfg(feature = "exec-stage")]
 fn client() -> Result<
     reverie_rpc_transport::birth_authority::StageClient<std::os::unix::net::UnixStream>,
     reverie::syscalls::Errno,
@@ -91,12 +95,12 @@ fn client() -> Result<
 /// Returns `Ok(())` without staging when the mapped route did
 /// not record a coordinator endpoint.
 pub fn stage_snapshot(encoded: Vec<u8>) -> Result<(), reverie::syscalls::Errno> {
-    #[cfg(not(feature = "successor"))]
+    #[cfg(not(feature = "exec-stage"))]
     {
         let _ = encoded;
         Ok(())
     }
-    #[cfg(feature = "successor")]
+    #[cfg(feature = "exec-stage")]
     {
         if COORDINATOR.get().is_none() {
             return Ok(());
@@ -125,11 +129,11 @@ pub fn stage_snapshot(encoded: Vec<u8>) -> Result<(), reverie::syscalls::Errno> 
 /// acked; on failure the staged flag stays set so the caller
 /// can fail closed instead of treating the mailbox as clear.
 pub fn invalidate_snapshot() -> Result<(), reverie::syscalls::Errno> {
-    #[cfg(not(feature = "successor"))]
+    #[cfg(not(feature = "exec-stage"))]
     {
         Ok(())
     }
-    #[cfg(feature = "successor")]
+    #[cfg(feature = "exec-stage")]
     {
         if !STAGED.load(Ordering::SeqCst) {
             return Ok(());
@@ -138,7 +142,7 @@ pub fn invalidate_snapshot() -> Result<(), reverie::syscalls::Errno> {
     }
 }
 
-#[cfg(all(test, feature = "successor"))]
+#[cfg(all(test, feature = "exec-stage"))]
 mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;

@@ -10,8 +10,18 @@
 # literoot-preload, feature mapped-successor-image, entry source
 # preload/src/mapped_entry.rs), with Hermit's private-static codegen
 # (hermit-install/private-static/owned/prepare.py CODEGEN) plus v0 symbol
-# mangling, which the factory's symbol discovery reads. Then checks the
-# archive's symbols with nm:
+# mangling, which the factory's symbol discovery reads, under the preload's
+# liteinst-runtime profile. From Cargo's compiler-artifact message it checks:
+#   - the profile is the one the factory requires: opt_level "3",
+#     debuginfo 0, debug_assertions true, overflow_checks true, test false;
+#   - the activated features are exactly default, exec-stage, liteinst,
+#     mapped-successor, mapped-successor-image and successor.
+# Then it checks the archive's symbols with nm:
+#   - literoot_mapped_initial_entry, the first-image entry, a global text
+#     symbol defined exactly once, with its observation label
+#     literoot_mapped_initial_entry_observed_int3 and
+#     literoot_preload::mapped_initial_entry::{terminal,
+#     observe_initializer_return} as v0 names, each exactly once;
 #   - literoot_mapped_successor_entry, a global text symbol;
 #   - literoot_mapped_successor_entry_observed_int3, the observation label;
 #   - literoot_mapped_layout, the HLMLAY01 descriptor, in read-only data;
@@ -22,7 +32,6 @@
 #     mapped-successor-image enables (Reverie 52fcfde3,
 #     https://github.com/rrnewton/reverie/pull/1500, private libc exports
 #     gated on a feature);
-#   - no literoot_mapped_initial_entry (the first generation is later work);
 #   - no LITEROOT_INIT, the preload's .init_array constructor, which the
 #     musl mapped-successor build leaves out (preload/src/lib.rs;
 #     scripts/check-preload-constructor.sh checks the LD_PRELOAD build keeps it).
@@ -33,22 +42,48 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 if [ $# -lt 1 ] || [ -z "$1" ]; then
-    sed -n '2,32p' "$0"
+    sed -n '2,41p' "$0"
     exit 64
 fi
 target=$1
 link=${2:-}
 codegen='-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes -C symbol-mangling-version=v0'
+mkdir -p "$target" || { echo "FAIL: cannot create $target" >&2; exit 1; }
+messages=$target/dry-run-cargo-messages.json
 if ! CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="$codegen" cargo rustc --locked --offline \
-    --manifest-path preload/Cargo.toml --lib --target x86_64-unknown-linux-musl --release \
-    --features mapped-successor-image --crate-type staticlib --target-dir "$target"; then
+    --manifest-path preload/Cargo.toml --lib --target x86_64-unknown-linux-musl \
+    --profile liteinst-runtime --features mapped-successor-image --crate-type staticlib \
+    --target-dir "$target" --message-format=json-render-diagnostics >"$messages"; then
     echo "FAIL: the mapped-successor-image archive did not build" >&2
     exit 1
 fi
-archive=$target/x86_64-unknown-linux-musl/release/libliteroot_preload.a
+archive=$target/x86_64-unknown-linux-musl/liteinst-runtime/libliteroot_preload.a
 [ -f "$archive" ] || { echo "FAIL: no archive at $archive" >&2; exit 1; }
-symbols=$(nm "$archive" 2>/dev/null) || { echo "FAIL: nm could not read $archive" >&2; exit 1; }
 fail=0
+# The preload's own compiler-artifact message, exactly one.
+artifact=$(jq -c 'select(.reason == "compiler-artifact" and .target.name == "literoot_preload")' \
+    "$messages") || { echo "FAIL: jq could not read $messages" >&2; exit 1; }
+if [ "$(grep -c . <<<"$artifact")" -ne 1 ]; then
+    echo "FAIL: expected one literoot_preload compiler artifact in $messages" >&2
+    exit 1
+fi
+want_profile='{"debug_assertions":true,"debuginfo":0,"opt_level":"3","overflow_checks":true,"test":false}'
+got_profile=$(jq -cS '.profile' <<<"$artifact")
+if [ "$got_profile" = "$want_profile" ]; then
+    echo "ok: the archive's profile is the factory's ($got_profile)"
+else
+    echo "FAIL: the archive's profile is $got_profile, not the factory's $want_profile" >&2
+    fail=1
+fi
+want_features='["default","exec-stage","liteinst","mapped-successor","mapped-successor-image","successor"]'
+got_features=$(jq -c '.features | sort' <<<"$artifact")
+if [ "$got_features" = "$want_features" ]; then
+    echo "ok: the activated features are exactly $got_features"
+else
+    echo "FAIL: the activated features are $got_features, not exactly $want_features" >&2
+    fail=1
+fi
+symbols=$(nm "$archive" 2>/dev/null) || { echo "FAIL: nm could not read $archive" >&2; exit 1; }
 need() { # <description> <extended regex over "type name">
     if grep -Eq -- "$2" <<<"$symbols"; then
         echo "ok: $1"
@@ -57,6 +92,20 @@ need() { # <description> <extended regex over "type name">
         fail=1
     fi
 }
+once() { # <description> <extended regex over "type name">
+    local found
+    found=$(grep -Ec -- "$2" <<<"$symbols")
+    if [ "$found" -eq 1 ]; then
+        echo "ok: $1, exactly once"
+    else
+        echo "FAIL: $1: found $found times, not once (pattern $2)" >&2
+        fail=1
+    fi
+}
+once "first-image entry is a global text symbol" ' T literoot_mapped_initial_entry$'
+once "first-image observation label is present" ' [TtNn] literoot_mapped_initial_entry_observed_int3$'
+once "first-image terminal has its v0 name" ' [Tt] _RNvNtCs[0-9A-Za-z]+_16literoot_preload20mapped_initial_entry8terminal$'
+once "first-image observer has its v0 name" ' [Tt] _RNvNtCs[0-9A-Za-z]+_16literoot_preload20mapped_initial_entry26observe_initializer_return$'
 need "successor entry is a global text symbol" ' T literoot_mapped_successor_entry$'
 need "observation label is present" ' [TtNn] literoot_mapped_successor_entry_observed_int3$'
 need "HLMLAY01 descriptor is in read-only data" ' [Rr] literoot_mapped_layout$'
@@ -81,12 +130,6 @@ if grep -q 'LITEROOT_INIT' <<<"$symbols"; then
     fail=1
 else
     echo "ok: no preload constructor (LITEROOT_INIT) in the archive"
-fi
-if grep -q 'literoot_mapped_initial_entry' <<<"$symbols"; then
-    echo "FAIL: literoot_mapped_initial_entry is present; the first generation is later work" >&2
-    fail=1
-else
-    echo "ok: no first-generation entry"
 fi
 [ "$fail" -eq 0 ] || exit 1
 echo "dry run ok: $archive"

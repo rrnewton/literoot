@@ -24,20 +24,39 @@ compile_error!(
      in the Reverie factory, which Reverie main does not define yet"
 );
 
+// `liteinst` and `inguest-trap` each bring a global allocator, and a build has
+// exactly one, so the combination refuses by name (the TrapHost allocator below
+// is left out of it, which keeps this the only error).
+// scripts/check-preload-feature-refusals.sh pins these messages.
+#[cfg(all(feature = "inguest-trap", feature = "liteinst"))]
+compile_error!(
+    "literoot-preload: inguest-trap and liteinst each install a global allocator; \
+     build inguest-trap with --no-default-features"
+);
+// The watched first image is a TrapHost build; `successor` is the mapped
+// image's liteinst build. The two are separate images.
+#[cfg(all(feature = "watched-initial", feature = "successor"))]
+compile_error!(
+    "literoot-preload: watched-initial is the TrapHost first image and cannot \
+     also be the liteinst successor image"
+);
+
 #[path = "../../src/arch.rs"]
 mod arch;
 mod exec_stage;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 mod mapped_entry;
+// The mapped first image's C entry, in its own file: Reverie's factory accepts
+// mapped_entry.rs only by its SHA-256, so the successor entry stays unchanged.
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+mod mapped_initial_entry;
 // The initial-image packet: the image decodes and admits. The encoder is
 // row e/f's; it carries its own item-level allow(dead_code).
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 #[path = "../../src/initial_packet.rs"]
 mod initial_packet;
-// `pub` so the initializer is reachable from the crate root, which keeps it
-// out of the dead-code lint before the G2 entry calls it.
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
-pub mod initial_image;
+mod initial_image;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
 #[path = "../../src/shared_record.rs"]
@@ -59,7 +78,9 @@ use std::path::Path;
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_scoped_tool_allocator!();
 
-#[cfg(feature = "inguest-trap")]
+// Not with liteinst, whose allocator is declared above: that combination is
+// refused by name at the top of this file.
+#[cfg(all(feature = "inguest-trap", not(feature = "liteinst")))]
 #[global_allocator]
 static GLOBAL: reverie_inguest::guest::alloc::GuestAllocator =
     reverie_inguest::guest::alloc::GuestAllocator;
@@ -630,5 +651,33 @@ mod constructor_tests {
             initializer as usize,
             "LITEROOT_INIT must name the preload's initializer"
         );
+    }
+}
+
+#[cfg(test)]
+mod first_image_source_tests {
+    /// The first image's initializer seeds the launcher-exec one-shot before
+    /// anything else, as the preload constructor does in every LD_PRELOAD
+    /// image (`initialize` above). Without it the image's first guest execve
+    /// takes the launcher passthrough and skips translation. The initializer
+    /// is musl-only and needs a mapped prelude no unit test can construct, so
+    /// this pins its first statement in the source; the physical first-guest
+    /// exec regression belongs to the host harness.
+    #[test]
+    fn first_image_initializer_marks_the_launcher_exec_seen_first() {
+        let source = include_str!("initial_image.rs");
+        let call = "crate::rootfs_tool::mark_launcher_exec_seen();";
+        assert_eq!(source.matches(call).count(), 1, "exactly one call");
+        let signature = "pub unsafe fn literoot_mapped_initial_initialize(";
+        let (_, after) = source
+            .split_once(signature)
+            .expect("the first-image initializer is defined");
+        let (_, body) = after.split_once('{').expect("the initializer has a body");
+        let first = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            .expect("the initializer body has a statement");
+        assert_eq!(first, call);
     }
 }

@@ -23,11 +23,16 @@ inguest-trap = ["dep:reverie-inguest"]
 # RootfsSuccessorConsumer type-checks against the real trait.
 successor = [
     "liteinst",
+    "exec-stage",
     "dep:reverie-inguest",
-    "dep:reverie-rpc-transport",
     "reverie-liteinst/exec-native-injection",
     "reverie-inguest/exec-native-injection",
 ]
+# The mapped route's staging client (src/exec_stage.rs): the image stages its
+# exec snapshot with the host's birth authority before it injects exec. It
+# needs only the RPC transport, so a TrapHost build can stage without
+# `successor`, which brings in reverie-liteinst and its global allocator.
+exec-stage = ["dep:reverie-rpc-transport"]
 # Mapped successor consumer (E2-3c slice 4): the mapped-musl
 # successor initializer on top of the successor seam. The
 # physical mapped entry and host harness select this feature
@@ -58,6 +63,11 @@ mapped-successor-image = ["mapped-successor", "reverie-inguest/private-libc-expo
 # launch against a preload without this feature is refused by
 # name (see rootfs_tool::exec_watch_for_selector).
 exec-watch = []
+# The watched first image of a mapped launch: a TrapHost preload that arms the
+# exec watch and stages its snapshot, with no reverie-liteinst in the graph.
+# Build it with --no-default-features. src/lib.rs refuses, by name, the two
+# combinations that would put a second global allocator in it.
+watched-initial = ["inguest-trap", "exec-watch", "exec-stage"]
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "52fcfde386bdec275bd3d23a2ceaa1b1e7c59977" }
@@ -72,6 +82,17 @@ serde = { version = "1.0.219", features = ["derive"] }
 
 
 
+
+# The profile Reverie's private-image factory builds the image archive with:
+# release code generation (opt-level 3, no debug info) with debug assertions and
+# overflow checks on, and no LTO. The factory requires exactly these values in
+# the compiler-artifact profile; private-static/dry-run.sh builds with this
+# profile and checks them.
+[profile.liteinst-runtime]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = false
 
 [patch.crates-io]
 liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }

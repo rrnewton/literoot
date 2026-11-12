@@ -1,7 +1,7 @@
 //! The mapped first image's initializer (row d addendum, revision 3).
 //!
-//! The G2 C-ABI entry (`literoot_mapped_initial_entry`, later work) will live
-//! in `mapped_entry.rs` and call this after capture, private libc
+//! The C-ABI entry, `literoot_mapped_initial_entry` in
+//! `mapped_initial_entry.rs`, calls this after capture, private libc
 //! initialization, region adoption and tool-init enablement. Every decision
 //! is in `initial_packet::admit_initial`, which host tests reach; this is a
 //! fixed call chain plus the carriage conversion.
@@ -33,7 +33,11 @@ fn carriage(read: &Result<std::path::PathBuf, CoordinatorPathError>) -> Carriage
 
 /// Initializes the mapped first image from its captured, adopted prelude.
 ///
-/// Order: the straddler selector first (before anything is admitted); then
+/// Order: the launcher-exec one-shot is seeded first, unconditionally, as the
+/// preload constructor does in every LD_PRELOAD image: the launcher's exec
+/// happened before this image existed, so no execve this Tool sees is the
+/// launcher's (`rootfs_tool::mark_launcher_exec_seen`). Then the straddler
+/// selector (before anything is admitted); then
 /// `admit_initial` (packet decode, fingerprint before connect, carriage
 /// check, connect and top-band placement, redemption with the packet's
 /// digest, Config qualification); then prepare, install, lifecycle, finish.
@@ -45,6 +49,7 @@ fn carriage(read: &Result<std::path::PathBuf, CoordinatorPathError>) -> Carriage
 /// private libc/TLS/FD cleanup. No guest instruction has run in this image.
 /// Errors are terminal for this image; the entry must not fall back.
 pub unsafe fn literoot_mapped_initial_initialize(mapped: MappedToolPrelude) -> std::io::Result<()> {
+    crate::rootfs_tool::mark_launcher_exec_seen();
     let straddler = reverie_liteinst::validate_straddler_selector()?;
     let read = mapped.coordinator_path();
     let tid = reverie::Pid::from_raw(mapped.native_tid());
