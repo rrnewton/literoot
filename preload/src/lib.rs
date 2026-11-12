@@ -11,24 +11,23 @@
 //!   runs through the fallback continuation, zero ptrace and no
 //!   reverie-liteinst in the graph at all.
 
-// Until dh-axoec lands on Reverie main, the mapped successor needs Reverie
-// API that exists only on that branch (`valid_mapped_input_range`,
-// `MappedToolPrelude::coordinator_path`; Reverie 30cf50e5). The feature
-// fails here by name instead of on a missing item.
-// scripts/check-mapped-successor-refusal.sh pins this message. An evidence
-// build against that branch sets `--cfg literoot_dh_axoec`; when dh-axoec
-// lands, the cfg and this refusal go.
-#[cfg(all(feature = "mapped-successor", not(literoot_dh_axoec)))]
+// The mapped first image (initial generation) is dh-tc7os work: Reverie's
+// factory descriptor for literoot has no first generation yet
+// (`MappedConsumer::Literoot`, `first: None`), so a literoot first image
+// cannot link, and nothing supervises one. The entry fails here by name
+// until dh-tc7os defines it. scripts/check-mapped-initial-refusal.sh pins
+// this message. The mapped successor (`mapped-successor`) compiles against
+// Reverie main; running it also waits on dh-tc7os.
+#[cfg(feature = "mapped-initial")]
 compile_error!(
-    "literoot-preload: the mapped-successor feature needs dh-axoec, whose Reverie \
-     mapped-entry API is not on Reverie main yet"
+    "literoot-preload: the mapped-initial entry needs dh-tc7os (the factory's \
+     literoot first generation is not defined on Reverie main)"
 );
 
 #[path = "../../src/arch.rs"]
 mod arch;
 mod exec_stage;
-#[cfg(all(feature = "mapped-successor", target_env = "musl", literoot_dh_axoec))]
-#[path = "../../runtime/src/mapped_entry.rs"]
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 mod mapped_entry;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
@@ -56,6 +55,18 @@ reverie_liteinst::declare_legacy_scoped_tool_allocator!();
 static GLOBAL: reverie_inguest::guest::alloc::GuestAllocator =
     reverie_inguest::guest::alloc::GuestAllocator;
 
+// The preload's constructor is left out of the private runtime image only:
+// the musl mapped-successor build, which enters at its C entry and runs
+// Reverie's private libc initialization (`__init_libc` only, never
+// `__libc_start_init` or application constructors), so this entry would never
+// run there, and the image carries no stray .init_array root.
+// private-static/dry-run.sh checks the archive for it. Every other build is
+// an LD_PRELOAD build and keeps it, whatever features unification enables:
+// without it the guest would run without literoot and nothing would say so.
+// scripts/check-preload-constructor.sh checks the release library, and the
+// `constructor_tests` test (end of this file) fails to compile if a GNU build
+// loses it.
+#[cfg(not(all(feature = "mapped-successor", target_env = "musl")))]
 #[used]
 #[unsafe(link_section = ".init_array")]
 static LITEROOT_INIT: unsafe extern "C" fn(
@@ -64,6 +75,8 @@ static LITEROOT_INIT: unsafe extern "C" fn(
     *mut *mut libc::c_char,
 ) = initialize;
 
+// LITEROOT_INIT is the only root.
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
 unsafe fn loaded_as_preload() -> bool {
     let mut info = MaybeUninit::<libc::Dl_info>::uninit();
     let found = unsafe {
@@ -90,11 +103,15 @@ unsafe fn loaded_as_preload() -> bool {
     }
 }
 
+// LITEROOT_INIT is the only root.
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
 fn fail(msg: &str) -> ! {
     eprintln!("literoot-preload: {msg}");
     std::process::abort()
 }
 
+// LITEROOT_INIT is the only root.
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
 unsafe extern "C" fn initialize(
     _argc: libc::c_int,
     _argv: *mut *mut libc::c_char,
@@ -365,7 +382,7 @@ unsafe impl reverie_liteinst::NativeSuccessorConsumer<reporting::ReportingTool>
 /// libc/TLS/FD cleanup. No guest instruction has run in this
 /// image. Errors are terminal for this image; the entry must
 /// not fall back to an ordinary or InitialImage route.
-#[cfg(all(feature = "mapped-successor", target_env = "musl", literoot_dh_axoec))]
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 pub unsafe fn literoot_mapped_successor_initialize(
     mapped: reverie_inguest::guest::exec_private::mapped_initial::MappedToolPrelude,
 ) -> std::io::Result<()> {
@@ -582,5 +599,26 @@ mod successor_tests {
         .encode()
         .expect("encode");
         assert!(decode_successor_state(&cfg, &bytes[..bytes.len() - 1]).is_err());
+    }
+}
+
+#[cfg(all(test, not(target_env = "musl")))]
+mod constructor_tests {
+    /// A GNU build is an LD_PRELOAD build whatever its features, so it keeps
+    /// the .init_array constructor. This stops compiling if a cfg drops the
+    /// constructor there; `--features mapped-successor` on GNU is the case
+    /// the cfg on `LITEROOT_INIT` has to get right.
+    #[test]
+    fn gnu_build_keeps_the_preload_constructor() {
+        let initializer: unsafe extern "C" fn(
+            libc::c_int,
+            *mut *mut libc::c_char,
+            *mut *mut libc::c_char,
+        ) = super::initialize;
+        assert_eq!(
+            super::LITEROOT_INIT as usize,
+            initializer as usize,
+            "LITEROOT_INIT must name the preload's initializer"
+        );
     }
 }
