@@ -44,29 +44,29 @@ compile_error!(
 #[path = "../../src/arch.rs"]
 mod arch;
 mod exec_stage;
+#[path = "../../src/exec_state.rs"]
+mod exec_state;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
-mod mapped_entry;
-// The mapped first image's C entry, in its own file: Reverie's factory accepts
-// mapped_entry.rs only by its SHA-256, so the successor entry stays unchanged.
-#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
-mod mapped_initial_entry;
+mod initial_image;
 // The initial-image packet: the image decodes and admits. The encoder is
 // row e/f's; it carries its own item-level allow(dead_code).
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 #[path = "../../src/initial_packet.rs"]
 mod initial_packet;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
-mod initial_image;
-#[path = "../../src/exec_state.rs"]
-mod exec_state;
-#[path = "../../src/shared_record.rs"]
-#[allow(dead_code)] // Future shared-record transports are the first production callers.
-mod shared_record;
+mod mapped_entry;
+// The mapped first image's C entry, in its own file: Reverie's factory accepts
+// mapped_entry.rs only by its SHA-256, so the successor entry stays unchanged.
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+mod mapped_initial_entry;
 #[path = "../../src/refusal_log.rs"]
 mod refusal_log;
 mod reporting;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
+#[path = "../../src/shared_record.rs"]
+#[allow(dead_code)] // Future shared-record transports are the first production callers.
+mod shared_record;
 #[path = "../../src/translate.rs"]
 mod translate;
 
