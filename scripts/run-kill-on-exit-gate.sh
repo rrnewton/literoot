@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kill-on-exit gate (owner: museport / literoot lane). Runs
+# Kill-on-exit gate (literoot). Runs
 # the kill_on_exit suite once: ptrace kill semantics plus
 # the in-guest named-refusal arm. The busy-daemon test
 # loops internally (10 launcher runs). The strict unpaced

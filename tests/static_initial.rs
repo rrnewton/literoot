@@ -1,5 +1,5 @@
 //! Static-initial canary for bucket (a) of the trap
-//! suite classification (53 names, bead dh-35ic7).
+//! suite classification (53 names).
 //!
 //! The guest is a statically linked initial program
 //! (ET_EXEC, no PT_INTERP) of exactly the shape the
@@ -103,7 +103,7 @@ fn static_initial_ptrace_control() {
 
 /// Canary: the same static initial guest must run under
 /// the in-guest trap backend once static admission lands
-/// (Reverie exec route, PR #1327 chain; bead dh-35ic7).
+/// (Reverie exec route, PR #1327 chain).
 /// Today it is refused pre-spawn by the A6 gate
 /// ("static executables are not supported by the
 /// in-guest backend (no PT_INTERP)"), so this test is

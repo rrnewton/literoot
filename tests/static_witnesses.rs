@@ -1,5 +1,5 @@
 //! Red witnesses W10, W10x, W11 and W12 of the static-initial plan
-//! (revision 5, `PLAN-static-via-W6a.md` in the dev-hermit workspace):
+//! (revision 5 of the static-initial plan):
 //! a static initial guest under the in-guest trap backend makes one
 //! call that the in-guest runtime refuses, keeps running, and the
 //! refusal is named in literoot's side log.

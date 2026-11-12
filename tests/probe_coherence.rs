@@ -1,5 +1,5 @@
 //! Probe-cache coherence across guest processes sharing one
-//! rootfs (coord7 gate): process A replaces a symlink with a
+//! rootfs (review gate): process A replaces a symlink with a
 //! real directory; process B, which previously resolved through
 //! the symlink (caching its kind), must observe the new layout.
 //! Without shared generation invalidation B keeps splicing the

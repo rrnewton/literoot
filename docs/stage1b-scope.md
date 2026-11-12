@@ -4,8 +4,8 @@ Status: DESIGN-ONLY scope from literoot (the consumer), 2026-11-05.
 No reverie-inguest code is proposed here line-by-line; this pins
 the interface literoot needs, the gate, failure modes, witnesses,
 and touch estimate so an implementation lane can start cold.
-Pinned tree: reverie @ ac71ee9 (slot). Nobody is currently on this
-item (coord7 via museli-lt, 2026-11-05).
+Pinned tree: reverie @ ac71ee9. Nobody was assigned to this item
+as of 2026-11-05.
 
 ## 1. Exact interface literoot needs
 
@@ -123,11 +123,11 @@ unknown is successor arming order vs ld.so, not volume.
 
 ## 6. Recommended lane
 
-**musegate** (museli-lt's lean, concurred): the work is
+**The gate/launcher side** (the preferred owner): the work is
 preload/launcher-side Reverie mechanics, and spike context on the
-gate/launcher seam transfers directly. museproot supplies the
+gate/launcher seam transfers directly. The literoot side supplies the
 consumer witnesses above (literoot oracle + apk + statloop8 are
 ready-made acceptance tests) and reviews from the Tool side.
-If musegate is saturated, museproot can take it — preload-side
+If the gate side is saturated, the literoot side can take it — preload-side
 knowledge is fresh — at the cost of pausing literoot M1 tail
 (suite widening).

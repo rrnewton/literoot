@@ -21,7 +21,7 @@ path = "src/main.rs"
 # POC). The crates.io 0.0.1 placeholder is published from the
 # placeholder commit (no dependencies); POC pins below are git revs
 # (design docs/design.md §10) expressed as local path deps in the
-# dev-hermit slot so the POC builds offline:
+# development checkout so the POC builds offline:
 #   reverie  git ac8b35c226e87fd3c34d25d4cd9e9fb475e73904
 #   liteinst crates.io 0.2.0 (via reverie-liteinst)
 # Flip each edge to a crates.io version as releases land.
