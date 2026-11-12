@@ -52,47 +52,235 @@ fn manifests_request_liteinst_feature() {
     }
 }
 
-/// One dynamic `/bin/true` under `--backend liteinst` must exit 0.
-/// Skips (passes) only when the preload DSO was not built next to
-/// the manifest, matching probe_coherence's convention.
-#[test]
-fn liteinst_true_guest_exits_zero() {
+/// The built preload, or `None` after printing the conventional
+/// skip message (only when the caller opted in to skipping).
+fn preload_or_skip() -> Option<PathBuf> {
     let preload = preload_path();
-    if !preload.exists() {
-        if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
-            eprintln!("backend_smoke: preload not built — skipping (opt-in)");
-            return;
-        }
-        panic!(
-            "backend_smoke: preload not built at {} — build the preload \
-             (cargo build -p literoot-preload --release) or set \
-             LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
-            preload.display()
-        );
+    if preload.exists() {
+        return Some(preload);
     }
-    let dir = std::env::temp_dir().join(format!("literoot-smoke-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    for sub in ["bin", "lib64"] {
+    if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
+        eprintln!("backend_smoke: preload not built — skipping (opt-in)");
+        return None;
+    }
+    panic!(
+        "backend_smoke: preload not built at {} — build the preload \
+         (cargo build -p literoot-preload --release) or set \
+         LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
+        preload.display()
+    );
+}
+
+/// `(PT_INTERP, DT_NEEDED)` of an ELF image, read from its own
+/// program headers and dynamic section — no library-name list is
+/// hard-coded per architecture.
+fn elf_interp_and_needed(image: &[u8]) -> (Option<String>, Vec<String>) {
+    fn rd16(b: &[u8], little: bool) -> u16 {
+        let v: [u8; 2] = b[..2].try_into().unwrap();
+        if little { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
+    }
+    fn rd32(b: &[u8], little: bool) -> u32 {
+        let v: [u8; 4] = b[..4].try_into().unwrap();
+        if little { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
+    }
+    fn rd64(b: &[u8], little: bool) -> u64 {
+        let v: [u8; 8] = b[..8].try_into().unwrap();
+        if little { u64::from_le_bytes(v) } else { u64::from_be_bytes(v) }
+    }
+    assert!(&image[0..4] == b"\x7fELF", "guest is not an ELF image");
+    let little = image[5] == 1;
+    let is64 = image[4] == 2;
+    let (phoff, phentsize, phnum): (usize, usize, usize) = if is64 {
+        (
+            rd64(&image[32..40], little) as usize,
+            rd16(&image[54..56], little) as usize,
+            rd16(&image[56..58], little) as usize,
+        )
+    } else {
+        (
+            rd32(&image[28..32], little) as usize,
+            rd16(&image[42..44], little) as usize,
+            rd16(&image[44..46], little) as usize,
+        )
+    };
+    let mut interp = None;
+    let mut dynamic = None;
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        let entry = &image[off..off + phentsize];
+        let p_type = rd32(&entry[0..4], little);
+        let (p_offset, p_vaddr, p_filesz): (u64, u64, u64) = if is64 {
+            (
+                rd64(&entry[8..16], little),
+                rd64(&entry[16..24], little),
+                rd64(&entry[32..40], little),
+            )
+        } else {
+            (
+                rd32(&entry[4..8], little) as u64,
+                rd32(&entry[8..12], little) as u64,
+                rd32(&entry[16..20], little) as u64,
+            )
+        };
+        match p_type {
+            1 => loads.push((p_vaddr, p_offset, p_filesz)),
+            2 => dynamic = Some((p_offset as usize, p_filesz as usize)),
+            3 => {
+                let raw = &image[p_offset as usize..(p_offset + p_filesz) as usize];
+                let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+                interp = Some(String::from_utf8_lossy(&raw[..end]).into_owned());
+            }
+            _ => {}
+        }
+    }
+    let mut needed = Vec::new();
+    if let Some((dyn_off, dyn_size)) = dynamic {
+        let v2o = |vaddr: u64| -> usize {
+            for (va, off, sz) in &loads {
+                if vaddr >= *va && vaddr < va + sz {
+                    return (off + (vaddr - va)) as usize;
+                }
+            }
+            vaddr as usize
+        };
+        let ent = if is64 { 16 } else { 8 };
+        let mut strtab = 0usize;
+        let mut name_offsets: Vec<usize> = Vec::new();
+        for i in 0..dyn_size / ent {
+            let e = &image[dyn_off + i * ent..dyn_off + (i + 1) * ent];
+            let (tag, val): (i64, u64) = if is64 {
+                (
+                    rd64(&e[0..8], little) as i64,
+                    rd64(&e[8..16], little),
+                )
+            } else {
+                (rd32(&e[0..4], little) as i32 as i64, rd32(&e[4..8], little) as u64)
+            };
+            match tag {
+                0 => break,
+                1 => name_offsets.push(val as usize),
+                5 => strtab = v2o(val),
+                _ => {}
+            }
+        }
+        for noff in name_offsets {
+            let raw = &image[strtab + noff..];
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            needed.push(String::from_utf8_lossy(&raw[..end]).into_owned());
+        }
+    }
+    (interp, needed)
+}
+
+/// Stage a `/bin/true` rootfs from the guest binary's own
+/// PT_INTERP and DT_NEEDED, located on the host. `omit` drops one
+/// named library from the staging (the negative fixture).
+fn stage_true_rootfs(dir: &std::path::Path, omit: Option<&str>, omit_interp: bool) -> Vec<String> {
+    for sub in ["bin", "lib64", "usr/lib64", "lib", "usr/lib"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
-    std::fs::copy("/bin/true", dir.join("bin/true")).unwrap();
-    for lib in ["libc.so.6", "ld-linux-x86-64.so.2"] {
-        std::fs::copy(format!("/lib64/{lib}"), dir.join("lib64").join(lib)).unwrap();
+    let true_host = ["/bin/true", "/usr/bin/true"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("host /bin/true present");
+    std::fs::copy(true_host, dir.join("bin/true")).unwrap();
+    let image = std::fs::read(true_host).unwrap();
+    let (interp, needed) = elf_interp_and_needed(&image);
+    if let Some(interp) = &interp {
+        let host_interp = std::path::Path::new(interp);
+        assert!(host_interp.exists(), "guest PT_INTERP {interp} absent on host");
+        if !omit_interp {
+            let dest = dir.join(interp.trim_start_matches('/'));
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(host_interp, &dest).unwrap();
+        }
     }
-    let out = Command::new(literoot_bin())
+    const SEARCH: &[&str] = &[
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+    ];
+    for lib in &needed {
+        if omit == Some(lib.as_str()) {
+            continue;
+        }
+        let host_lib = SEARCH
+            .iter()
+            .map(|d| std::path::Path::new(d).join(lib))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| panic!("guest DT_NEEDED {lib} not found on host"));
+        // Both trusted loader directories, whichever the guest's
+        // loader consults in the staged rootfs.
+        std::fs::copy(&host_lib, dir.join("lib64").join(lib)).unwrap();
+        std::fs::copy(&host_lib, dir.join("usr/lib64").join(lib)).unwrap();
+    }
+    needed
+}
+
+fn run_liteinst_true(dir: &std::path::Path, preload: &std::path::Path) -> std::process::Output {
+    Command::new(literoot_bin())
         .args(["--backend", "liteinst", "-r"])
-        .arg(&dir)
+        .arg(dir)
         .arg("/bin/true")
-        .env("LITEROOT_PRELOAD", &preload)
+        .env("LITEROOT_PRELOAD", preload)
         .output()
-        .expect("spawn literoot liteinst /bin/true");
+        .expect("spawn literoot liteinst /bin/true")
+}
+
+/// One dynamic `/bin/true` under `--backend liteinst` must exit 0:
+/// the rootfs libraries come from the guest binary's own PT_INTERP
+/// and DT_NEEDED, not a hard-coded list. x86_64 only: the in-guest
+/// LiteInst runtime refuses aarch64 guests by name ("in-guest
+/// LiteInst runtime is not supported on aarch64"), measured on an
+/// aarch64 VM. Skips (passes) only when the preload DSO was not
+/// built next to the manifest, matching probe_coherence's
+/// convention.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn liteinst_true_guest_exits_zero() {
+    let Some(preload) = preload_or_skip() else { return };
+    let dir = std::env::temp_dir().join(format!("literoot-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    stage_true_rootfs(&dir, None, false);
+    let out = run_liteinst_true(&dir, &preload);
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         out.status.success(),
         "liteinst /bin/true failed: status={} stderr={}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The negative fixture: the same rootfs with the guest binary
+/// truncated must NOT run. (Omitting a staged library is not a
+/// valid negative here: literoot supplies the loader itself and
+/// its default host==guest binds rescue libraries from the host
+/// root.) A staging regression that copies nothing turns the
+/// positive test red (no guest in the rootfs at all); this one
+/// pins that a broken guest is reported, not passed over.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn liteinst_true_guest_missing_library_fails() {
+    let Some(preload) = preload_or_skip() else { return };
+    let dir = std::env::temp_dir().join(format!("literoot-smoke-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    stage_true_rootfs(&dir, None, true);
+    std::fs::write(dir.join("bin/true"), b"\x7fELF").unwrap();
+    let out = run_liteinst_true(&dir, &preload);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success(),
+        "liteinst with a truncated guest binary must fail, got success: {out:?}"
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
