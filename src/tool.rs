@@ -925,8 +925,8 @@ pub fn run_guest(
                         &backend_args,
                     ));
         }
-        // The ptrace cap may also classify by loader identity
-        // The refusal above never does.
+        // The ptrace cap may also classify by loader identity.
+        // The in-guest refusal below never does.
         let mut cap_loader = has_loader;
         let mut cap_reason = "exact_interp";
         if !in_guest && !cap_loader {
@@ -1020,8 +1020,8 @@ pub fn run_guest(
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
     // agrees — test-bind-cwd-bash-pwd).
     cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
-    // The ptrace cap may also classify by loader identity
-    // The refusal below never does.
+    // The ptrace cap may also classify by loader identity.
+    // The in-guest refusal below never does.
     let mut cap_loader = has_loader;
     let mut cap_reason = "exact_interp";
     if !in_guest

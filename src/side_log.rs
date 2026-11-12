@@ -1,7 +1,8 @@
 //! The launcher side log (`--refusal-log <path>`): one file
-//! the launcher owns, into which every literoot refusal is written as one line of a
-//! closed grammar, so a suite driver can tell "nothing was refused" from
-//! "something was refused" and from "not measured".
+//! the launcher owns, into which refusals and initial-stack cap
+//! records are written as one line each of a closed grammar, so a
+//! suite driver can tell "nothing was refused" from "something was
+//! refused" and from "not measured".
 //!
 //! The launcher opens the file before anything can refuse or spawn:
 //! append and create (`O_WRONLY|O_APPEND|O_CREAT`; std adds `O_CLOEXEC`),
@@ -134,7 +135,9 @@ pub fn refused_launcher(token: &'static str) {
 /// Percent-encode a program path for the capped record: every
 /// byte outside `[A-Za-z0-9._/-]` becomes `%XX`, so a path with
 /// spaces, newlines, or non-ASCII bytes stays one ASCII token and
-/// can never forge another record.
+/// can never forge another record. Only the `tool` configuration
+/// writes capped records; tests exercise the codec directly.
+#[cfg(any(feature = "tool", test))]
 fn encode_program(program: &str) -> String {
     use std::os::unix::ffi::OsStrExt as _;
     if program.is_empty() {
@@ -190,7 +193,9 @@ fn decode_program(token: &str) -> Option<Vec<u8>> {
 /// `literoot: capped initial_stack <reason> <old_cur> <old_max>
 /// <new_cur> <program>`: an initial stack cap was applied (and is
 /// restored after the spawn). The program is percent-encoded.
-/// Goes only to the side log, never to the guest's stderr.
+/// Goes only to the side log, never to the guest's stderr. Only
+/// the `tool` configuration applies caps, so only it writes these.
+#[cfg(feature = "tool")]
 pub fn capped_initial_stack(
     token: &'static str,
     program: &str,
@@ -417,6 +422,32 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn strict_decoder_rejects_noncanonical_forms() {
+        // Lowercase hex, an encoded safe-set byte, and truncated
+        // or malformed escapes are not the canonical encoding the
+        // writer produces, so the decoder refuses them.
+        for bad in ["%2f", "%41", "%+F", "a%", "%2", "%zz"] {
+            assert_eq!(decode_program(bad), None, "{bad}");
+        }
+        // An encoded byte outside the safe set is canonical.
+        assert_eq!(decode_program("%25"), Some(vec![b'%']));
+        assert_eq!(decode_program("%20"), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn empty_program_uses_the_percent_sentinel() {
+        // The whole token `%` is the empty program's encoding; it
+        // is never produced for a non-empty program, and a capped
+        // record carrying it parses and validates as a non-refusal.
+        assert_eq!(encode_program(""), "%");
+        assert_eq!(decode_program("%"), Some(Vec::new()));
+        let line = "literoot: capped initial_stack loader_identity 1 2 1 %";
+        assert!(parse(line).is_ok(), "{line}");
+        let log = format!("literoot: begin 42\n{line}\nliteroot: end 42 ok\n");
+        assert_eq!(validate(&log), Ok(vec![]));
     }
 
     #[test]
