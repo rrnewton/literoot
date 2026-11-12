@@ -22,7 +22,7 @@ path = "src/main.rs"
 # placeholder commit (no dependencies); POC pins below are git revs
 # (design docs/design.md §10) expressed as local path deps in the
 # dev-hermit slot so the POC builds offline:
-#   reverie  git 073e61eaa8f45001731613f311cbfbc2287cfa57
+#   reverie  git ac8b35c226e87fd3c34d25d4cd9e9fb475e73904
 #   liteinst crates.io 0.2.0 (via reverie-liteinst)
 # Flip each edge to a crates.io version as releases land.
 default = ["run", "in-guest"]
@@ -56,10 +56,10 @@ private-runtime = [
 ]
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "073e61eaa8f45001731613f311cbfbc2287cfa57", optional = true }
-reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "073e61eaa8f45001731613f311cbfbc2287cfa57", optional = true }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "073e61eaa8f45001731613f311cbfbc2287cfa57", default-features = false, features = ["liteinst"], optional = true }
-reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "073e61eaa8f45001731613f311cbfbc2287cfa57", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", optional = true }
+reverie-ptrace = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", optional = true }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", default-features = false, features = ["liteinst"], optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "ac8b35c226e87fd3c34d25d4cd9e9fb475e73904", default-features = false, features = ["launcher", "coordinator-rpc"], optional = true }
 libc = { version = "0.2.186", optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
