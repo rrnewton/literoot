@@ -105,9 +105,27 @@ fn read_elf_interp_bounded(path: &Path) -> InterpRead {
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return InterpRead::NotElf;
     }
+    // Read up to a full header; a recognised ELF that is too
+    // short to inspect is Uncertain, never NotElf.
     let mut header = [0u8; 64];
-    if file.read_exact(&mut header).is_err() || &header[0..4] != b"\x7fELF" {
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return InterpRead::NotElf,
+        }
+    }
+    if filled < 4 || &header[0..4] != b"\x7fELF" {
         return InterpRead::NotElf;
+    }
+    let header_needed = match header.get(4) {
+        Some(2) => 58,
+        Some(1) => 46,
+        _ => return InterpRead::Uncertain,
+    };
+    if filled < header_needed {
+        return InterpRead::Uncertain;
     }
     let le = header[5] == 1;
     let rd16 = |b: &[u8]| -> u16 {
@@ -154,7 +172,12 @@ fn read_elf_interp_bounded(path: &Path) -> InterpRead {
             _ => return InterpRead::Uncertain,
         };
     let entry_min = (filesz_at + 8) as u64;
-    if phoff == 0 || phnum == 0 || phentsize < entry_min || phentsize > 256 {
+    if phnum == 0 {
+        // No program headers: definitely no PT_INTERP (relocatable
+        // objects, kernel modules), matching the backend's reader.
+        return InterpRead::NotElf;
+    }
+    if phoff == 0 || phentsize < entry_min || phentsize > 256 {
         return InterpRead::Uncertain;
     }
     let Some(table_len) = phnum.checked_mul(phentsize) else {
@@ -307,7 +330,7 @@ fn explicit_linker_as_main(
 /// the guest-view file after rootfs and bind translation (there is
 /// no backend admission step), so a launch the host view misses
 /// must still be capped. An extra match here only adds a cap and
-/// restore the guest never observes.
+/// restore (a different mmap layout for that one exec).
 fn explicit_linker_as_main_guest_view(
     config: &RootConfig,
     cwd_guest: &Path,
@@ -332,9 +355,14 @@ fn explicit_linker_as_main_guest_view(
     let target_host = resolve_in_rootfs(config, cwd_guest, Path::new(target));
     match read_elf_interp_bounded(&target_host) {
         InterpRead::Named(interp) => {
-            interp == guest_prog
-                || interp == guest_found
-                || interp_names_program(&interp, host_prog)
+            if interp == guest_prog || interp == guest_found {
+                return true;
+            }
+            // Resolve the interpreter through the same guest view
+            // (rootfs, binds, symlinks) before comparing: a guest
+            // alias of the loader names the same host file.
+            let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&interp));
+            interp_names_program(&interp_host.to_string_lossy(), host_prog)
         }
         InterpRead::Uncertain => true,
         InterpRead::NotElf => false,
@@ -1588,6 +1616,43 @@ mod explicit_linker_tests {
             read_elf_interp_bounded(&elf32),
             InterpRead::Named(ref s) if s == "/lib/ld.so"
         ));
+    }
+
+    #[test]
+    fn bounded_reader_reads_short_elf32_header() {
+        // A 60-byte ELF32 whose program header starts inside the
+        // ident-sized prefix: phoff=20, one 32-byte entry,
+        // PT_INTERP at offset 48 (11 bytes including the NUL).
+        let interp = "/tmp/ld-cx";
+        let mut img = vec![0u8; 60];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 1; // ELF32
+        img[5] = 1; // little-endian
+        img[28..32].copy_from_slice(&20u32.to_le_bytes()); // e_phoff
+        img[42..44].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
+        img[44..46].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        img[20..24].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        img[24..28].copy_from_slice(&48u32.to_le_bytes()); // p_offset
+        img[36..40].copy_from_slice(&11u32.to_le_bytes()); // p_filesz
+        img[48..48 + interp.len()].copy_from_slice(interp.as_bytes());
+        let target = temp_file("short32", &img);
+        assert!(matches!(
+            read_elf_interp_bounded(&target),
+            InterpRead::Named(ref s) if s == interp
+        ));
+    }
+
+    #[test]
+    fn bounded_reader_no_program_headers_is_not_elf() {
+        // A full header with e_phnum == 0 (a relocatable object or
+        // kernel module shape) has no PT_INTERP: NotElf, never a
+        // linker classification.
+        let mut img = vec![0u8; 64];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2; // ELF64
+        img[5] = 1; // little-endian
+        let target = temp_file("no-phdr", &img);
+        assert!(matches!(read_elf_interp_bounded(&target), InterpRead::NotElf));
     }
 
     #[test]

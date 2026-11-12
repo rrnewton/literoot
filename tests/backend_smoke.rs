@@ -251,7 +251,8 @@ fn compile_brk_guest_with_linker(
 
 /// A successor image reached through the rootfs dynamic loader must
 /// keep both a growable break and the guest's exact stack limit.
-#[cfg(target_arch = "aarch64")]
+/// Gated on the `run` feature, which compiles the ptrace backend in.
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
 fn ptrace_successor_exec_preserves_brk_growth_and_stack_limit() {
     let dir = std::env::temp_dir().join(format!("literoot-brk-exec-{}", std::process::id()));
@@ -843,8 +844,9 @@ fn trap_explicit_linker_many_headers_refused_by_name() {
 /// that loads is the guest-view file. An explicit linker whose
 /// target exists only inside the rootfs must still be capped, so
 /// the guest keeps a growable break and its exact (unlimited)
-/// limit after restore (dh-exsg3).
-#[cfg(target_arch = "aarch64")]
+/// limit after restore (dh-exsg3). Gated on the `run` feature:
+/// that is the configuration that compiles the ptrace backend in.
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
 #[test]
 fn ptrace_explicit_linker_guest_view_capped() {
     const GUEST_INTERP: &str = "/opt/literoot-ptinterp/ld.so";
@@ -903,6 +905,214 @@ fn ptrace_explicit_linker_guest_view_capped() {
             )
             && stdout.contains("pthread=ok"),
         "literoot ptrace explicit linker guest-view launch must \
+         be capped with a growable break: {out:?}"
+    );
+}
+
+/// The alias case of the ptrace guest-view test: the program is
+/// invoked through a symlink alias of the loader inside the
+/// rootfs, while the target's PT_INTERP names the real loader
+/// path. The guest-view comparison must resolve the interpreter
+/// through the rootfs so the alias still classifies and caps
+/// (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn ptrace_explicit_linker_guest_alias_capped() {
+    const GUEST_INTERP: &str = "/opt/literoot-ptinterp/ld.so";
+    const GUEST_ALIAS: &str = "/opt/literoot-ptinterp/ld-alias.so";
+    let dir = std::env::temp_dir().join(format!("literoot-ptrace-alias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let interp_dir = rootfs.join("opt/literoot-ptinterp");
+    let lib_dir = rootfs.join("lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [interp_dir.as_path(), lib_dir.as_path(), work_dir.as_path()] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, interp_dir.join("ld.so")).unwrap();
+    std::os::unix::fs::symlink("ld.so", interp_dir.join("ld-alias.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some(GUEST_INTERP));
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    let bind = format!("{}:/bound", work_dir.display());
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            &root_arg,
+            "-b",
+            &bind,
+            "-w",
+            "/work",
+            GUEST_ALIAS,
+            "/bound/brk_after_exec",
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot ptrace explicit linker alias guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("pthread=ok"),
+        "literoot ptrace explicit linker alias launch must be \
+         capped with a growable break: {out:?}"
+    );
+}
+
+/// The shebang-arm twin of the ptrace guest-view test: a script
+/// naming the rootfs loader as its interpreter, with the dynamic
+/// target named through a remapping bind, must still be capped
+/// under ptrace (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn ptrace_shebang_linker_guest_view_capped() {
+    const GUEST_INTERP: &str = "/opt/literoot-ptinterp/ld.so";
+    let dir = std::env::temp_dir().join(format!("literoot-ptrace-shebang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let interp_dir = rootfs.join("opt/literoot-ptinterp");
+    let lib_dir = rootfs.join("lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [interp_dir.as_path(), lib_dir.as_path(), work_dir.as_path()] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, interp_dir.join("ld.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some(GUEST_INTERP));
+    let script = work_dir.join("ld-script");
+    std::fs::write(&script, format!("#!{GUEST_INTERP} /bound/brk_after_exec\n")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+    }
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    let bind = format!("{}:/bound", work_dir.display());
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            &root_arg,
+            "-b",
+            &bind,
+            "-w",
+            "/work",
+            "/work/ld-script",
+        ])
+        .output()
+        .expect("run literoot ptrace shebang linker guest-view guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("pthread=ok"),
+        "literoot ptrace shebang linker guest-view launch must \
+         be capped with a growable break: {out:?}"
+    );
+}
+
+/// The usrmerge case of the ptrace guest-view test: the loader
+/// lives under /usr/lib in the rootfs with /lib as a symlink to
+/// it (usrmerge); the target's PT_INTERP uses the /lib spelling
+/// while the program is invoked by its /usr/lib spelling. Both
+/// sides canonicalise inside the rootfs, so it still classifies
+/// and caps (dh-exsg3).
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn ptrace_explicit_linker_guest_usrmerge_capped() {
+    let dir = std::env::temp_dir().join(format!("literoot-ptrace-usrmerge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rootfs = dir.join("rootfs");
+    let ld_dir = rootfs.join("usr/lib/literoot-ld");
+    let lib_dir = rootfs.join("usr/lib64");
+    let work_dir = rootfs.join("work");
+    for sub in [ld_dir.as_path(), lib_dir.as_path(), work_dir.as_path()] {
+        std::fs::create_dir_all(sub).unwrap();
+    }
+    std::os::unix::fs::symlink("usr/lib", rootfs.join("lib")).unwrap();
+    let host_ld = ["/lib64/ld-linux-aarch64.so.1", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 dynamic linker present");
+    std::fs::copy(host_ld, ld_dir.join("ld.so")).unwrap();
+    let host_libc = ["/lib64/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("aarch64 libc present");
+    std::fs::copy(host_libc, lib_dir.join("libc.so.6")).unwrap();
+    std::os::unix::fs::symlink("usr/lib64", rootfs.join("lib64")).unwrap();
+    compile_brk_guest_with_linker(&work_dir, Some("/lib/literoot-ld/ld.so"));
+    let root_arg = rootfs.to_string_lossy().into_owned();
+    let bind = format!("{}:/bound", work_dir.display());
+    let literoot = literoot_bin().to_string_lossy().into_owned();
+    let out = Command::new("/bin/bash")
+        .args([
+            "-c",
+            "ulimit -s unlimited; exec \"$@\"",
+            "bash",
+            &literoot,
+            "--backend",
+            "ptrace",
+            "-r",
+            &root_arg,
+            "-b",
+            &bind,
+            "-w",
+            "/work",
+            "/usr/lib/literoot-ld/ld.so",
+            "/bound/brk_after_exec",
+            "stage2",
+        ])
+        .output()
+        .expect("run literoot ptrace explicit linker usrmerge guest");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success()
+            && stdout.contains(
+                "rlim_cur=18446744073709551615 \
+                 rlim_max=18446744073709551615 delta=1048576",
+            )
+            && stdout.contains("pthread=ok"),
+        "literoot ptrace explicit linker usrmerge launch must \
          be capped with a growable break: {out:?}"
     );
 }
