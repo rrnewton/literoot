@@ -25,6 +25,8 @@
 //! - `literoot: refused unsupported <kind>`, kind in [`UNSUPPORTED`]
 //! - `literoot: refused guest <kind>`, kind in [`GUEST`]
 //! - `literoot: refused launcher <token>`, token in [`LAUNCHER`]
+//! - `literoot: capped initial_stack <reason> <old_cur> <old_max>
+//!   <new_cur> <program>`, reason in [`CAP_REASONS`] (not a refusal)
 //!
 //! A log is valid for one test name only if every line parses, there is at
 //! least one `begin`, and every `begin` has a matching `end <pid> ok`.
@@ -63,6 +65,10 @@ pub const GUEST: &[&str] = &[
     "kompat_auxv",
     "fake_id_auxv",
 ];
+/// `capped initial_stack` reasons: why the initial stack cap was
+/// applied (not a refusal; the run proceeds with the limit
+/// restored after spawn).
+pub const CAP_REASONS: &[&str] = &["exact_interp", "loader_identity"];
 /// `launcher` tokens: launcher errors that refuse a run.
 pub const LAUNCHER: &[&str] = &[
     "unlimited_stack_loader",
@@ -125,6 +131,22 @@ pub fn refused_launcher(token: &'static str) {
     refusal_log::write_line(&format!("literoot: refused launcher {token}"));
 }
 
+/// `literoot: capped initial_stack <reason> <old_cur> <old_max>
+/// <new_cur> <program>`: an initial stack cap was applied (and is
+/// restored after the spawn). Goes only to the side log, never to
+/// the guest's stderr.
+pub fn capped_initial_stack(
+    token: &'static str,
+    program: &str,
+    original: (u64, u64),
+    new_cur: u64,
+) {
+    refusal_log::write_line(&format!(
+        "literoot: capped initial_stack {token} {} {} {new_cur} {program}",
+        original.0, original.1
+    ));
+}
+
 /// One parsed side-log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
@@ -132,6 +154,7 @@ pub enum Line {
     End(u32, Option<String>),
     Route(String),
     Refused(String),
+    Capped(String),
 }
 
 /// Parse one line (without its `\n`) under the closed grammar. Anything
@@ -174,6 +197,12 @@ pub fn parse(line: &str) -> Result<Line, String> {
         }
         ["refused", "guest", k] if one_of(k, GUEST) => Ok(Line::Refused(rest.to_owned())),
         ["refused", "launcher", t] if one_of(t, LAUNCHER) => Ok(Line::Refused(rest.to_owned())),
+        ["capped", "initial_stack", t, oc, om, nc, ..]
+            if one_of(t, CAP_REASONS)
+                && [oc, om, nc].iter().all(|n| n.parse::<u64>().is_ok()) =>
+        {
+            Ok(Line::Capped(rest.to_owned()))
+        }
         _ => bad(),
     }
 }

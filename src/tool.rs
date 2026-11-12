@@ -268,7 +268,9 @@ fn read_elf_interp_bounded(path: &Path) -> InterpRead {
 /// option with no value, or a slashless target (glibc looks those
 /// up through its library search, never the working directory)
 /// means no target was named.
-fn linker_target_arg(args: &[String]) -> Option<&str> {
+/// The first positional (non-option) argument under the ld.so
+/// option grammar, without the slashless-target rule.
+fn first_positional_arg(args: &[String]) -> Option<&str> {
     const VALUE_OPTIONS: &[&str] = &[
         "--argv0",
         "--audit",
@@ -288,17 +290,21 @@ fn linker_target_arg(args: &[String]) -> Option<&str> {
         "--version",
     ];
     let mut tokens = args.iter();
-    let target = loop {
+    loop {
         let token = tokens.next()?;
         if !token.starts_with("--") {
-            break token.as_str();
+            return Some(token.as_str());
         }
         if VALUE_OPTIONS.contains(&token.as_str()) {
             tokens.next()?;
         } else if !FLAG_OPTIONS.contains(&token.as_str()) {
             return None;
         }
-    };
+    }
+}
+
+fn linker_target_arg(args: &[String]) -> Option<&str> {
+    let target = first_positional_arg(args)?;
     if !target.contains('/') {
         return None;
     }
@@ -402,6 +408,159 @@ fn explicit_linker_as_main_guest_view(
         InterpRead::Uncertain => true,
         InterpRead::NotElf => false,
     }
+}
+
+/// A file's DT_SONAME, with the same bounded, non-blocking read
+/// discipline as the PT_INTERP reader. `None` when absent or not
+/// an inspectable ELF.
+fn elf_soname_bounded(path: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if !path_is_regular_file(path) {
+        return None;
+    }
+    let mut file = open_regular_nonblocking(path)?;
+    let header = read_elf_header(&mut file).ok()?;
+    let little = header[5] == 1;
+    let is64 = header[4] == 2;
+    let rd16 = |b: &[u8], little: bool| -> u16 {
+        let v: [u8; 2] = b[..2].try_into().unwrap();
+        if little { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
+    };
+    let rd32 = |b: &[u8], little: bool| -> u32 {
+        let v: [u8; 4] = b[..4].try_into().unwrap();
+        if little { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
+    };
+    let rd64 = |b: &[u8], little: bool| -> u64 {
+        let v: [u8; 8] = b[..8].try_into().unwrap();
+        if little { u64::from_le_bytes(v) } else { u64::from_be_bytes(v) }
+    };
+    let (phoff, phentsize, phnum): (u64, u64, u64) = if is64 {
+        (
+            rd64(&header[32..40], little),
+            rd16(&header[54..56], little) as u64,
+            rd16(&header[56..58], little) as u64,
+        )
+    } else {
+        (
+            rd32(&header[28..32], little) as u64,
+            rd16(&header[42..44], little) as u64,
+            rd16(&header[44..46], little) as u64,
+        )
+    };
+    let entry_min: u64 = if is64 { 40 } else { 20 };
+    if phoff == 0 || phnum == 0 || phentsize < entry_min || phentsize > 256 {
+        return None;
+    }
+    let table_len = phnum.checked_mul(phentsize)?;
+    if table_len > 65536 || file.seek(SeekFrom::Start(phoff)).is_err() {
+        return None;
+    }
+    let mut table = vec![0u8; table_len as usize];
+    file.read_exact(&mut table).ok()?;
+    let mut dynamic = None;
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    for i in 0..phnum as usize {
+        let off = i.checked_mul(phentsize as usize)?;
+        let entry = table.get(off..off.checked_add(phentsize as usize)?)?;
+        if entry.len() < entry_min as usize {
+            return None;
+        }
+        let p_type = rd32(&entry[0..4], little);
+        let (p_offset, p_vaddr, p_filesz): (u64, u64, u64) = if is64 {
+            (
+                rd64(&entry[8..16], little),
+                rd64(&entry[16..24], little),
+                rd64(&entry[32..40], little),
+            )
+        } else {
+            (
+                rd32(&entry[4..8], little) as u64,
+                rd32(&entry[8..12], little) as u64,
+                rd32(&entry[16..20], little) as u64,
+            )
+        };
+        match p_type {
+            1 => loads.push((p_vaddr, p_offset, p_filesz)),
+            2 => dynamic = Some((p_offset, p_filesz)),
+            _ => {}
+        }
+    }
+    let (dyn_off, dyn_size) = dynamic?;
+    if dyn_size > 65536 {
+        return None;
+    }
+    let ent: u64 = if is64 { 16 } else { 8 };
+    let mut strtab = None;
+    let mut soname_offset = None;
+    for i in 0..dyn_size / ent {
+        let at = dyn_off.checked_add(i.checked_mul(ent)?)?;
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut raw = [0u8; 16];
+        file.read_exact(&mut raw[..ent as usize]).ok()?;
+        let (tag, val): (i64, u64) = if is64 {
+            (rd64(&raw[0..8], little) as i64, rd64(&raw[8..16], little))
+        } else {
+            (rd32(&raw[0..4], little) as i32 as i64, rd32(&raw[4..8], little) as u64)
+        };
+        match tag {
+            0 => break,
+            5 => strtab = Some(val),
+            14 => soname_offset = Some(val),
+            _ => {}
+        }
+    }
+    let strtab_vaddr = strtab?;
+    let name_at = strtab_vaddr.checked_add(soname_offset?)?;
+    let file_offset = loads.iter().find_map(|(va, off, sz)| {
+        if name_at >= *va && name_at - va < *sz {
+            off.checked_add(name_at - va)
+        } else {
+            None
+        }
+    })?;
+    file.seek(SeekFrom::Start(file_offset)).ok()?;
+    let mut raw = vec![0u8; 256];
+    let read = file.read(&mut raw).ok()?;
+    raw.truncate(read);
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf8(raw[..end].to_vec()).ok()
+}
+
+fn is_loader_soname(soname: &str) -> bool {
+    soname.starts_with("ld-") && soname.contains(".so")
+}
+
+/// Whether the program itself is a dynamic loader, for the
+/// ptrace cap only (by design review): no PT_INTERP is
+/// checked by the caller; here the program must carry a loader
+/// SONAME (`ld-*.so*`), and the launch must name a positional
+/// argument for it to load. The in-guest refusal never uses this
+/// broader identity. Named limit: a loader whose SONAME does not
+/// start with `ld-` (possibly musl's) is not identified; a wrong
+/// cap here is cheap, since the limit is restored before the
+/// first guest instruction.
+fn loader_identity_as_main(host_prog: &Path, args: &[String]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    let gate_open = match read_initial_stack_limit() {
+        Ok(limits) => limits.rlim_cur == libc::RLIM64_INFINITY,
+        Err(_) => true,
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let gate_open = false;
+    if !gate_open || first_positional_arg(args).is_none() {
+        return false;
+    }
+    elf_soname_bounded(host_prog).is_some_and(|s| is_loader_soname(&s))
+}
+
+/// Record every initial stack cap actually applied in the side
+/// log (program, reason, original limits, capped soft limit) for
+/// suite drivers and operators to key on. Never the guest's
+/// stderr: ptrace is the default backend, so stderr output would
+/// appear on every capped dynamic launch.
+fn log_initial_cap(program: &str, reason: &'static str, original: (u64, u64)) {
+    crate::side_log::capped_initial_stack(reason, program, original, u64::MAX - 1);
 }
 
 /// Whether an interpreter string names the program: string-equal
@@ -751,11 +910,29 @@ pub fn run_guest(
                         &backend_args,
                     ));
         }
+        // The ptrace cap may also classify by loader identity
+        // The refusal above never does.
+        let mut cap_loader = has_loader;
+        let mut cap_reason = "exact_interp";
+        if !in_guest && !cap_loader {
+            let backend_args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            if loader_identity_as_main(&interp_host, &backend_args) {
+                cap_loader = true;
+                cap_reason = "loader_identity";
+            }
+        }
         cmd.current_dir(&host_cwd);
         cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
         refuse_unlimited_in_guest_loader(has_loader, in_guest)?;
-        let initial_restore = if initial_loader_cap_needed(has_loader, in_guest) {
-            cap_initial_stack_limit(&mut cfg)?
+        let initial_restore = if initial_loader_cap_needed(cap_loader, in_guest) {
+            let restore = cap_initial_stack_limit(&mut cfg)?;
+            if let Some(original) = restore {
+                log_initial_cap(&script_interp, cap_reason, original);
+            }
+            restore
         } else {
             None
         };
@@ -794,6 +971,7 @@ pub fn run_guest(
                 &guest_found,
                 command.get(1..).unwrap_or(&[]),
             )));
+    let prog_has_interp = prog_interp.is_some();
     let interp_guest = prog_interp
         // In-guest: when the host interp exists, let the kernel
         // load it and the preload arm inside the program itself.
@@ -827,9 +1005,25 @@ pub fn run_guest(
     // guest env shows PWD=<guest cwd>; bash's pwd builtin then
     // agrees — test-bind-cwd-bash-pwd).
     cmd.env("PWD", cwd_guest.to_string_lossy().as_ref());
+    // The ptrace cap may also classify by loader identity
+    // The refusal below never does.
+    let mut cap_loader = has_loader;
+    let mut cap_reason = "exact_interp";
+    if !in_guest
+        && !cap_loader
+        && !prog_has_interp
+        && loader_identity_as_main(&host_prog, command.get(1..).unwrap_or(&[]))
+    {
+        cap_loader = true;
+        cap_reason = "loader_identity";
+    }
     refuse_unlimited_in_guest_loader(has_loader, in_guest)?;
-    let initial_restore = if initial_loader_cap_needed(has_loader, in_guest) {
-        cap_initial_stack_limit(&mut cfg)?
+    let initial_restore = if initial_loader_cap_needed(cap_loader, in_guest) {
+        let restore = cap_initial_stack_limit(&mut cfg)?;
+        if let Some(original) = restore {
+            log_initial_cap(&guest_prog, cap_reason, original);
+        }
+        restore
     } else {
         None
     };
@@ -1515,8 +1709,8 @@ fn parse_shebang_pub(image: &[u8]) -> Option<(String, Option<String>)> {
 #[cfg(test)]
 mod explicit_linker_tests {
     use super::{
-        interp_names_program, linker_target_arg, open_regular_nonblocking, path_is_regular_file,
-        read_elf_header, read_elf_interp_bounded, InterpRead,
+        elf_soname_bounded, interp_names_program, linker_target_arg, open_regular_nonblocking,
+        path_is_regular_file, read_elf_header, read_elf_interp_bounded, InterpRead,
     };
     use std::path::PathBuf;
 
@@ -1766,6 +1960,21 @@ mod explicit_linker_tests {
             chunks: [Ok(full[..40].to_vec())].into_iter().collect(),
         };
         assert_eq!(read_elf_header(&mut reader), Err(InterpRead::Uncertain));
+    }
+
+    #[test]
+    fn soname_reader_zero_phentsize_is_none_not_panic() {
+        // 64-byte ELF64 header with e_phoff=64, e_phentsize=0,
+        // e_phnum=1: the SONAME reader must refuse, not slice a
+        // zero-length entry.
+        let mut img = vec![0u8; 64];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2;
+        img[5] = 1;
+        img[32..40].copy_from_slice(&64u64.to_le_bytes());
+        img[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let target = temp_file("zero-phentsize", &img);
+        assert_eq!(elf_soname_bounded(&target), None);
     }
 
     #[test]
