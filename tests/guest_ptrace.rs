@@ -214,7 +214,7 @@ int main(void) {
 /// build's "trap" backend is the liteinst preload with
 /// site patching off; the TrapHost flavour shares the
 /// same RootfsTool refusal and is covered by the row
-/// binaries in the lane evidence.
+/// binaries in evidence kept outside the repository.
 fn run_trap_guest(src_bin: &std::path::Path, guest_name: &str) -> Option<Output> {
     run_trap_guest_with(src_bin, guest_name, &[], &[])
 }
@@ -300,7 +300,7 @@ fn guest_ptrace_refused_fast_trap_backend() {
 /// to the kernel, so ATTACH on a pid that cannot exist
 /// gets the kernel's ESRCH (guest exit 42), not a Tool
 /// EPERM. Refusing every request on this backend (the
-/// pre-koe10 behaviour) fails this test.
+/// behaviour before d448256b) fails this test.
 #[test]
 fn guest_ptrace_scope_ptrace_backend_kernel_served() {
     let dir = std::env::temp_dir().join(format!("literoot-guestptrace-scope-{}", std::process::id()));

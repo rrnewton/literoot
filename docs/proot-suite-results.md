@@ -212,7 +212,7 @@ kernel 7.1.3, gcc 11.5/glibc 2.34.
 
 Versions (aligned run — launcher and preload from the same Reverie):
 
-- literoot: `3e25697` (PR #1 head
+- literoot: `3e25697` (https://github.com/rrnewton/literoot/pull/1 head
   `031dc11` + docs/pin commits; src identical to PR head)
 - Reverie (launcher libs + preload): `778a446cd3283ecd1c220792071a84b27c14db56`
   for both `literoot/Cargo.toml` and `literoot/preload/Cargo.toml`
@@ -302,7 +302,7 @@ have to be supported:
   **environment** (suite-rootfs path length).
 - `test-execve-eacces-enoexec`: upstream test bug
   (`extern char *environ[]`), fails natively on this toolchain;
-  see the reclassification note in this doc's history (PR #1 doc).
+  see the reclassification note in this doc's history (https://github.com/rrnewton/literoot/pull/1).
 
 Logs (kept outside the repository): `suite-liteinst.log`,
 `suite-trap.log` (pre-alignment run, identical counts) and the aligned

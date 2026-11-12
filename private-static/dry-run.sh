@@ -83,14 +83,14 @@ else
     echo "ok: no preload constructor (LITEROOT_INIT) in the archive"
 fi
 if grep -q 'literoot_mapped_initial_entry' <<<"$symbols"; then
-    echo "FAIL: literoot_mapped_initial_entry is present; the first generation is dh-tc7os work" >&2
+    echo "FAIL: literoot_mapped_initial_entry is present; the first generation is later work" >&2
     fail=1
 else
-    echo "ok: no first-generation entry (dh-tc7os)"
+    echo "ok: no first-generation entry"
 fi
 [ "$fail" -eq 0 ] || exit 1
 echo "dry run ok: $archive"
 if [ "$link" = --link ]; then
-    echo "refused: linking and publishing a literoot private runtime image needs dh-tc7os (Reverie's factory has no literoot first generation, and no supervisor transfers a literoot image yet)" >&2
+    echo "refused: linking and publishing a literoot private runtime image needs later factory work (Reverie's factory has no literoot first generation, and no supervisor transfers a literoot image yet)" >&2
     exit 3
 fi

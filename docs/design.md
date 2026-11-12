@@ -544,7 +544,7 @@ is staged. That gap is stated in every results table until closed.
 | Crate | What literoot needs | Published | POC pin |
 |---|---|---|---|
 | `liteinst` (ex-`liteinst2`) | patcher/planner/trampoline/scanner + guard-signal runtime; quiescent + emission later (M3 pre-patch) | crates.io `liteinst` **0.2.0** (+ subcrates 0.2.0/0.2.1); `liteinst2` 0.2.1 is a deprecation pointer | git rev `d64dc833418a4c265803645653b8f597d0f25060` via Reverie (below) |
-| `reverie` (`reverie-core` 0.5.4), `reverie-inguest`, `reverie-liteinst` | Tool/Guest traits, in-guest runtime, `LiteinstBackend` | **Not on crates.io as a usable set** (name-reservation placeholders only) | git `reverie` @ `ac71ee9c844def23714c22f0a37f92bb1e838817` (slot head); `liteinst2` @ `46e6e8f3cc6a5cfce0e4b1bf4d7aec93a0e0f336` available locally |
+| `reverie` (`reverie-core` 0.5.4), `reverie-inguest`, `reverie-liteinst` | Tool/Guest traits, in-guest runtime, `LiteinstBackend` | **Not on crates.io as a usable set** (name-reservation placeholders only) | git `reverie` @ `ac71ee9c844def23714c22f0a37f92bb1e838817` (then-current head); `liteinst2` @ `46e6e8f3cc6a5cfce0e4b1bf4d7aec93a0e0f336` available locally |
 | `reverie-liteinst` → liteinst edge | the binding itself | — | pins liteinst2 git `d64dc83` (2026-10-10), **1,971 commits behind** liteinst 0.2.0 — "liteinst can do X" ≠ "a Reverie tool gets X" |
 
 **Unreleased pieces literoot needs (exact list):**
@@ -600,8 +600,8 @@ a reproducibility story.
 
 ## 12. M1 POC scope and exit criteria
 
-The POC began as a standalone tree, before the `rrnewton/literoot`
-repository existed. POC = minimum `-r/-b/-w` +
+The POC began as a standalone tree before it was maintained in
+this repository. POC = minimum `-r/-b/-w` +
 Tool (§4.1 core subset: `openat/newfstatat/access/readlinkat/
 execve/chdir/getcwd` + fd table) + seccomp-trap net + oracle
 harness (§9 comparators 1-subset + 3, comparator 2 vs

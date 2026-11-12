@@ -9,7 +9,7 @@
 #   private runtime image is built for.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
-want='literoot-preload: the mapped-initial entry needs dh-tc7os (the factory'"'"'s literoot first generation is not defined on Reverie main)'
+want='literoot-preload: the mapped-initial entry needs a literoot first generation in the Reverie factory, which Reverie main does not define yet'
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 RUSTFLAGS="-C target-feature=-crt-static" cargo check --offline \
@@ -18,12 +18,12 @@ RUSTFLAGS="-C target-feature=-crt-static" cargo check --offline \
 rc=$?
 errors=$(grep -E '^error(\[E[0-9]+\])?: ' "$out" | grep -v '^error: could not compile ')
 if [ "$rc" -eq 0 ]; then
-    echo "FAIL: mapped-initial compiled; drop the dh-tc7os refusal only with dh-tc7os on main" >&2
+    echo "FAIL: mapped-initial compiled; drop the first-generation refusal only once Reverie main defines that generation" >&2
     exit 1
 fi
 if [ "$errors" != "error: $want" ]; then
-    echo "FAIL: expected exactly the dh-tc7os refusal, got:" >&2
+    echo "FAIL: expected exactly the first-generation refusal, got:" >&2
     printf '%s\n' "$errors" >&2
     exit 1
 fi
-echo "ok: mapped-initial refuses by name (dh-tc7os)"
+echo "ok: mapped-initial refuses by name (no first generation yet)"

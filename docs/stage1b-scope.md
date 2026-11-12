@@ -3,7 +3,7 @@
 Status: DESIGN-ONLY scope from literoot (the consumer), 2026-11-05.
 No reverie-inguest code is proposed here line-by-line; this pins
 the interface literoot needs, the gate, failure modes, witnesses,
-and touch estimate so an implementation lane can start cold.
+and touch estimate so an implementer can start cold.
 Pinned tree: reverie @ ac71ee9. Nobody was assigned to this item
 as of 2026-11-05.
 
@@ -121,7 +121,7 @@ flag), otherwise today's typed refusal remains.
 Estimate class: 1–2k lines touched/added plus tests; the
 unknown is successor arming order vs ld.so, not volume.
 
-## 6. Recommended lane
+## 6. Recommended owner
 
 **The gate/launcher side** (the preferred owner): the work is
 preload/launcher-side Reverie mechanics, and spike context on the

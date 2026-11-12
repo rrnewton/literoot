@@ -20,8 +20,8 @@
 // Reverie main; running it also waits on that work.
 #[cfg(feature = "mapped-initial")]
 compile_error!(
-    "literoot-preload: the mapped-initial entry needs dh-tc7os (the factory's \
-     literoot first generation is not defined on Reverie main)"
+    "literoot-preload: the mapped-initial entry needs a literoot first generation \
+     in the Reverie factory, which Reverie main does not define yet"
 );
 
 #[path = "../../src/arch.rs"]

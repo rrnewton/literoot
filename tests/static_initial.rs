@@ -9,8 +9,8 @@
 //! Reverie's A6 static-admission gate, because no
 //! preload can load into a static image and the exec
 //! route that would admit it (private initializer +
-//! Ready/entry + successor admission, Reverie PR #1327
-//! chain) is not in the pinned Reverie. The trap canary
+//! Ready/entry + successor admission, the chain of
+//! https://github.com/rrnewton/reverie/pull/1327) is not in the pinned Reverie. The trap canary
 //! is therefore quarantined with #[ignore] as a known
 //! failure: its body stays strict (exact guest exit 7
 //! plus marker content, never accepting the A6 refusal),
@@ -103,7 +103,8 @@ fn static_initial_ptrace_control() {
 
 /// Canary: the same static initial guest must run under
 /// the in-guest trap backend once static admission lands
-/// (Reverie exec route, PR #1327 chain).
+/// (Reverie exec route, the
+/// https://github.com/rrnewton/reverie/pull/1327 chain).
 /// Today it is refused pre-spawn by the A6 gate
 /// ("static executables are not supported by the
 /// in-guest backend (no PT_INTERP)"), so this test is
@@ -111,7 +112,7 @@ fn static_initial_ptrace_control() {
 /// accept the refusal. Un-ignore it when the pin gains
 /// a Ready-capable private initializer.
 #[test]
-#[ignore = "known failure: static initial admission blocked on Reverie exec route (PR #1327), bead dh-35ic7"]
+#[ignore = "known failure: static initial admission blocked on Reverie exec route (https://github.com/rrnewton/reverie/pull/1327)"]
 fn static_initial_trap_canary() {
     let preload = resolve_preload();
     assert!(

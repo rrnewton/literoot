@@ -1260,8 +1260,8 @@ impl Tool for RootfsTool {
             // initial-stack walk below does not patch the guest's auxv, which
             // therefore differs from the ptrace backend's. The walk still runs,
             // from the live stack pointer, and can write the word after any
-            // 11/12/13/14 (16 with zero_hwcap) it meets there (a follow-up
-            // gates it). Each is keyed once per exec (C3 amendments
+            // 11/12/13/14 (16 with zero_hwcap) it meets there (gating the
+            // walk is a follow-up). Each is keyed once per exec (C3 amendments
             // kompat_auxv and fake_id_auxv). `zero_hwcap` needs `-k`, so
             // kompat_auxv covers it.
             if guest.config().kernel_release.is_some() {

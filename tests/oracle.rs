@@ -358,7 +358,7 @@ fn task_b_named_cases() {
 /// the host root: literoot does not chroot, so the Tool's
 /// root link ("/") is spliced and re-rooted. Passing the
 /// magic link through unspliced listed host entries (the
-/// koe9 regression). The marker file exists only in the
+/// regression fixed in d448256b). The marker file exists only in the
 /// rootfs; "home" exists only on the host root.
 #[test]
 fn proc_self_root_lists_rootfs_root() {

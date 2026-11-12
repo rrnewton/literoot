@@ -1619,7 +1619,7 @@ fn classify_kill_wait_error(error: &reverie::Error) -> KillWaitErrorClass {
 }
 
 /// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
-/// the running binary, else the slot build output.
+/// the running binary, else this checkout's build output.
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
 fn find_preload() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
