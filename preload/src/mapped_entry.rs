@@ -42,7 +42,7 @@ unsafe fn terminal() -> ! {
 
 /// Numeric slice preconditions only, via the shared
 /// `reverie-loader` predicate re-exported through
-/// `mapped_initial` (its tests execute on GNU; see dh-axoec).
+/// `mapped_initial` (Reverie main; its tests execute on GNU).
 fn valid_input_range(address: usize, bytes: usize) -> bool {
     mapped_initial::valid_mapped_input_range(address, bytes)
 }
@@ -131,16 +131,29 @@ core::arch::global_asm!(".protected literoot_mapped_successor_entry");
 mod tests {
     use super::*;
 
+    /// The input cap is Reverie's `handoff::MAX_BYTES`, re-exported as
+    /// `MAPPED_INPUT_MAX_BYTES`. Reverie 0134d15cf9e raised it from 1 MiB to
+    /// 6_348_827 (header + maximum tables + maximum strings + auxv slack;
+    /// reverie-loader handoff.rs). The literal pins that value, so a
+    /// change in Reverie fails here and is reviewed rather than followed.
+    const INPUT_CAP: usize = 6_348_827;
+
+    #[test]
+    fn mapped_entry_input_cap_is_reveries_handoff_bound() {
+        assert_eq!(mapped_initial::MAPPED_INPUT_MAX_BYTES, INPUT_CAP);
+    }
+
     #[test]
     fn mapped_entry_bounds_accept_complete_header_and_cap() {
         let address = 0x6000_1000_0000;
         assert!(valid_input_range(address, 960));
         assert!(valid_input_range(address, 1024 * 1024));
+        assert!(valid_input_range(address, INPUT_CAP));
     }
 
     /// HLMLAY01 decoded and checked as Reverie's producer does in
     /// `AuditedRuntimeImage::new` (reverie-inguest
-    /// launcher/exec_stop/producer.rs:251-274 at 073e61ea): twelve
+    /// launcher/exec_stop/producer.rs:251-274 at ac8b35c2): twelve
     /// little-endian words from the 96 bytes. Words 3-5 are P's
     /// `handoff::{VERSION, HEADER_BYTES, MAX_BYTES}`, which
     /// `mapped_initial` re-exports under these names; word 10 is P's
@@ -152,8 +165,10 @@ mod tests {
         let raw: Vec<u8> = MAPPED_LAYOUT.iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(raw.len(), 96);
         let mut d = [0u64; 12];
-        for (out, row) in d.iter_mut().zip(raw.chunks_exact(8)) {
-            *out = u64::from_le_bytes(row.try_into().unwrap());
+        let (rows, rest) = raw.as_chunks::<8>();
+        assert!(rest.is_empty());
+        for (out, row) in d.iter_mut().zip(rows) {
+            *out = u64::from_le_bytes(*row);
         }
         assert_eq!(
             d[..6],
@@ -180,7 +195,7 @@ mod tests {
             (address + 1, 960),
             (address, 0),
             (address, 959),
-            (address, 1024 * 1024 + 1),
+            (address, INPUT_CAP + 1),
             (usize::MAX - 7, 960),
             ((isize::MAX as usize) & !7, 960),
             (address, usize::MAX),

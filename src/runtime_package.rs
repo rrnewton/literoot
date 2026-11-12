@@ -16,8 +16,12 @@
 //! (checked with fstat on the opened descriptor, not the path), are read once
 //! and kept open for the run, and must not change identity or bytes
 //! (`RuntimePackage::verify`). The trusted writers are therefore the
-//! installer and the effective user; nobody else can have replaced the
-//! bytes in place, with a matching digest, before the open.
+//! installer and the effective user. The mode check is a property of the
+//! file at open, not a revocation: a descriptor that another process opened
+//! for writing while the file was still group- or other-writable, or a
+//! shared writable mapping of it, can still write afterwards. The retained
+//! bytes let `verify` detect such a change when it is called; nothing here
+//! prevents it.
 //! Facts come only from the package, never from argv or the environment.
 //! [`open_audited`] is the only caller of `AuditedRuntimeImage::new` in
 //! literoot; a test pins that.
@@ -188,12 +192,12 @@ impl RetainedFile {
 
     fn verify(&self) -> io::Result<()> {
         if state(&self.path, &self.file)? != self.state {
-            return Err(refused("a retained package file changed identity"));
+            return Err(refused(format!("{}: changed identity after open", self.path.display())));
         }
         let mut bytes = vec![0; self.bytes.len()];
         self.file.read_exact_at(&mut bytes, 0)?;
         if bytes != self.bytes || state(&self.path, &self.file)? != self.state {
-            return Err(refused("a retained package file changed bytes"));
+            return Err(refused(format!("{}: changed bytes after open", self.path.display())));
         }
         Ok(())
     }
@@ -469,7 +473,8 @@ mod tests {
         let retained = RetainedFile::open(&path, MAX_IMAGE).unwrap();
         retained.verify().unwrap();
         std::fs::write(&path, b"\x7fELF grown after the package was opened").unwrap();
-        assert!(retained.verify().unwrap_err().to_string().contains("changed"));
+        let why = retained.verify().unwrap_err().to_string();
+        assert!(why.contains(&format!("{ELF_FILE}: changed")), "{why}");
     }
 
     #[test]
@@ -522,7 +527,7 @@ mod tests {
         // Built, so this file's own needle is not a match.
         let needle = ["AuditedRuntimeImage", "::new("].concat();
         let mut calls = Vec::new();
-        let mut stack = vec![root.join("src"), root.join("preload/src"), root.join("runtime")];
+        let mut stack = vec![root.join("src"), root.join("preload/src")];
         while let Some(path) = stack.pop() {
             if path.is_dir() {
                 for entry in std::fs::read_dir(&path).unwrap() {

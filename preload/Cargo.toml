@@ -37,6 +37,12 @@ mapped-successor = [
     "reverie-liteinst/loader-private-runtime",
     "reverie-inguest/loader-private-runtime",
 ]
+# Mapped first image (initial generation): dh-tc7os work. Enabling it fails
+# to compile by name (src/lib.rs) until Reverie's factory defines literoot's
+# first generation; scripts/check-mapped-initial-refusal.sh pins that. So
+# `cargo ... --all-features` on this crate fails by design: that is the refusal,
+# not breakage. Reverie's factory passes exactly ["mapped-successor"].
+mapped-initial = ["mapped-successor"]
 # Watched exec (W6a spawn swap): allows this preload build to
 # arm TrapOptions.exec_watch when the launcher asserted watched
 # mode in the tool selector. Default off; an asserted watched
@@ -55,10 +61,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 
 
 
-
-[lints.rust]
-# Set only by an evidence build against dh-axoec (see src/lib.rs).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(literoot_dh_axoec)"] }
 
 [patch.crates-io]
 liteinst = { git = "https://github.com/rrnewton/liteinst2", rev = "34901a29a0070f30398f237839a567720c739af5" }
