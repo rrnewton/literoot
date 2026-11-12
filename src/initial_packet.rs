@@ -454,10 +454,12 @@ fn soft_nofile() -> Option<u64> {
 /// where `connect` put it when no number is free), refuses
 /// [`ConnectError::FdMove`] and closes the connection. This is stricter
 /// than Reverie's ordinary connection, which accepts every block down to 3.
-/// If Reverie's placement call itself errors, it returns with a number
-/// still open and does not say which (the connect-time number or the moved
-/// one), so that number is not closed here; the refusal is terminal for the
-/// image either way.
+/// If Reverie's placement call itself errors, it has made one close attempt
+/// on the number it still held (the connect-time number, or the moved one)
+/// and returns its original error (reverie-inguest
+/// `protect::place_runtime_fd_and` at 52fcfde3), so nothing is left to close
+/// here. Only a seccomp filter that fakes or refuses that close can keep the
+/// number open, and the refusal is terminal for the image either way.
 ///
 /// The placement records nothing. Reverie's installation reserves the
 /// coordinator descriptor exactly once, after `from_live_client`
@@ -999,8 +1001,8 @@ mod tests {
     #[test]
     fn digest_mismatch_texts_are_reveries() {
         // reverie-rpc-transport initial_image.rs:97 and blocking_client.rs:410
-        // at c5eff334 (unchanged since ac8b35c2). A rewording there fails this, rather than silently
-        // turning the refusal into Transport.
+        // at 52fcfde3 (unchanged since ac8b35c2). A rewording there fails
+        // this, rather than silently turning the refusal into Transport.
         let ack = classify(RpcError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "InitialImage acknowledgement config digest mismatch",

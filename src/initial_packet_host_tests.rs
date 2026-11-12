@@ -272,3 +272,125 @@ fn placement_leaves_the_single_reservation_to_installation() {
         }
     });
 }
+
+/// Installs a seccomp filter under which syscall `number` fails with EPERM,
+/// without running, when the low half of its argument `argument` is `value`.
+fn refuse(number: libc::c_long, argument: u32, value: u32) -> Result<(), String> {
+    let load = |k: u32| libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let skip_unless = |k: u32, skip: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt: 0,
+        jf: skip,
+        k,
+    };
+    let ret = |k: u32| libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    // seccomp_data: nr at 0, args from 16, eight bytes each.
+    let mut program = [
+        load(0),
+        skip_unless(number as u32, 3),
+        load(16 + 8 * argument),
+        skip_unless(value, 1),
+        ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    let fprog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: prctl and seccomp read only the arguments given; `fprog`
+    // points at `program`, which outlives both calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
+        }
+        if libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &raw const fprog,
+        ) != 0
+        {
+            return Err(format!("seccomp: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+/// How many descriptors this process has open (the directory's own one
+/// included, in every count alike).
+fn open_count() -> Result<usize, String> {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .map_err(|e| format!("read /proc/self/fd: {e}"))
+}
+
+/// When Reverie's placement itself fails, it closes the descriptor it still
+/// holds before returning (reverie-inguest `protect::place_runtime_fd_and`
+/// at 52fcfde3), so a refused connect leaves nothing open. Here it cannot
+/// block signals, so it fails before moving the connection: the
+/// connect-time socket is closed.
+#[test]
+fn a_placement_that_cannot_block_signals_leaves_no_descriptor() {
+    let (_, hard) = limits();
+    in_child(hard.min(2048), || {
+        let (_l, path) = listener("noblock")?;
+        let before = open_count()?;
+        let free = lowest_free();
+        refuse(libc::SYS_rt_sigprocmask, 0, libc::SIG_BLOCK as u32)?;
+        match connect_coordinator(&path) {
+            Err(ConnectError::FdMove {
+                errno: libc::EPERM,
+                placed: -1,
+            }) => {
+                check(open_count()? == before, "a descriptor leaked".into())?;
+                check(
+                    lowest_free() == free,
+                    "the connect-time number stayed open".into(),
+                )
+            }
+            other => Err(format!("expected FdMove with EPERM, got {other:?}")),
+        }
+    });
+}
+
+/// The same after the move: the kernel will not say whether the old number
+/// is still open (`F_GETFD` refused), so the placement fails and closes the
+/// moved number; the move had closed the old one. `is_open` uses `F_GETFD`,
+/// so this counts descriptors instead.
+#[test]
+fn a_placement_that_fails_after_the_move_leaves_no_descriptor() {
+    let (_, hard) = limits();
+    assert!(
+        hard >= 1026,
+        "needs a hard RLIMIT_NOFILE of at least 1026 to leave a number at 1025; the runner's is {hard}"
+    );
+    in_child(hard.min(2048), || {
+        let (_l, path) = listener("aftermove")?;
+        let before = open_count()?;
+        let free = lowest_free();
+        refuse(libc::SYS_fcntl, 1, libc::F_GETFD as u32)?;
+        match connect_coordinator(&path) {
+            Err(ConnectError::FdMove {
+                errno: libc::EPERM,
+                placed: -1,
+            }) => {
+                check(open_count()? == before, "a descriptor leaked".into())?;
+                check(
+                    lowest_free() == free,
+                    "the connect-time number stayed open".into(),
+                )
+            }
+            other => Err(format!("expected FdMove with EPERM, got {other:?}")),
+        }
+    });
+}

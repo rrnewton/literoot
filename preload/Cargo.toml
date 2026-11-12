@@ -9,7 +9,7 @@ description = "In-guest preload hosting the literoot RootfsTool (Reverie liteins
 name = "literoot_preload"
 crate-type = ["cdylib"]
 
-# Pinned Reverie rev: c5eff334873f7a36747242363fe3bd95b60d7107 (Reverie main).
+# Pinned Reverie rev: 52fcfde386bdec275bd3d23a2ceaa1b1e7c59977 (Reverie main).
 [features]
 default = ["liteinst"]
 liteinst = ["dep:reverie-liteinst"]
@@ -42,8 +42,16 @@ mapped-successor = [
 # to compile by name (src/lib.rs) until Reverie's factory defines literoot's
 # first generation; scripts/check-mapped-initial-refusal.sh pins that. So
 # `cargo ... --all-features` on this crate fails by design: that is the refusal,
-# not breakage. Reverie's factory passes exactly ["mapped-successor"].
+# not breakage.
 mapped-initial = ["mapped-successor"]
+# The private successor image's own build: `mapped-successor` plus Reverie's
+# `private-libc-exports`, which exports the private runtime's C allocator
+# (malloc and its aliases) and its strong __init_tls under their libc names.
+# Reverie's factory builds exactly ["mapped-successor-image"]
+# (selected_initializers.rs, LITEROOT). literoot's own musl tests and checks
+# build `mapped-successor` alone: an ordinary musl program that links those
+# exports dies before main.
+mapped-successor-image = ["mapped-successor", "reverie-inguest/private-libc-exports"]
 # Watched exec (W6a spawn swap): allows this preload build to
 # arm TrapOptions.exec_watch when the launcher asserted watched
 # mode in the tool selector. Default off; an asserted watched
@@ -52,10 +60,10 @@ mapped-initial = ["mapped-successor"]
 exec-watch = []
 
 [dependencies]
-reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "c5eff334873f7a36747242363fe3bd95b60d7107" }
-reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "c5eff334873f7a36747242363fe3bd95b60d7107", default-features = false, features = ["liteinst"], optional = true }
-reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "c5eff334873f7a36747242363fe3bd95b60d7107", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
-reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "c5eff334873f7a36747242363fe3bd95b60d7107", optional = true }
+reverie = { package = "reverie-core", git = "https://github.com/rrnewton/reverie", rev = "52fcfde386bdec275bd3d23a2ceaa1b1e7c59977" }
+reverie-liteinst = { git = "https://github.com/rrnewton/reverie", rev = "52fcfde386bdec275bd3d23a2ceaa1b1e7c59977", default-features = false, features = ["liteinst"], optional = true }
+reverie-inguest = { git = "https://github.com/rrnewton/reverie", rev = "52fcfde386bdec275bd3d23a2ceaa1b1e7c59977", default-features = false, features = ["launcher", "coordinator-rpc", "rcb-clock"], optional = true }
+reverie-rpc-transport = { git = "https://github.com/rrnewton/reverie", rev = "52fcfde386bdec275bd3d23a2ceaa1b1e7c59977", optional = true }
 libc = "0.2.186"
 # The initial-image packet's config wire fingerprint (src/initial_packet.rs).
 sha2 = { version = "0.10.9", optional = true }
