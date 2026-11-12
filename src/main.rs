@@ -17,6 +17,11 @@ mod side_log;
 mod exec_state;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
+#[cfg(all(feature = "private-runtime", feature = "tool"))]
+#[cfg_attr(not(test), allow(dead_code))] // Row e/f's launcher is the first non-test caller.
+mod initial_packet;
+#[cfg(all(test, feature = "private-runtime", feature = "tool"))]
+mod initial_packet_host_tests;
 #[cfg(feature = "private-runtime")]
 #[allow(dead_code)] // Row f's static route is the first production caller.
 mod runtime_package;

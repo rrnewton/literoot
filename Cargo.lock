@@ -644,6 +644,7 @@ dependencies = [
  "reverie-inguest",
  "reverie-liteinst",
  "reverie-ptrace",
+ "reverie-rpc-transport",
  "serde",
  "serde_json",
  "sha2",

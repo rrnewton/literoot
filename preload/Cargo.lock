@@ -573,6 +573,7 @@ dependencies = [
  "reverie-liteinst",
  "reverie-rpc-transport",
  "serde",
+ "sha2",
 ]
 
 [[package]]

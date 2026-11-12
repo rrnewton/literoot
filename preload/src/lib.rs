@@ -29,6 +29,16 @@ mod arch;
 mod exec_stage;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 mod mapped_entry;
+// The initial-image packet: the image decodes and admits; the encoder and
+// the launcher-side helpers are row e/f's.
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+#[path = "../../src/initial_packet.rs"]
+#[allow(dead_code)]
+mod initial_packet;
+// `pub` so the initializer is reachable from the crate root, which keeps it
+// out of the dead-code lint before the G2 entry calls it.
+#[cfg(all(feature = "mapped-successor", target_env = "musl"))]
+pub mod initial_image;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
 #[path = "../../src/shared_record.rs"]
@@ -400,8 +410,9 @@ pub unsafe fn literoot_mapped_successor_initialize(
     let packet = mapped
         .successor_init_packet()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.name()))?;
-    let stream = std::os::unix::net::UnixStream::connect(&coordinator)?;
-    let stream = reverie_inguest::guest::rpc::move_ordinary_coordinator_stream(stream)?;
+    // The same connector as the mapped first image: connect, then place in
+    // the runtime's top band, or refuse (initial_packet::connect_coordinator).
+    let stream = crate::initial_packet::connect_coordinator(&coordinator)?;
     let tid = reverie::Pid::from_raw(mapped.native_tid());
     let request = SuccessorRequest {
         ticket: packet.redemption(),
