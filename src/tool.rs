@@ -104,15 +104,6 @@ enum InterpRead {
     Uncertain,
 }
 
-/// Read a file's PT_INTERP with bounded, non-blocking I/O. The
-/// path comes from a guest-controlled argument: it is opened only
-/// as a regular file, with `O_NONBLOCK | O_NOCTTY` and a
-/// descriptor re-check (the pinned backend's `open_regular`
-/// protocol, which also closes the stat/open replacement race),
-/// and only the ELF header, the program-header table (capped at
-/// 64 KiB, the kernel's own table bound), and the interpreter
-/// string (capped at 4096 bytes) are read — never the whole file.
-/// Both ELF classes are read.
 /// Read an ELF header prefix from `reader`: retries
 /// `Interrupted`, and once the ELF magic has been seen, any other
 /// read error (or a short EOF) is `Uncertain`, never `NotElf` —
@@ -149,6 +140,15 @@ fn read_elf_header<R: std::io::Read>(reader: &mut R) -> Result<[u8; 64], InterpR
     Ok(header)
 }
 
+/// Read a file's PT_INTERP with bounded, non-blocking I/O. The
+/// path comes from a guest-controlled argument: it is opened only
+/// as a regular file, with `O_NONBLOCK | O_NOCTTY` and a
+/// descriptor re-check (the pinned backend's `open_regular`
+/// protocol, which also closes the stat/open replacement race),
+/// and only the ELF header, the program-header table (capped at
+/// 64 KiB, the kernel's own table bound), and the interpreter
+/// string (capped at 4096 bytes) are read — never the whole file.
+/// Both ELF classes are read.
 fn read_elf_interp_bounded(path: &Path) -> InterpRead {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
@@ -1743,6 +1743,16 @@ mod explicit_linker_tests {
             chunks: [Err(std::io::Error::other("injected failure"))]
                 .into_iter()
                 .collect(),
+        };
+        assert_eq!(read_elf_header(&mut reader), Err(InterpRead::NotElf));
+    }
+
+    #[test]
+    fn header_read_tiny_eof_is_not_elf() {
+        // Fewer than 4 bytes before EOF: the magic was never
+        // identified, so this is NotElf, not Uncertain.
+        let mut reader = SeqReader {
+            chunks: [Ok(vec![0x7f, b'E'])].into_iter().collect(),
         };
         assert_eq!(read_elf_header(&mut reader), Err(InterpRead::NotElf));
     }
