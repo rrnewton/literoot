@@ -259,27 +259,85 @@ fn liteinst_true_guest_exits_zero() {
     );
 }
 
-/// The negative fixture: the same rootfs with the guest binary
-/// truncated must NOT run. (Omitting a staged library is not a
-/// valid negative here: literoot supplies the loader itself and
-/// its default host==guest binds rescue libraries from the host
-/// root.) A staging regression that copies nothing turns the
-/// positive test red (no guest in the rootfs at all); this one
-/// pins that a broken guest is reported, not passed over.
+/// The negative fixture: stage the rootfs exactly as the
+/// positive test does (interpreter included), prove the intact
+/// guest runs, then truncate only the guest binary and require a
+/// failure. The control makes the failure attributable to the
+/// truncation, not to the backend, preload, or staging.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn liteinst_true_guest_missing_library_fails() {
+fn liteinst_true_guest_truncated_guest_fails() {
     let Some(preload) = preload_or_skip() else { return };
     let dir = std::env::temp_dir().join(format!("literoot-smoke-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    stage_true_rootfs(&dir, None, true);
+    stage_true_rootfs(&dir, None, false);
+    let intact = run_liteinst_true(&dir, &preload);
+    assert!(
+        intact.status.success(),
+        "control: intact staged guest must run first: {intact:?}"
+    );
     std::fs::write(dir.join("bin/true"), b"\x7fELF").unwrap();
     let out = run_liteinst_true(&dir, &preload);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !out.status.success(),
         "liteinst with a truncated guest binary must fail, got success: {out:?}"
+    );
+}
+
+/// The staging derivation itself: the guest's PT_INTERP is staged
+/// at its exact guest path and every direct DT_NEEDED is staged
+/// under both loader directories. (Only the guest's direct
+/// DT_NEEDED entries are resolved, from a fixed list of host
+/// library directories, and each found file is copied into both
+/// directories regardless of its origin directory; transitive
+/// dependencies and RUNPATH are not resolved.)
+#[test]
+fn liteinst_fixture_derives_guest_libraries() {
+    let dir = std::env::temp_dir().join(format!("literoot-smoke-derive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let needed = stage_true_rootfs(&dir, None, false);
+    let image = std::fs::read("/bin/true").unwrap_or_else(|_| std::fs::read("/usr/bin/true").unwrap());
+    let (interp, parsed_needed) = elf_interp_and_needed(&image);
+    assert_eq!(needed, parsed_needed);
+    assert!(!needed.is_empty(), "guest must have direct DT_NEEDED entries");
+    if let Some(interp) = interp {
+        assert!(
+            dir.join(interp.trim_start_matches('/')).exists(),
+            "PT_INTERP {interp} must be staged at its exact guest path"
+        );
+    }
+    for lib in &needed {
+        assert!(dir.join("lib64").join(lib).exists(), "{lib} must be staged under lib64");
+        assert!(
+            dir.join("usr/lib64").join(lib).exists(),
+            "{lib} must be staged under usr/lib64"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On aarch64 the in-guest LiteInst runtime refuses guests by
+/// name today. Pin that refusal (exit 125 with its text) so the
+/// day ARM support lands, this test flips and the x86_64-only
+/// positive tests can be re-scoped.
+#[cfg(all(target_arch = "aarch64", feature = "run"))]
+#[test]
+fn liteinst_true_guest_aarch64_named_refusal() {
+    let Some(preload) = preload_or_skip() else { return };
+    let dir = std::env::temp_dir().join(format!("literoot-smoke-armrefusal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    stage_true_rootfs(&dir, None, false);
+    let out = run_liteinst_true(&dir, &preload);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.code() == Some(125)
+            && stderr.contains("in-guest LiteInst runtime is not supported on aarch64"),
+        "liteinst on aarch64 must refuse by name today: {out:?}"
     );
 }
 
