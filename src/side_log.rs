@@ -1,7 +1,8 @@
 //! The launcher side log (`--refusal-log <path>`): one file
-//! the launcher owns, into which every literoot refusal is written as one line of a
-//! closed grammar, so a suite driver can tell "nothing was refused" from
-//! "something was refused" and from "not measured".
+//! the launcher owns, into which refusals and initial-stack cap
+//! records are written as one line each of a closed grammar, so a
+//! suite driver can tell "nothing was refused" from "something was
+//! refused" and from "not measured".
 //!
 //! The launcher opens the file before anything can refuse or spawn:
 //! append and create (`O_WRONLY|O_APPEND|O_CREAT`; std adds `O_CLOEXEC`),
@@ -417,6 +418,32 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn strict_decoder_rejects_noncanonical_forms() {
+        // Lowercase hex, an encoded safe-set byte, and truncated
+        // or malformed escapes are not the canonical encoding the
+        // writer produces, so the decoder refuses them.
+        for bad in ["%2f", "%41", "%+F", "a%", "%2", "%zz"] {
+            assert_eq!(decode_program(bad), None, "{bad}");
+        }
+        // An encoded byte outside the safe set is canonical.
+        assert_eq!(decode_program("%25"), Some(vec![b'%']));
+        assert_eq!(decode_program("%20"), Some(vec![b' ']));
+    }
+
+    #[test]
+    fn empty_program_uses_the_percent_sentinel() {
+        // The whole token `%` is the empty program's encoding; it
+        // is never produced for a non-empty program, and a capped
+        // record carrying it parses and validates as a non-refusal.
+        assert_eq!(encode_program(""), "%");
+        assert_eq!(decode_program("%"), Some(Vec::new()));
+        let line = "literoot: capped initial_stack loader_identity 1 2 1 %";
+        assert!(parse(line).is_ok(), "{line}");
+        let log = format!("literoot: begin 42\n{line}\nliteroot: end 42 ok\n");
+        assert_eq!(validate(&log), Ok(vec![]));
     }
 
     #[test]
