@@ -275,6 +275,7 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
         fake_uid,
         fake_gid,
         kernel_release,
+        identity_only,
         kill_on_exit,
         kompat_force,
         post_exec_at_exec_stop,
@@ -290,6 +291,7 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
         && *fake_uid == b.fake_uid
         && *fake_gid == b.fake_gid
         && *kernel_release == b.kernel_release
+        && *identity_only == b.identity_only
         && *kill_on_exit == b.kill_on_exit
         && *kompat_force == b.kompat_force
         && *post_exec_at_exec_stop == b.post_exec_at_exec_stop
@@ -508,6 +510,7 @@ mod successor_tests {
             fake_uid: Some(0),
             fake_gid: Some(0),
             kernel_release: Some("6.0-literoot".to_string()),
+            identity_only: false,
             kill_on_exit: false,
             kompat_force: false,
             post_exec_at_exec_stop: false,
@@ -542,6 +545,9 @@ mod successor_tests {
         mutations.push(c);
         let mut c = launched_config();
         c.initial_stack_limit = Some((8388608, 8388608));
+        mutations.push(c);
+        let mut c = launched_config();
+        c.identity_only = true;
         mutations.push(c);
         let mut c = launched_config();
         c.kill_on_exit = true;

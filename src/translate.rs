@@ -174,6 +174,9 @@ pub struct RootConfig {
     pub fake_ids: Option<(u32, u32)>,
     /// Spoofed kernel release (`-k`), if any.
     pub kernel_release: Option<String>,
+    /// `--identity-only`, in effect: the `-i` ids are the caller's own
+    /// non-root ids, and only the set*id and setxattr calls are emulated.
+    pub identity_only: bool,
 }
 
 impl RootConfig {
@@ -188,7 +191,14 @@ impl RootConfig {
                 b.guest = canonicalize_plain(&rootfs, &b.guest);
             }
         }
-        Self { rootfs, binds, fake_root: false, fake_ids: None, kernel_release: None }
+        Self {
+            rootfs,
+            binds,
+            fake_root: false,
+            fake_ids: None,
+            kernel_release: None,
+            identity_only: false,
+        }
     }
 
     /// Lexically normalize a guest path against `cwd` (a guest path),

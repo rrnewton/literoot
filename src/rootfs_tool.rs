@@ -47,6 +47,10 @@ pub struct LiterootConfig {
     pub fake_uid: Option<u32>,
     pub fake_gid: Option<u32>,
     pub kernel_release: Option<String>,
+    /// --identity-only in effect (the launcher checked the `-i` ids
+    /// against its own real ids).
+    #[serde(default)]
+    pub identity_only: bool,
     /// --kill-on-exit: kill the whole guest tree when the
     /// initial guest process exits (proot semantics).
     #[serde(default)]
@@ -104,6 +108,7 @@ impl LiterootConfig {
             _ => None,
         };
         c.kernel_release = self.kernel_release.clone();
+        c.identity_only = self.identity_only;
         c
     }
 }
@@ -2896,8 +2901,8 @@ impl Tool for RootfsTool {
                 Ok(0)
             }
             Syscall::Setuid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if f[1] == 0 {
@@ -2913,8 +2918,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setgid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if f[4] == 0 {
@@ -2930,8 +2935,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setreuid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.ruid() != u32::MAX {
@@ -2947,8 +2952,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setregid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.rgid() != u32::MAX {
@@ -2964,8 +2969,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setresuid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.ruid() != u32::MAX {
@@ -2983,8 +2988,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setresgid(s) => {
-                if self.fake_ids(guest).is_some() {
-                    let fake_cfg = self.fake_ids(guest);
+                if self.fake_cred_ids(guest).is_some() {
+                    let fake_cfg = self.fake_cred_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.rgid() != u32::MAX {
@@ -3018,7 +3023,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setxattr(x) => {
-                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     let _ = x;
                     Ok(0)
                 } else {
@@ -3026,7 +3031,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Lsetxattr(x) => {
-                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     let _ = x;
                     Ok(0)
                 } else {
@@ -3034,7 +3039,7 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Fsetxattr(x) => {
-                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
                     let _ = x;
                     Ok(0)
                 } else {
@@ -3545,12 +3550,26 @@ impl RootfsTool {
         }
     }
 
+    /// The fake ids every fake-identity rule uses; none under
+    /// --identity-only, which emulates only the set*id and setxattr
+    /// calls (`fake_cred_ids`).
     fn fake_ids<T: Guest<Self>>(&self, guest: &T) -> Option<(u32, u32)> {
+        let cfg = self.config(guest);
+        if cfg.identity_only {
+            None
+        } else {
+            cfg.fake_ids
+        }
+    }
+
+    /// The fake ids the set*id and setxattr emulation starts from,
+    /// --identity-only included.
+    fn fake_cred_ids<T: Guest<Self>>(&self, guest: &T) -> Option<(u32, u32)> {
         self.config(guest).fake_ids
     }
 
     fn fake_state<T: Guest<Self>>(&self, guest: &T) -> [u32; 6] {
-        let fake_cfg = self.fake_ids(guest);
+        let fake_cfg = self.fake_cred_ids(guest);
         let mut st = self.state.lock().unwrap();
         *st.fake.get_or_insert_with(|| init_fake(fake_cfg))
     }

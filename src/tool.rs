@@ -727,6 +727,13 @@ pub fn reporter_missing() -> bool {
 
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
 /// requested backend. Returns the guest exit code.
+/// --identity-only takes effect only when the `-i` ids are the caller's
+/// own real ids and not root: then nothing about them needs faking but
+/// the set*id and setxattr calls. Other ids keep the full `-i` rules.
+fn identity_only_applies(fake_ids: Option<(u32, u32)>, (uid, gid): (u32, u32)) -> bool {
+    matches!(fake_ids, Some((u, g)) if u != 0 && u == uid && g == gid)
+}
+
 pub fn run_guest(
     config: &RootConfig,
     cwd_guest: &Path,
@@ -790,6 +797,8 @@ pub fn run_guest(
         fake_uid: config.fake_ids.map(|(u, _)| u),
         fake_gid: config.fake_ids.map(|(_, g)| g),
         kernel_release: config.kernel_release.clone(),
+        identity_only: config.identity_only
+            && identity_only_applies(config.fake_ids, unsafe { (libc::getuid(), libc::getgid()) }),
         kill_on_exit,
         kompat_force: std::env::var_os("PROOT_FORCE_KOMPAT").is_some(),
         post_exec_at_exec_stop: !in_guest,
@@ -2098,6 +2107,24 @@ mod explicit_linker_tests {
         assert!(interp_names_program(alias.to_str().unwrap(), &prog));
         // A different linker does not name the program.
         assert!(!interp_names_program("/other/ld.so", &prog));
+    }
+}
+
+#[cfg(test)]
+mod identity_only_tests {
+    use super::identity_only_applies;
+
+    #[test]
+    fn applies_only_to_the_callers_own_non_root_ids() {
+        let me = (10123, 10124);
+        assert!(identity_only_applies(Some((10123, 10124)), me));
+        assert!(!identity_only_applies(None, me));
+        assert!(!identity_only_applies(Some((10123, 10123)), me));
+        assert!(!identity_only_applies(Some((10124, 10124)), me));
+        assert!(!identity_only_applies(Some((0, 0)), me));
+        // Root's own ids are still faked in full.
+        assert!(!identity_only_applies(Some((0, 0)), (0, 0)));
+        assert!(!identity_only_applies(Some((0, 5)), (0, 5)));
     }
 }
 

@@ -211,6 +211,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     let mut fake_root = false;
     let mut fake_ids: Option<(u32, u32)> = None;
     let mut kernel_release: Option<String> = None;
+    let mut identity_only = false;
     let mut backend = String::from("ptrace");
     let mut verbose = false;
     let mut kill_on_exit = false;
@@ -271,6 +272,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
             "-k" | "--kernel-release" => kernel_release = Some(take(&mut i, "-k")?),
             "--backend" => backend = take(&mut i, "--backend")?,
             "--kill-on-exit" => kill_on_exit = true,
+            "--identity-only" => identity_only = true,
             "--check" => check_paths.push(take(&mut i, "--check")?),
             "-v" | "--verbose" => {
                 // proot's -v requires a level argument; only
@@ -376,6 +378,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     config.fake_root = fake_root;
     config.fake_ids = fake_ids.or(if fake_root { Some((0, 0)) } else { None });
     config.kernel_release = kernel_release;
+    // Requested here; the launcher keeps it only for the caller's own
+    // non-root ids (`tool::identity_only_applies`).
+    config.identity_only = identity_only;
     Ok(Cli {
         config,
         cwd_guest,
@@ -399,6 +404,9 @@ fn print_usage() {
          \x20 -w, --cwd, --pwd <dir> initial guest cwd (default / or PROOT_CWD)\n\
          \x20 -0, --root-id          fake uid/gid 0\n\
          \x20 -i, --change-id <u:g>  fake uid and gid\n\
+         \x20 --identity-only        with -i equal to the caller's own non-root ids, emulate\n\
+         \x20                        only the set*id and setxattr calls (an Android launcher's\n\
+         \x20                        patched-proot rule); other ids keep the full -i rules\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
          \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3); guest ptrace is refused on in-guest backends\n\
          \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
