@@ -149,6 +149,33 @@ impl std::fmt::Display for CliError {
     }
 }
 
+/// proot's option table gives every long option that takes a value the
+/// `=` separator (`--kernel-release=VALUE`); literoot accepts that form as
+/// well as the space form. Only the long options below are split, so an
+/// `=` in any other argument (a no-value flag, or the guest command and
+/// its arguments) is left as it was.
+fn split_long_value(arg: &str) -> (&str, Option<String>) {
+    const LONG_WITH_VALUE: [&str; 11] = [
+        "--rootfs",
+        "--bind",
+        "--mount",
+        "--cwd",
+        "--pwd",
+        "--kernel-release",
+        "--identity",
+        "--change-id",
+        "--backend",
+        "--check",
+        "--verbose",
+    ];
+    if let Some((name, value)) = arg.split_once('=') {
+        if LONG_WITH_VALUE.contains(&name) {
+            return (name, Some(value.to_owned()));
+        }
+    }
+    (arg, None)
+}
+
 fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     let mut rootfs: Option<PathBuf> = std::env::var_os("PROOT_ROOTFS").map(PathBuf::from);
     let mut binds: Vec<Bind> = Vec::new();
@@ -169,14 +196,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
 
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        let mut take = |i: &mut usize, flag: &str| -> Result<String, String> {
+        let (a, inline) = split_long_value(&args[i]);
+        let take = |i: &mut usize, flag: &str| -> Result<String, String> {
+            if let Some(value) = &inline {
+                return Ok(value.clone());
+            }
             *i += 1;
             args.get(*i)
                 .cloned()
                 .ok_or_else(|| format!("literoot: {flag} requires a value"))
         };
-        match a.as_str() {
+        match a {
             "--" => {
                 command.extend(args[i + 1..].iter().cloned());
                 break;
@@ -196,7 +226,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
                 }
                 binds.push(b);
             }
-            "-w" | "--cwd" | "-c" => {
+            "-w" | "--cwd" | "--pwd" | "-c" => {
                 cwd_explicit = true;
                 cwd_guest = PathBuf::from(take(&mut i, "-w")?)
             }
@@ -204,7 +234,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
                 fake_root = true;
                 fake_ids = Some((0, 0));
             }
-            "-i" | "--identity" => {
+            "-i" | "--identity" | "--change-id" => {
                 let v = take(&mut i, "-i")?;
                 let (u, g) = v
                     .split_once(':')
@@ -223,15 +253,22 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
                 // proot's -v requires a level argument; only
                 // positive levels print (tests use -v -1 = quiet
                 // and compare stderr byte-for-byte).
-                match args.get(i + 1) {
-                    Some(next) => match next.parse::<i64>() {
-                        Ok(level) => {
-                            verbose = level > 0;
+                let level = match &inline {
+                    Some(value) => Some(value.as_str()),
+                    None => args.get(i + 1).map(String::as_str),
+                };
+                match level.map(str::parse::<i64>) {
+                    Some(Ok(level)) => {
+                        verbose = level > 0;
+                        if inline.is_none() {
                             i += 1;
                         }
-                        Err(_) => return Err(CliError::ProotAlsoRaises("literoot: -v requires a level argument".into())),
-                    },
-                    _ => return Err(CliError::ProotAlsoRaises("literoot: -v requires a level argument".into())),
+                    }
+                    _ => {
+                        return Err(CliError::ProotAlsoRaises(
+                            "literoot: -v requires a level argument".into(),
+                        ));
+                    }
                 }
             }
             "-q" => {
@@ -336,14 +373,16 @@ fn print_usage() {
          \x20 -r, --rootfs <dir>     root filesystem (or PROOT_ROOTFS)\n\
          \x20 -R <dir>               -r plus default binds (/dev,/proc,/sys)\n\
          \x20 -b, --bind <h[:g]>     bind host path h at guest path g (repeatable)\n\
-         \x20 -w, --cwd <dir>        initial guest cwd (default / or PROOT_CWD)\n\
+         \x20 -w, --cwd, --pwd <dir> initial guest cwd (default / or PROOT_CWD)\n\
          \x20 -0, --root-id          fake uid/gid 0\n\
+         \x20 -i, --change-id <u:g>  fake uid and gid\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
          \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3); guest ptrace is refused on in-guest backends\n\
          \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
          \x20                        kill-on-exit refusals exit 2 (a guest may also exit 2; the literoot: kill-on-exit: stderr prefix distinguishes)\n\
          \x20 --check <guest-path>   print translation and exit (repeatable)\n\
-         \x20 -v, --verbose          report selected mechanism\n\
+         \x20 -v, --verbose <level>  report selected mechanism (level > 0)\n\
+         \x20 Long options that take a value also accept --name=value.\n\
          \x20 --help, --version"
     );
 }
@@ -634,5 +673,159 @@ mod kill_on_exit_parse_tests {
             2
         );
         assert_eq!(launcher_error_exit_code("tracer spawn: EPERM"), 125);
+    }
+}
+
+#[cfg(test)]
+mod long_option_value_tests {
+    use super::{parse_cli, Cli};
+    use std::path::PathBuf;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Everything `parse_cli` decides, in a comparable form.
+    fn summary(cli: &Cli) -> impl PartialEq + std::fmt::Debug {
+        (
+            cli.config.rootfs.clone(),
+            cli.config.binds.clone(),
+            cli.config.fake_root,
+            cli.config.fake_ids,
+            cli.config.kernel_release.clone(),
+            cli.cwd_guest.clone(),
+            cli.backend.clone(),
+            cli.verbose,
+            cli.kill_on_exit,
+            cli.check_paths.clone(),
+            cli.command.clone(),
+        )
+    }
+
+    fn parse(v: &[&str]) -> Cli {
+        parse_cli(&args(v)).unwrap_or_else(|e| panic!("{v:?}: {e}"))
+    }
+
+    fn error(v: &[&str]) -> String {
+        match parse_cli(&args(v)) {
+            Ok(cli) => panic!("{v:?} parsed: {cli:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn launcher_style_argv_parses() {
+        // The shape of the argv an Android launcher builds for proot.
+        let cli = parse(&[
+            "--kill-on-exit",
+            "--kernel-release=6.17.0-generic",
+            "-i",
+            "10123:10123",
+            "-r",
+            "/",
+            "-w",
+            "/root",
+            "-b",
+            "/dev",
+            "-b",
+            "/proc/self/fd:/dev/fd",
+            "/usr/bin/env",
+            "-i",
+            "HOME=/root",
+            "/bin/true",
+        ]);
+        assert_eq!(cli.config.kernel_release.as_deref(), Some("6.17.0-generic"));
+        assert_eq!(cli.config.fake_ids, Some((10123, 10123)));
+        assert!(cli.kill_on_exit);
+        assert_eq!(cli.cwd_guest, PathBuf::from("/root"));
+        assert_eq!(cli.config.binds.len(), 2);
+        assert_eq!(
+            cli.command,
+            args(&["/usr/bin/env", "-i", "HOME=/root", "/bin/true"])
+        );
+    }
+
+    #[test]
+    fn equals_form_matches_space_form() {
+        let pairs: [(&[&str], &[&str]); 8] = [
+            (
+                &["--rootfs=/", "/bin/true"],
+                &["--rootfs", "/", "/bin/true"],
+            ),
+            (
+                &["--bind=/dev", "/bin/true"],
+                &["--bind", "/dev", "/bin/true"],
+            ),
+            (
+                &["--mount=/tmp:/mnt", "/bin/true"],
+                &["--mount", "/tmp:/mnt", "/bin/true"],
+            ),
+            (&["--cwd=/root", "/bin/true"], &["-w", "/root", "/bin/true"]),
+            (
+                &["--pwd=/root", "/bin/true"],
+                &["--cwd", "/root", "/bin/true"],
+            ),
+            (
+                &["--kernel-release=6.1.0", "/bin/true"],
+                &["-k", "6.1.0", "/bin/true"],
+            ),
+            (
+                &["--change-id=5:6", "/bin/true"],
+                &["-i", "5:6", "/bin/true"],
+            ),
+            (&["--verbose=-1", "/bin/true"], &["-v", "-1", "/bin/true"]),
+        ];
+        for (equals, space) in pairs {
+            assert_eq!(
+                summary(&parse(equals)),
+                summary(&parse(space)),
+                "{equals:?} vs {space:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_keeps_later_equals_signs() {
+        let cli = parse(&["--kernel-release=a=b", "/bin/true"]);
+        assert_eq!(cli.config.kernel_release.as_deref(), Some("a=b"));
+        let cli = parse(&["--check=/x=y"]);
+        assert_eq!(cli.check_paths, args(&["/x=y"]));
+    }
+
+    #[test]
+    fn empty_equals_value_is_a_value() {
+        let cli = parse(&["--kernel-release=", "/bin/true"]);
+        assert_eq!(cli.config.kernel_release.as_deref(), Some(""));
+        assert_eq!(cli.command, args(&["/bin/true"]));
+    }
+
+    #[test]
+    fn command_arguments_are_not_split() {
+        let cli = parse(&["/bin/echo", "--kernel-release=x", "--rootfs=/nope"]);
+        assert_eq!(cli.config.kernel_release, None);
+        assert_eq!(
+            cli.command,
+            args(&["/bin/echo", "--kernel-release=x", "--rootfs=/nope"])
+        );
+        let cli = parse(&["--", "--cwd=/x"]);
+        assert_eq!(cli.command, args(&["--cwd=/x"]));
+    }
+
+    #[test]
+    fn flags_without_a_value_refuse_equals() {
+        assert!(
+            error(&["--kill-on-exit=1", "/bin/true"]).contains("unknown option --kill-on-exit=1")
+        );
+        assert!(error(&["--root-id=1", "/bin/true"]).contains("unknown option --root-id=1"));
+    }
+
+    #[test]
+    fn verbose_equals_needs_a_number() {
+        assert!(parse(&["--verbose=1", "/bin/true"]).verbose);
+        assert!(!parse(&["--verbose=0", "/bin/true"]).verbose);
+        assert!(error(&["--verbose=x", "/bin/true"]).contains("-v requires a level"));
+        // The equals form never consumes the next argument as the level.
+        let cli = parse(&["--verbose=1", "2"]);
+        assert_eq!(cli.command, args(&["2"]));
     }
 }
