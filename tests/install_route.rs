@@ -168,6 +168,202 @@ int main(int argc, char **argv) {
 }
 "#;
 
+/// Every reader of the fd table, and fds or a cwd with no guest path:
+/// argv dir. In the work directory: b/b1, b/b2, `c4 (deleted)/victim`,
+/// `e (deleted)/victim`, and `a` whose `v/bound/marker` (content "m") and
+/// `child` exist natively but are binds under literoot, so `a/v` is a
+/// virtual bind-prefix directory there.
+const FD_READERS_C: &str = r#"
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void say(const char *what, long r, int e) {
+    printf("%s %ld errno %d\n", what, r < 0 ? -1L : r, r < 0 ? e : 0);
+}
+
+static int exists(const char *p) { return access(p, F_OK) == 0; }
+
+static int cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+/* Open `a` (the fd table records it), close it, and dup `fb` onto the
+ * same number: a number whose entry still names `a`. */
+static int stale(const char *a, int fb) {
+    int x = open(a, O_RDONLY | O_DIRECTORY);
+    close(x);
+    int d = fcntl(fb, F_DUPFD, 0);
+    return d == x ? d : -1;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    const char *dir = argv[1];
+    char p[4096], q[4096], buf[256];
+    long r;
+
+    /* 5: a virtual bind-prefix directory fd, then a bound child through it. */
+    snprintf(p, sizeof p, "%s/a/v", dir);
+    int dv = open(p, O_RDONLY | O_DIRECTORY);
+    say("5 open(a/v)", dv < 0 ? -1 : 0, errno);
+    int fm = openat(dv, "bound/marker", O_RDONLY);
+    memset(buf, 0, sizeof buf);
+    r = fm < 0 ? -1 : read(fm, buf, sizeof buf - 1);
+    printf("5 openat(a/v,bound/marker) %s\n", r > 0 ? buf : "-");
+    struct stat st;
+    r = fstatat(dv, "bound/marker", &st, 0);
+    printf("5 fstatat(a/v,bound/marker) %ld size %ld\n", r, r == 0 ? (long) st.st_size : -1L);
+
+    /* 6-8: numbers whose table entry is `a`, now holding `b`. Each reader
+     * gets its own fresh number, so no earlier call has corrected the
+     * entry (openat's passthrough check records what it finds). */
+    snprintf(p, sizeof p, "%s/a", dir);
+    snprintf(q, sizeof q, "%s/b", dir);
+    int fb = open(q, O_RDONLY | O_DIRECTORY);
+    if (fb < 0) return 3;
+    int fa = open(p, O_RDONLY | O_DIRECTORY);
+    close(fa);
+    int dd = fcntl(fb, F_DUPFD, 0);
+    printf("6 dup took a's number %d\n", dd == fa);
+    r = openat(dd, "v", O_RDONLY | O_DIRECTORY);
+    say("6 openat(dup,v)", r, errno);
+    struct statx sx;
+    r = syscall(SYS_statx, stale(p, fb), "v", 0, STATX_BASIC_STATS, &sx);
+    say("6 statx(dup,v)", r, errno);
+    int dg = stale(p, fb);
+    char *names[64]; int n = 0;
+    char dbuf[4096];
+    for (;;) {
+        long got = syscall(SYS_getdents64, dg, dbuf, sizeof dbuf);
+        if (got <= 0) break;
+        for (long off = 0; off < got;) {
+            struct dirent64 *de = (struct dirent64 *) (dbuf + off);
+            if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..") && n < 64)
+                names[n++] = strdup(de->d_name);
+            off += de->d_reclen;
+        }
+    }
+    qsort(names, n, sizeof names[0], cmp);
+    printf("7 getdents(dup)");
+    for (int i = 0; i < n; i++) printf(" %s", names[i]);
+    printf("\n");
+    r = fchdir(stale(p, fb));
+    say("8 fchdir(dup)", r, errno);
+    r = openat(AT_FDCWD, "made5", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    say("8 openat(cwd,made5)", r < 0 ? -1 : 0, errno);
+    snprintf(p, sizeof p, "%s/b/made5", dir); snprintf(q, sizeof q, "%s/a/made5", dir);
+    printf("8 b/made5 %d a/made5 %d\n", exists(p), exists(q));
+
+    /* 9: fchdir into a deleted directory, then chdir("..") out of it. */
+    if (chdir(dir) != 0) return 3;
+    mkdir("c3", 0700);
+    int d3 = open("c3", O_RDONLY | O_DIRECTORY);
+    if (d3 < 0 || rmdir("c3") != 0) return 3;
+    r = fchdir(d3);
+    say("9 fchdir(deleted)", r, errno);
+    r = openat(AT_FDCWD, "made", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    say("9 openat(cwd,made)", r < 0 ? -1 : 0, errno);
+    r = getcwd(buf, sizeof buf) ? 0 : -1;
+    say("9 getcwd", r, errno);
+    r = chdir("..");
+    say("9 chdir(..)", r, errno);
+    r = openat(AT_FDCWD, "made4", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    say("9 openat(cwd,made4)", r < 0 ? -1 : 0, errno);
+    snprintf(p, sizeof p, "%s/made4", dir); snprintf(q, sizeof q, "%s/made", dir);
+    printf("9 made4 %d made %d\n", exists(p), exists(q));
+
+    /* 10: empty paths keep their own rules. */
+    int fr = open("reg", O_RDWR | O_CREAT | O_EXCL, 0644);
+    if (fr < 0 || unlink("reg") != 0) return 3;
+    r = readlinkat(fr, "", buf, sizeof buf);
+    say("10 readlinkat(deleted-regular,\"\")", r, errno);
+    if (symlink("target", "lnk") != 0) return 3;
+    int fl = open("lnk", O_PATH | O_NOFOLLOW);
+    memset(buf, 0, sizeof buf);
+    r = readlinkat(fl, "", buf, sizeof buf - 1);
+    printf("10 readlinkat(O_PATH-symlink,\"\") %ld %s\n", r, r > 0 ? buf : "-");
+    r = open("lnk", O_RDONLY | O_NOFOLLOW);
+    say("10 open(lnk,O_NOFOLLOW)", r < 0 ? -1 : 0, errno);
+    r = mkdirat(d3, "", 0755);
+    say("10 mkdirat(deleted-dir,\"\")", r, errno);
+
+    /* 11: a deleted directory whose /proc text names a real directory. */
+    mkdir("c4", 0700);
+    int d4 = open("c4", O_RDONLY | O_DIRECTORY);
+    if (d4 < 0 || rmdir("c4") != 0) return 3;
+    r = unlinkat(d4, "victim", 0);
+    say("11 unlinkat(deleted,victim)", r, errno);
+    printf("11 c4 (deleted)/victim %d\n", exists("c4 (deleted)/victim"));
+
+    /* 12: a live directory whose name ends in " (deleted)". */
+    int fe = open("e (deleted)", O_RDONLY | O_DIRECTORY);
+    r = unlinkat(fe, "victim", 0);
+    say("12 unlinkat(live-e,victim)", r, errno);
+    printf("12 e (deleted)/victim %d\n", exists("e (deleted)/victim"));
+    return 0;
+}
+"#;
+
+/// A thread with a private fd table: argv dir, holding a/victim, b/victim,
+/// a/victim2, b/victim2. The leader opens `a` as fd n; the worker unshares
+/// its fd table, closes n and opens `b`, which takes n in its table only.
+const FD_THREAD_C: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static const char *dir;
+static int fa;
+
+static int exists(const char *d, const char *n) {
+    char p[4096];
+    snprintf(p, sizeof p, "%s/%s/%s", dir, d, n);
+    return access(p, F_OK) == 0;
+}
+
+static void *worker(void *arg) {
+    (void) arg;
+    char b[4096];
+    snprintf(b, sizeof b, "%s/b", dir);
+    if (unshare(CLONE_FILES) != 0) { printf("unshare failed %d\n", errno); return 0; }
+    close(fa);
+    int fb = open(b, O_RDONLY | O_DIRECTORY);
+    printf("worker b took the leader's number %d\n", fb == fa);
+    int r = unlinkat(fb, "victim", 0);
+    printf("worker unlinkat(n,victim) %d errno %d\n", r, r ? errno : 0);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    dir = argv[1];
+    char a[4096];
+    snprintf(a, sizeof a, "%s/a", dir);
+    fa = open(a, O_RDONLY | O_DIRECTORY);
+    if (fa < 0) return 3;
+    pthread_t t;
+    if (pthread_create(&t, 0, worker, 0) != 0) return 3;
+    pthread_join(t, 0);
+    printf("a/victim %d b/victim %d\n", exists("a", "victim"), exists("b", "victim"));
+    int r = unlinkat(fa, "victim2", 0);
+    printf("leader unlinkat(n,victim2) %d errno %d\n", r, r ? errno : 0);
+    printf("a/victim2 %d b/victim2 %d\n", exists("a", "victim2"), exists("b", "victim2"));
+    return 0;
+}
+"#;
+
 fn real_ids() -> (u32, u32) {
     extern "C" {
         fn getuid() -> u32;
@@ -188,7 +384,7 @@ fn build_guest(dir: &Path, name: &str, source: &str) -> PathBuf {
     std::fs::write(&src, source).unwrap();
     let bin = dir.join(name);
     let cc = Command::new("cc")
-        .args(["-O2", "-o"])
+        .args(["-O2", "-pthread", "-o"])
         .arg(&bin)
         .arg(&src)
         .output()
@@ -417,6 +613,119 @@ fn a_dirfd_the_fd_table_cannot_name_resolves_to_its_own_file() {
     );
     for (name, flags) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
         let work = stale_fd_work(&dir, name);
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The work directory for FD_READERS_C. `native` puts a/v/bound/marker and
+/// a/child in place; under literoot they come from binds.
+fn fd_readers_work(parent: &Path, name: &str, native: bool) -> PathBuf {
+    let work = parent.join(name);
+    for d in ["a", "b", "c4 (deleted)", "e (deleted)"] {
+        std::fs::create_dir_all(work.join(d)).unwrap();
+    }
+    std::fs::write(work.join("b/b1"), "").unwrap();
+    std::fs::write(work.join("b/b2"), "").unwrap();
+    std::fs::write(work.join("c4 (deleted)/victim"), "").unwrap();
+    std::fs::write(work.join("e (deleted)/victim"), "").unwrap();
+    if native {
+        std::fs::create_dir_all(work.join("a/v/bound")).unwrap();
+        std::fs::write(work.join("a/v/bound/marker"), "m").unwrap();
+        std::fs::create_dir_all(work.join("a/child")).unwrap();
+    }
+    work
+}
+
+#[test]
+fn every_fd_table_reader_and_unnamed_fds_and_cwds_match_native() {
+    let dir = own_dir("fd-readers");
+    let guest = build_guest(&dir, "readers", FD_READERS_C);
+    let work = fd_readers_work(&dir, "native", true);
+    let native = run_native(&guest, "native", &[work.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "5 open(a/v) 0 errno 0\n\
+         5 openat(a/v,bound/marker) m\n\
+         5 fstatat(a/v,bound/marker) 0 size 1\n\
+         6 dup took a's number 1\n\
+         6 openat(dup,v) -1 errno 2\n\
+         6 statx(dup,v) -1 errno 2\n\
+         7 getdents(dup) b1 b2\n\
+         8 fchdir(dup) 0 errno 0\n\
+         8 openat(cwd,made5) 0 errno 0\n\
+         8 b/made5 1 a/made5 0\n\
+         9 fchdir(deleted) 0 errno 0\n\
+         9 openat(cwd,made) -1 errno 2\n\
+         9 getcwd -1 errno 2\n\
+         9 chdir(..) 0 errno 0\n\
+         9 openat(cwd,made4) 0 errno 0\n\
+         9 made4 1 made 0\n\
+         10 readlinkat(deleted-regular,\"\") -1 errno 2\n\
+         10 readlinkat(O_PATH-symlink,\"\") 6 target\n\
+         10 open(lnk,O_NOFOLLOW) -1 errno 40\n\
+         10 mkdirat(deleted-dir,\"\") -1 errno 2\n\
+         11 unlinkat(deleted,victim) -1 errno 2\n\
+         11 c4 (deleted)/victim 1\n\
+         12 unlinkat(live-e,victim) 0 errno 0\n\
+         12 e (deleted)/victim 0\n"
+    );
+    // Under literoot a/v/bound and a/child are binds, so a/v is a virtual
+    // bind-prefix directory and a/child is a synthetic entry of a.
+    let bound = dir.join("bound-v");
+    std::fs::create_dir(&bound).unwrap();
+    std::fs::write(bound.join("marker"), "m").unwrap();
+    let child = dir.join("bound-child");
+    std::fs::create_dir(&child).unwrap();
+    let binds = [
+        format!("{}:/w/a/v/bound", bound.display()),
+        format!("{}:/w/a/child", child.display()),
+    ];
+    for (name, mode) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = fd_readers_work(&dir, name, false);
+        let mut flags = mode;
+        for b in &binds {
+            flags.extend(["-b", b.as_str()]);
+        }
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_thread_with_its_own_fd_table_resolves_its_own_fds() {
+    let dir = own_dir("fd-thread");
+    let guest = build_guest(&dir, "thread", FD_THREAD_C);
+    let setup = |name: &str| {
+        let work = dir.join(name);
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(work.join(d)).unwrap();
+            for v in ["victim", "victim2"] {
+                std::fs::write(work.join(d).join(v), "").unwrap();
+            }
+        }
+        work
+    };
+    let work = setup("native");
+    let native = run_native(&guest, "native", &[work.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "worker b took the leader's number 1\n\
+         worker unlinkat(n,victim) 0 errno 0\n\
+         a/victim 1 b/victim 0\n\
+         leader unlinkat(n,victim2) 0 errno 0\n\
+         a/victim2 0 b/victim2 1\n"
+    );
+    for (name, flags) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = setup(name);
         assert_eq!(
             under_literoot(&work, &guest, name, &flags, &["/w"]),
             native,

@@ -1516,7 +1516,16 @@ impl Tool for RootfsTool {
                 if self.dirfd_passthrough(guest, openat.dirfd(), &guest_path) {
                     return Ok(guest.inject(openat).await?);
                 }
-                let host = self.translate_follow(guest, openat.dirfd(), &guest_path);
+                // O_NOFOLLOW opens the final symlink itself (O_PATH) or
+                // fails ELOOP, so the final component is not followed here.
+                let host = if openat
+                    .flags()
+                    .contains(reverie::syscalls::OFlag::O_NOFOLLOW)
+                {
+                    self.translate_for(guest, openat.dirfd(), &guest_path)
+                } else {
+                    self.translate_follow(guest, openat.dirfd(), &guest_path)
+                };
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         openat.with_path(PathPtr::from_ptr(ptr))
@@ -1524,6 +1533,7 @@ impl Tool for RootfsTool {
                     .await?;
                 let first = guest.inject(rewritten).await;
                 drop(_guard);
+                let mut opened_virtual = false;
                 // Virtual bind-prefix directory: open the
                 // nearest real ancestor and synthesize entries
                 // in getdents64 (readdir nested bindings).
@@ -1535,7 +1545,10 @@ impl Tool for RootfsTool {
                         };
                         if self.is_virtual_bind_dir(guest, &abs) {
                             match self.open_virtual_dir(guest, openat, &abs).await? {
-                                Some(fd) => Ok(fd),
+                                Some(fd) => {
+                                    opened_virtual = fd >= 0;
+                                    Ok(fd)
+                                }
                                 None => Err(e),
                             }
                         } else {
@@ -1566,6 +1579,9 @@ impl Tool for RootfsTool {
                     // Record fd → guest path for future *at calls.
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, openat.dirfd(), &guest_path);
+                    if !opened_virtual {
+                        forget_fd_state(&mut st, ret as i32);
+                    }
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -1585,7 +1601,11 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(open).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path);
+                let host = if open.flags().contains(reverie::syscalls::OFlag::O_NOFOLLOW) {
+                    self.translate_for(guest, libc::AT_FDCWD, &guest_path)
+                } else {
+                    self.translate_follow(guest, libc::AT_FDCWD, &guest_path)
+                };
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         open.with_path(PathPtr::from_ptr(ptr))
@@ -1595,6 +1615,7 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
+                    forget_fd_state(&mut st, ret as i32);
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -1806,15 +1827,13 @@ impl Tool for RootfsTool {
             Syscall::Fchdir(fch) => {
                 let ret = guest.inject(fch).await?;
                 if ret == 0 {
-                    // Replicated cwd follows the fd's guest path.
+                    // Replicated cwd follows the kernel's new cwd; the fd's
+                    // guest path is only the preferred spelling (the fd can
+                    // be replaced between the call and this check).
                     let cfg = self.config(guest);
-                    let new_cwd = {
-                        let st = self.state.lock().unwrap();
-                        self.fd_guest_path(guest, &cfg, &st, fch.fd())
-                    };
-                    if let Some(p) = new_cwd {
-                        self.state.lock().unwrap().cwd = p;
-                    }
+                    let mut st = self.state.lock().unwrap();
+                    let candidate = self.fd_guest_path(guest, &cfg, &st, fch.fd());
+                    st.cwd = self.live_cwd_guest_path(guest, &cfg, &st, candidate);
                 }
                 Ok(ret)
             }
@@ -2390,6 +2409,7 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, oa.dirfd(), &guest_path);
+                    forget_fd_state(&mut st, ret as i32);
                     st.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
@@ -2478,9 +2498,26 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Getdents64(gd) => {
+                let cfg = self.config(guest);
                 let virt = {
-                    let st = self.state.lock().unwrap();
-                    st.virtual_fds.get(&(gd.fd() as i32)).cloned()
+                    let fd = gd.fd() as i32;
+                    let mut st = self.state.lock().unwrap();
+                    let live = std::fs::metadata(format!("{}/fd/{}", task_dir(guest), fd));
+                    match live {
+                        Ok(md) if st.virtual_fds.contains_key(&fd) => {
+                            match virtual_fd_path(&cfg, &st, fd, &md) {
+                                Some(_) => st.virtual_fds.get(&fd).cloned(),
+                                None => {
+                                    // A stale virtual record: the number now
+                                    // holds another directory.
+                                    forget_fd_state(&mut st, fd);
+                                    None
+                                }
+                            }
+                        }
+                        // /proc unreadable: the record stands, as before.
+                        _ => st.virtual_fds.get(&fd).cloned(),
+                    }
                 };
                 match virt {
                     None => {
@@ -2638,7 +2675,14 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(rewritten).await?;
                 if ret == 0 {
                     let mut st = self.state.lock().unwrap();
-                    st.cwd = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
+                    if st.cwd == Path::new(UNNAMED_CWD) && !guest_path.is_absolute() {
+                        // Relative to a cwd with no guest path: only the
+                        // kernel knows where this landed.
+                        let cfg = self.config_locked(guest, &st);
+                        st.cwd = self.live_cwd_guest_path(guest, &cfg, &st, None);
+                    } else {
+                        st.cwd = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
+                    }
                 }
                 Ok(ret)
             }
@@ -3672,6 +3716,42 @@ impl RootfsTool {
         cfg
     }
 
+    /// The replicated cwd after a successful chdir or fchdir, from the
+    /// kernel's cwd of the calling task (/proc/<pid>/task/<tid>/cwd), which
+    /// is right even if the fd was replaced after the call: `candidate`
+    /// (the spelling the call implies) when it names that directory, else
+    /// the link's target mapped into the guest, else UNNAMED_CWD for a
+    /// directory with no guest path (deleted, outside every tree). When
+    /// /proc cannot be read, `candidate` or the old cwd stands.
+    fn live_cwd_guest_path<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        cfg: &RootConfig,
+        st: &ProcState,
+        candidate: Option<PathBuf>,
+    ) -> PathBuf {
+        use std::os::unix::fs::MetadataExt as _;
+        let link = format!("{}/cwd", task_dir(guest));
+        let live = match std::fs::metadata(&link) {
+            Ok(md) => md,
+            Err(_) => return candidate.unwrap_or_else(|| st.cwd.clone()),
+        };
+        if live.nlink() == 0 {
+            return PathBuf::from(UNNAMED_CWD);
+        }
+        if let Some(p) = candidate {
+            let virt =
+                st.virtual_fds.values().any(|(v, _)| *v == p) && same_file(&cfg.rootfs, &live);
+            if virt || same_file(&cfg.translate(&p, Path::new("/"), None), &live) {
+                return p;
+            }
+        }
+        std::fs::read_link(&link)
+            .ok()
+            .and_then(|t| cfg.reverse(&t))
+            .unwrap_or_else(|| PathBuf::from(UNNAMED_CWD))
+    }
+
     /// The guest path of the file open as `fd`, or None when it has none.
     /// The fd table learns a path at open but is not told about close,
     /// dup, close_range, close-on-exec or fds received over a socket, and
@@ -3679,6 +3759,9 @@ impl RootfsTool {
     /// be a different file (measured: rm's directory fd resolved to the
     /// lock file its parent dpkg had open under that number). So the
     /// kernel's /proc/<pid>/fd/<fd> decides:
+    /// - a virtual bind-prefix directory (open_virtual_dir) keeps its
+    ///   virtual path while the fd still holds the placeholder, the rootfs
+    ///   root directory;
     /// - the entry stands while its translated host path is the same
     ///   file (device and inode) as the open one, whichever host spelling
     ///   a bind gives it;
@@ -3696,14 +3779,24 @@ impl RootfsTool {
         fd: i32,
     ) -> Option<PathBuf> {
         use std::os::unix::fs::MetadataExt as _;
-        let dir = format!("/proc/{}/fd", guest.pid().as_raw());
+        let dir = format!("{}/fd", task_dir(guest));
         let link = format!("{dir}/{fd}");
         let recorded = st.fds.get(&fd);
-        let live = match std::fs::metadata(&link) {
-            Ok(md) => md,
-            Err(_) if std::fs::metadata(&dir).is_ok() => return None,
-            Err(_) => return recorded.cloned(),
+        // lstat of the fd link says whether the fd is open; stat follows it
+        // to the object, which fails for an O_PATH fd on a dangling symlink.
+        if std::fs::symlink_metadata(&link).is_err() {
+            return if std::fs::metadata(&dir).is_ok() {
+                None
+            } else {
+                recorded.cloned()
+            };
+        }
+        let Ok(live) = std::fs::metadata(&link) else {
+            return std::fs::read_link(&link).ok().and_then(|t| cfg.reverse(&t));
         };
+        if let Some(v) = virtual_fd_path(cfg, st, fd, &live) {
+            return Some(v);
+        }
         if live.nlink() == 0 {
             return None;
         }
@@ -4079,6 +4172,7 @@ impl RootfsTool {
                 let fd = guest.inject(rewritten).await?;
                 if fd >= 0 {
                     let mut st = self.state.lock().unwrap();
+                    forget_fd_state(&mut st, fd as i32);
                     st.virtual_fds
                         .insert(fd as i32, (guest_abs.to_path_buf(), false));
                     st.fds.insert(fd as i32, guest_abs.to_path_buf());
@@ -4365,7 +4459,7 @@ impl RootfsTool {
             return false;
         }
         let cfg = self.config(guest);
-        let live = std::fs::metadata(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd));
+        let live = std::fs::metadata(format!("{}/fd/{}", task_dir(guest), dirfd));
         let mut st = self.state.lock().unwrap();
         // fd_guest_path checks a table entry against the open file, so a
         // stale entry never stops a passthrough.
@@ -4419,16 +4513,34 @@ impl RootfsTool {
         } else {
             self.fd_guest_path(guest, &cfg, &st, dirfd)
         };
-        if dirfd != libc::AT_FDCWD && dirfd_guest.is_none() && !path.is_absolute() {
-            // The fd has no guest path (deleted, pipe, socket, outside
-            // every mapped tree, closed): resolve through the fd itself,
-            // so the kernel answers for the object it holds (ENOENT in a
-            // deleted directory, ENOTDIR for a pipe) instead of the call
-            // landing relative to the cwd.
-            let mut host = PathBuf::from(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd));
-            if !path.as_os_str().is_empty() {
-                host.push(path);
+        // An empty path with a real dirfd (AT_EMPTY_PATH, or a call that
+        // must fail ENOENT without it) names the fd's own object, which
+        // the kernel already holds: leave it empty, so each syscall's own
+        // empty-path rule applies (readlinkat(fd, "") on an O_PATH symlink
+        // reads that link; translating would follow it).
+        if dirfd != libc::AT_FDCWD && path.as_os_str().is_empty() {
+            return PathBuf::new();
+        }
+        // A dirfd with no guest path (deleted, pipe, socket, outside every
+        // mapped tree, closed), or a cwd with none: the kernel resolves
+        // through the object itself (ENOENT in a deleted directory,
+        // ENOTDIR for a pipe) instead of the call landing relative to the
+        // old cwd. An empty path stays empty here too.
+        let unnamed_base = if path.is_absolute() {
+            None
+        } else if dirfd != libc::AT_FDCWD {
+            dirfd_guest
+                .is_none()
+                .then(|| format!("{}/fd/{}", task_dir(guest), dirfd))
+        } else {
+            (cwd == Path::new(UNNAMED_CWD)).then(|| format!("{}/cwd", task_dir(guest)))
+        };
+        if let Some(base) = unnamed_base {
+            if path.as_os_str().is_empty() {
+                return PathBuf::new();
             }
+            let mut host = PathBuf::from(base);
+            host.push(path);
             return host;
         }
         // Unknown non-path dirfd: relative resolution against cwd
@@ -4782,6 +4894,53 @@ fn host_for_tool_read(host: &Path, guest_pid: i32) -> PathBuf {
 fn init_fake(ids: Option<(u32, u32)>) -> [u32; 6] {
     let (u, g) = ids.unwrap_or((0, 0));
     [u, u, u, g, g, g]
+}
+
+/// The replicated cwd after a chdir/fchdir into a directory with no guest
+/// path (deleted, or outside every mapped tree). Relative paths then
+/// resolve through /proc/<pid>/task/<tid>/cwd, the kernel's cwd.
+const UNNAMED_CWD: &str = "/__literoot_unnamed_cwd__";
+
+/// /proc/<pid>/task/<tid>: the CALLING task's view. A thread can unshare
+/// its fd table (unshare(CLONE_FILES), close_range CLOSE_RANGE_UNSHARE) or
+/// its cwd (CLONE_FS), so the leader's /proc/<pid> is not always its own.
+fn task_dir<T: Guest<RootfsTool>>(guest: &T) -> String {
+    format!(
+        "/proc/{}/task/{}",
+        guest.pid().as_raw(),
+        guest.tid().as_raw()
+    )
+}
+
+/// True when `path` is the same file (device and inode) as `live`.
+fn same_file(path: &Path, live: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path)
+        .map(|md| (md.dev(), md.ino()) == (live.dev(), live.ino()))
+        .unwrap_or(false)
+}
+
+/// The virtual guest directory recorded for `fd` by open_virtual_dir, if
+/// the fd (`live`, its metadata) still holds the placeholder: a directory
+/// that is the rootfs root. Any other object under that number means the
+/// record is stale.
+fn virtual_fd_path(
+    cfg: &RootConfig,
+    st: &ProcState,
+    fd: i32,
+    live: &std::fs::Metadata,
+) -> Option<PathBuf> {
+    let (v, _) = st.virtual_fds.get(&fd)?;
+    (live.is_dir() && same_file(&cfg.rootfs, live)).then(|| v.clone())
+}
+
+/// Forget per-fd state for a number a new open just returned: its old
+/// virtual-directory record and getdents bookkeeping belong to the file the
+/// number held before.
+fn forget_fd_state(st: &mut ProcState, fd: i32) {
+    st.virtual_fds.remove(&fd);
+    st.dirent_pending.remove(&fd);
+    st.dirent_seen.remove(&fd);
 }
 
 /// Bumps the shared probe-cache generation on drop — placed at
