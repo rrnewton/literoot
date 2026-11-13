@@ -853,6 +853,57 @@ int main(int argc, char **argv) {
 }
 "#;
 
+/// A final symlink reached through one of two aliases of the same tree:
+/// argv base. `<base>/lr-alias-first` and `<base>/lr-alias-second` each
+/// hold `flink -> target/marker`. Through `first` the target is the nested
+/// tree (marker "nested"), through `second` the alias's own (marker "host").
+/// Under literoot both aliases are binds of one host tree, and
+/// `/lr-alias-first/target` is a further bind of another.
+const ALIAS_C: &str = r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void show(const char *what, const char *path) {
+    char buf[64] = {0};
+    int fd = open(path, O_RDONLY);
+    long n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    struct stat st;
+    int r = stat(path, &st);
+    printf("%s open %s stat %ld access %d\n", what, n > 0 ? buf : "-",
+           r == 0 ? (long) st.st_size : -1L, access(path, R_OK));
+#ifdef SYS_open
+    memset(buf, 0, sizeof buf);
+    fd = syscall(SYS_open, path, O_RDONLY);
+    n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    r = syscall(SYS_stat, path, &st);
+    printf("%s legacy open %s stat %ld access %ld\n", what, n > 0 ? buf : "-",
+           r == 0 ? (long) st.st_size : -1L, syscall(SYS_access, path, R_OK));
+#else
+    printf("%s legacy n/a\n", what);
+#endif
+    struct stat ls;
+    r = lstat(path, &ls);
+    char lk[64] = {0};
+    long k = readlink(path, lk, sizeof lk - 1);
+    printf("%s lstat link %d readlink %s\n", what, r == 0 && S_ISLNK(ls.st_mode), k > 0 ? lk : "-");
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    char p[4096];
+    snprintf(p, sizeof p, "%s/lr-alias-first/flink", argv[1]);
+    show("first", p);
+    snprintf(p, sizeof p, "%s/lr-alias-second/flink", argv[1]);
+    show("second", p);
+    return 0;
+}
+"#;
+
 fn real_ids() -> (u32, u32) {
     extern "C" {
         fn getuid() -> u32;
@@ -1324,6 +1375,69 @@ fn a_directory_stream_is_shared_by_split_tables_and_survives_fork_and_exec() {
         }
         assert_eq!(
             under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_final_symlink_keeps_the_alias_it_was_reached_through() {
+    let dir = own_dir("alias");
+    let guest = build_guest(&dir, "alias", ALIAS_C);
+    // Natively: two real directories with the layout each alias shows.
+    let nat = dir.join("native");
+    for (alias, marker) in [("lr-alias-first", "nested"), ("lr-alias-second", "host")] {
+        std::fs::create_dir_all(nat.join(alias).join("target")).unwrap();
+        std::fs::write(nat.join(alias).join("target/marker"), marker).unwrap();
+        std::os::unix::fs::symlink("target/marker", nat.join(alias).join("flink")).unwrap();
+    }
+    let native = run_native(&guest, "native", &[nat.to_str().unwrap()]);
+    let legacy = |alias: &str, marker: &str| {
+        if cfg!(target_arch = "x86_64") {
+            format!(
+                "{alias} legacy open {marker} stat {} access 0\n",
+                marker.len()
+            )
+        } else {
+            format!("{alias} legacy n/a\n")
+        }
+    };
+    assert_eq!(
+        native,
+        format!(
+            "first open nested stat 6 access 0\n{}\
+             first lstat link 1 readlink target/marker\n\
+             second open host stat 4 access 0\n{}\
+             second lstat link 1 readlink target/marker\n",
+            legacy("first", "nested"),
+            legacy("second", "host")
+        )
+    );
+    // Under literoot: one host tree bound at both aliases, and another tree
+    // bound over the first alias's `target`.
+    let host = dir.join("host");
+    std::fs::create_dir_all(host.join("target")).unwrap();
+    std::fs::write(host.join("target/marker"), "host").unwrap();
+    std::os::unix::fs::symlink("target/marker", host.join("flink")).unwrap();
+    let nested = dir.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("marker"), "nested").unwrap();
+    let binds = [
+        format!("{}:/lr-alias-first", host.display()),
+        format!("{}:/lr-alias-second", host.display()),
+        format!("{}:/lr-alias-first/target", nested.display()),
+    ];
+    for (name, mode) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = dir.join(name);
+        std::fs::create_dir(&work).unwrap();
+        let mut flags = mode;
+        for b in &binds {
+            flags.extend(["-b", b.as_str()]);
+        }
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &[""]),
             native,
             "{name}"
         );

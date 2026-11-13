@@ -1931,7 +1931,16 @@ impl Tool for RootfsTool {
                 if self.dirfd_passthrough(guest, stat.dirfd(), &guest_path) {
                     return Ok(guest.inject(stat).await?);
                 }
-                let host = self.translate_for(guest, stat.dirfd(), &guest_path);
+                // Follows a final symlink unless AT_SYMLINK_NOFOLLOW, in the
+                // guest namespace (a relative target may cross a bind).
+                let host = if stat
+                    .flags()
+                    .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
+                {
+                    self.translate_for(guest, stat.dirfd(), &guest_path)
+                } else {
+                    self.translate_follow(guest, stat.dirfd(), &guest_path)
+                };
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -1989,7 +1998,16 @@ impl Tool for RootfsTool {
                 if self.dirfd_passthrough(guest, stat.dirfd(), &guest_path) {
                     return Ok(guest.inject(stat).await?);
                 }
-                let host = self.translate_for(guest, stat.dirfd(), &guest_path);
+                // Follows a final symlink unless AT_SYMLINK_NOFOLLOW, in the
+                // guest namespace (a relative target may cross a bind).
+                let host = if stat
+                    .flags()
+                    .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
+                {
+                    self.translate_for(guest, stat.dirfd(), &guest_path)
+                } else {
+                    self.translate_follow(guest, stat.dirfd(), &guest_path)
+                };
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -2514,7 +2532,14 @@ impl Tool for RootfsTool {
                 if g.as_os_str().is_empty() {
                     return Ok(guest.inject(sx).await?);
                 }
-                let h = self.translate_for(guest, sx.dirfd(), &g);
+                let h = if sx
+                    .flags()
+                    .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
+                {
+                    self.translate_for(guest, sx.dirfd(), &g)
+                } else {
+                    self.translate_follow(guest, sx.dirfd(), &g)
+                };
                 if std::env::var_os("LITEROOT_DEBUG").is_some() {
                     eprintln!("literoot-tool: statx dirfd={} {g:?} -> {h:?}", sx.dirfd());
                 }
@@ -3756,7 +3781,7 @@ impl RootfsTool {
         let cfg = self.config(guest);
         let interp_host = {
             let h = cfg.translate(Path::new(script_interp), Path::new("/"), None);
-            resolve_symlink_chain(&cfg, h)
+            resolve_symlink_chain(&cfg, Some(PathBuf::from(script_interp)), h)
         };
         // The interpreter's own loader, if it is a dynamic ELF.
         let loader_host = std::fs::read(&interp_host)
@@ -3764,7 +3789,7 @@ impl RootfsTool {
             .and_then(|img| crate::translate::elf_interp(&img))
             .map(|ld| {
                 let h = cfg.translate(Path::new(&ld), Path::new("/"), None);
-                resolve_symlink_chain(&cfg, h)
+                resolve_symlink_chain(&cfg, Some(PathBuf::from(&ld)), h)
             });
         let orig_argv: Vec<usize> = match execve.argv() {
             Some(argv) => argv
@@ -3887,7 +3912,7 @@ impl RootfsTool {
     fn canonical_exe<T: Guest<Self>>(&self, guest: &T, p: &Path) -> PathBuf {
         let cfg = self.config(guest);
         let host = cfg.translate(p, Path::new("/"), None);
-        let resolved = resolve_symlink_chain(&cfg, host);
+        let resolved = resolve_symlink_chain(&cfg, Some(p.to_path_buf()), host);
         cfg.reverse(&resolved).unwrap_or_else(|| p.to_path_buf())
     }
 
@@ -4850,7 +4875,24 @@ impl RootfsTool {
         }
         let cfg = self.config(guest);
         let host = self.translate_for(guest, dirfd, path);
-        let resolved = resolve_symlink_chain(&cfg, host);
+        // The guest path the walk came through, if it has one: the final
+        // symlink is resolved from there, keeping that alias.
+        let guest_path = if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            let st = self.state.lock().unwrap();
+            let base = if dirfd != libc::AT_FDCWD {
+                self.fd_guest_path(guest, &cfg, &st, dirfd)
+            } else if st.cwd == Path::new("/__literoot_unset__") {
+                Some(self.seed_cwd(guest))
+            } else if st.cwd == Path::new(UNNAMED_CWD) {
+                None
+            } else {
+                Some(st.cwd.clone())
+            };
+            base.map(|b| b.join(path))
+        };
+        let resolved = resolve_symlink_chain(&cfg, guest_path, host);
         self.memoize_translate(dirfd, path, true, &resolved);
         resolved
     }
@@ -5332,7 +5374,14 @@ fn is_self_exe(link_guest: &Path, pid: i32) -> bool {
 }
 
 
-fn resolve_symlink_chain(cfg: &RootConfig, host: PathBuf) -> PathBuf {
+/// Follows a final-component symlink chain from `host`, the translation of
+/// the guest path `guest` when the caller knows it. A relative target is
+/// resolved from the link's GUEST directory and translated again, so the
+/// guest spelling the walk came through (an alias bind, a nested bind)
+/// decides where it lands, as proot's path/canon.c:330-341 does. Without a
+/// guest path (a dirfd or cwd with no guest name) the target is joined on
+/// the host side.
+fn resolve_symlink_chain(cfg: &RootConfig, guest: Option<PathBuf>, host: PathBuf) -> PathBuf {
     // Never follow /proc magic links Tool-side: readlink from
     // the Tool process names the wrong task's objects
     // (measured: guest fd/0 resolved to the tracer's pipe).
@@ -5360,30 +5409,31 @@ fn resolve_symlink_chain(cfg: &RootConfig, host: PathBuf) -> PathBuf {
         }
     }
     let mut cur = host;
+    let mut guest = guest;
     for _ in 0..40 {
         match std::fs::read_link(&cur) {
             Ok(target) if target.is_absolute() => {
                 cur = cfg.translate(&target, Path::new("/"), None);
+                guest = Some(target);
             }
             Ok(target) => {
-                // A relative target names a guest path next to the link,
-                // so resolve it in the guest namespace, where it may cross
-                // a bind (proot: path/canon.c:330-341). A link outside
-                // every mapped tree keeps the host join.
-                let guest_parent = cfg
-                    .reverse(&cur)
+                let parent = guest
+                    .as_ref()
                     .and_then(|g| g.parent().map(Path::to_path_buf));
-                cur = match guest_parent {
-                    Some(parent) => cfg.translate(&target, &parent, None),
+                match parent {
+                    Some(parent) => {
+                        cur = cfg.translate(&target, &parent, None);
+                        guest = Some(parent.join(&target));
+                    }
                     None => {
                         let mut next = cur
                             .parent()
                             .map(|p| p.to_path_buf())
                             .unwrap_or_else(|| PathBuf::from("/"));
                         next.push(target);
-                        next
+                        cur = next;
                     }
-                };
+                }
             }
             Err(_) => break,
         }
