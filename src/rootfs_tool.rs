@@ -1028,7 +1028,9 @@ impl Tool for RootfsTool {
             Sysno::symlinkat,
             Sysno::mknodat,
             Sysno::fchownat,
+            Sysno::fchown,
             Sysno::fchmodat,
+            Sysno::statfs,
             Sysno::utimensat,
             Sysno::statx,
             Sysno::uname,
@@ -2156,6 +2158,27 @@ impl Tool for RootfsTool {
                     .with_guest_path(guest, &h, |ptr| {
                         fc.with_path(PathPtr::from_ptr(ptr))
                     })
+                    .await?;
+                Ok(guest.inject(rewritten).await?)
+            }
+            Syscall::Fchown(fc) => {
+                // The fd form of fchownat's rule: fake root's chown always
+                // reports success (proot traces fchown for the same rule).
+                if self.config(guest).fake_ids == Some((0, 0))
+                    || (self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0)
+                {
+                    return Ok(0);
+                }
+                Ok(guest.inject(fc).await?)
+            }
+            Syscall::Statfs(sf) => {
+                let Some(pp) = sf.path() else {
+                    return Ok(guest.inject(sf).await?);
+                };
+                let g = pp.read(&guest.memory())?;
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let (_guard, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| sf.with_path(PathPtr::from_ptr(ptr)))
                     .await?;
                 Ok(guest.inject(rewritten).await?)
             }
