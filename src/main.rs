@@ -176,6 +176,29 @@ fn split_long_value(arg: &str) -> (&str, Option<String>) {
     (arg, None)
 }
 
+/// proot's `parse_integer_option` (`cli.c`): `strtol(value, &end, 10)`
+/// stored in an `int`. Leading whitespace and a sign are accepted and
+/// trailing text is ignored; only a value with no digits, or one outside
+/// `long`'s range, is refused (`None`). `side_log::take_from_args` reads
+/// `-v`'s level with it too, so both agree on what is a level.
+pub(crate) fn proot_integer(value: &str) -> Option<i32> {
+    let s = value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, rest) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    // More digits than an i128 holds is out of range as well (ERANGE).
+    let magnitude: i128 = rest[..digits].parse().ok()?;
+    let long = i64::try_from(if negative { -magnitude } else { magnitude }).ok()?;
+    // C's conversion of a long to int keeps the low 32 bits on Linux.
+    Some(long as i32)
+}
+
 fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     let mut rootfs: Option<PathBuf> = std::env::var_os("PROOT_ROOTFS").map(PathBuf::from);
     let mut binds: Vec<Bind> = Vec::new();
@@ -257,8 +280,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
                     Some(value) => Some(value.as_str()),
                     None => args.get(i + 1).map(String::as_str),
                 };
-                match level.map(str::parse::<i64>) {
-                    Some(Ok(level)) => {
+                match level.map(proot_integer) {
+                    Some(Some(level)) => {
                         verbose = level > 0;
                         if inline.is_none() {
                             i += 1;
@@ -678,7 +701,7 @@ mod kill_on_exit_parse_tests {
 
 #[cfg(test)]
 mod long_option_value_tests {
-    use super::{parse_cli, Cli};
+    use super::{parse_cli, proot_integer, side_log, Cli, CliError};
     use std::path::PathBuf;
 
     fn args(v: &[&str]) -> Vec<String> {
@@ -827,5 +850,94 @@ mod long_option_value_tests {
         // The equals form never consumes the next argument as the level.
         let cli = parse(&["--verbose=1", "2"]);
         assert_eq!(cli.command, args(&["2"]));
+    }
+
+    #[test]
+    fn levels_are_read_as_proots_strtol_reads_them() {
+        let cases: [(&str, Option<i32>); 16] = [
+            ("1", Some(1)),
+            ("-1", Some(-1)),
+            ("+2", Some(2)),
+            (" \t3", Some(3)),
+            ("1junk", Some(1)),
+            ("0x10", Some(0)),
+            ("4294967297", Some(1)),
+            ("9223372036854775807", Some(-1)),
+            ("-9223372036854775808", Some(0)),
+            ("9223372036854775808", None),
+            ("99999999999999999999999999999999999999999", None),
+            ("", None),
+            ("x", None),
+            ("-", None),
+            (" ", None),
+            ("- 1", None),
+        ];
+        for (value, level) in cases {
+            assert_eq!(proot_integer(value), level, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_level_proot_accepts_is_not_a_proot_error() {
+        // proot runs `--verbose=1junk` at level 1, so literoot must not
+        // classify it as an error proot also raises (which would drop the
+        // refusal marker): it is accepted, in both spellings.
+        for argv in [
+            &["--verbose=1junk", "/bin/true"][..],
+            &["-v", "1junk", "/bin/true"][..],
+        ] {
+            let cli = parse(argv);
+            assert!(cli.verbose, "{argv:?}");
+            assert_eq!(cli.command, args(&["/bin/true"]), "{argv:?}");
+        }
+        // A value proot refuses too stays the exempt variant.
+        for argv in [
+            &["--verbose=x", "/bin/true"][..],
+            &["--verbose=", "/bin/true"][..],
+            &["-v", "x", "/bin/true"][..],
+        ] {
+            assert!(
+                matches!(parse_cli(&args(argv)), Err(CliError::ProotAlsoRaises(_))),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_separate_value_spelling_survives_the_log_scan() {
+        // main() takes --refusal-log out first (side_log::take_from_args); an
+        // option whose value word it does not skip ends that scan early and
+        // leaves the log option to parse_cli, which refuses it.
+        let spellings: [(&str, &str); 19] = [
+            ("-r", "/"),
+            ("--rootfs", "/"),
+            ("-R", "/"),
+            ("-b", "/dev"),
+            ("--bind", "/dev"),
+            ("-m", "/dev"),
+            ("--mount", "/dev"),
+            ("-w", "/"),
+            ("--cwd", "/"),
+            ("--pwd", "/"),
+            ("-c", "/"),
+            ("-i", "5:6"),
+            ("--identity", "5:6"),
+            ("--change-id", "5:6"),
+            ("-k", "6.1.0"),
+            ("--kernel-release", "6.1.0"),
+            ("--backend", "ptrace"),
+            ("-v", "1junk"),
+            ("--verbose", "1"),
+        ];
+        for (option, value) in spellings {
+            let mut argv = args(&[option, value, "--refusal-log", "/l", "--check", "/"]);
+            assert_eq!(
+                side_log::take_from_args(&mut argv),
+                Ok(Some("/l".to_string())),
+                "{option}"
+            );
+            let cli = parse_cli(&argv).unwrap_or_else(|e| panic!("{option}: {e}"));
+            assert_eq!(cli.check_paths, args(&["/"]), "{option}");
+        }
     }
 }

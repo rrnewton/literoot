@@ -347,10 +347,11 @@ pub fn take_from_args(args: &mut Vec<String>) -> Result<Option<String>, (String,
         }
         // An option that takes its value as the next word skips it, so the
         // value is never mistaken for the guest command. `-v` takes the
-        // next word only when it is a level (an integer), as `parse_cli`
-        // reads it.
+        // next word only when it is a level (`crate::proot_integer`), as
+        // `parse_cli` reads it.
         let takes_value = if a == "-v" || a == "--verbose" {
-            args.get(i + 1).is_some_and(|next| next.parse::<i64>().is_ok())
+            args.get(i + 1)
+                .is_some_and(|next| crate::proot_integer(next).is_some())
         } else {
             VALUE_OPTIONS.contains(&a)
         };
@@ -373,9 +374,11 @@ const VALUE_OPTIONS: &[&str] = &[
     "--mount",
     "-w",
     "--cwd",
+    "--pwd",
     "-c",
     "-i",
     "--identity",
+    "--change-id",
     "-k",
     "--kernel-release",
     "--backend",
