@@ -826,7 +826,7 @@ dependencies = [
 [[package]]
 name = "reverie-core"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -855,7 +855,7 @@ dependencies = [
 [[package]]
 name = "reverie-inguest"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "bincode",
  "libc",
@@ -874,7 +874,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "bincode",
  "iced-x86",
@@ -894,12 +894,12 @@ dependencies = [
 [[package]]
 name = "reverie-loader"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 
 [[package]]
 name = "reverie-memory"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "syscalls",
 ]
@@ -907,7 +907,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "bincode",
  "bitflags 2.13.2",
@@ -924,7 +924,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "async-trait",
  "bincode",
@@ -939,7 +939,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.5.7"
-source = "git+https://github.com/rrnewton/reverie?rev=52fcfde386bdec275bd3d23a2ceaa1b1e7c59977#52fcfde386bdec275bd3d23a2ceaa1b1e7c59977"
+source = "git+https://github.com/facebookexperimental/reverie?rev=6281d616a880056c78bf9d34c602e8d0903d07f4#6281d616a880056c78bf9d34c602e8d0903d07f4"
 dependencies = [
  "bitflags 2.13.2",
  "derive_more",

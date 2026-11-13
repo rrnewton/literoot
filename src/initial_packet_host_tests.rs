@@ -336,7 +336,7 @@ fn open_count() -> Result<usize, String> {
 
 /// When Reverie's placement itself fails, it closes the descriptor it still
 /// holds before returning (reverie-inguest `protect::place_runtime_fd_and`
-/// at 52fcfde3), so a refused connect leaves nothing open. Here it cannot
+/// at 6281d616), so a refused connect leaves nothing open. Here it cannot
 /// block signals, so it fails before moving the connection: the
 /// connect-time socket is closed.
 #[test]

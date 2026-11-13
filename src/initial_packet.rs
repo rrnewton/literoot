@@ -457,7 +457,7 @@ fn soft_nofile() -> Option<u64> {
 /// If Reverie's placement call itself errors, it has made one close attempt
 /// on the number it still held (the connect-time number, or the moved one)
 /// and returns its original error (reverie-inguest
-/// `protect::place_runtime_fd_and` at 52fcfde3), so nothing is left to close
+/// `protect::place_runtime_fd_and` at 6281d616), so nothing is left to close
 /// here. Only a seccomp filter that fakes or refuses that close can keep the
 /// number open, and the refusal is terminal for the image either way.
 ///
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn digest_mismatch_texts_are_reveries() {
         // reverie-rpc-transport initial_image.rs:97 and blocking_client.rs:410
-        // at 52fcfde3 (unchanged since ac8b35c2). A rewording there fails
+        // at 6281d616 (unchanged since ac8b35c2). A rewording there fails
         // this, rather than silently turning the refusal into Transport.
         let ack = classify(RpcError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
