@@ -1134,6 +1134,96 @@ mod tests {
         assert_eq!(called, None);
     }
 
+    /// The launcher and the preload must be rebuilt together. A launcher
+    /// built with another `LiterootConfig` layout, here the one before
+    /// `identity_only`, puts that layout's fingerprint in the packet;
+    /// admission refuses it by name before connecting. Decoding that
+    /// layout's bytes as this one would shift every later field.
+    #[test]
+    fn a_config_layout_from_another_build_is_refused_not_misread() {
+        #[derive(serde::Serialize)]
+        struct BeforeIdentityOnly {
+            rootfs: String,
+            binds: Vec<(String, String, bool)>,
+            cwd: String,
+            fake_root: bool,
+            fake_uid: Option<u32>,
+            fake_gid: Option<u32>,
+            kernel_release: Option<String>,
+            kill_on_exit: bool,
+            kompat_force: bool,
+            post_exec_at_exec_stop: bool,
+            refuse_guest_ptrace: bool,
+            initial_exe: String,
+            initial_argv: Vec<String>,
+            initial_stack_limit: Option<(u64, u64)>,
+        }
+        let c = canonical_config();
+        let old = BeforeIdentityOnly {
+            rootfs: c.rootfs.clone(),
+            binds: c.binds.clone(),
+            cwd: c.cwd.clone(),
+            fake_root: c.fake_root,
+            fake_uid: c.fake_uid,
+            fake_gid: c.fake_gid,
+            kernel_release: c.kernel_release.clone(),
+            kill_on_exit: c.kill_on_exit,
+            kompat_force: c.kompat_force,
+            post_exec_at_exec_stop: c.post_exec_at_exec_stop,
+            refuse_guest_ptrace: c.refuse_guest_ptrace,
+            initial_exe: c.initial_exe.clone(),
+            initial_argv: c.initial_argv.clone(),
+            initial_stack_limit: c.initial_stack_limit,
+        };
+        let old_wire = encoded(&old);
+        let old_json = CONFIG_JSON.replace(r#""identity_only":true,"#, "");
+        assert_ne!(old_json, CONFIG_JSON);
+        let old_fp = hex16(hash_domains(&[
+            (TAG_CONFIG_WIRE, &old_wire),
+            (TAG_CONFIG_JSON, old_json.as_bytes()),
+            (TAG_REFUSAL_REVISION, &REFUSAL_RPC_REVISION.to_le_bytes()),
+            (TAG_REFUSAL_WIRE, &refusal_wire()),
+        ]));
+        assert_ne!(old_fp, fp());
+
+        // What the fingerprint protects against: the old bytes read as this
+        // layout do not give back the old config.
+        let same_config_now = LiterootConfig {
+            identity_only: false,
+            ..canonical_config()
+        };
+        match codec::decode::<LiterootConfig>(&old_wire) {
+            Err(_) => {}
+            Ok(misread) => assert_ne!(encoded(&misread), encoded(&same_config_now)),
+        }
+
+        let config = in_guest_config();
+        let p = encode(&[0; NONCE_LEN], &digest_of(&config), &old_fp, PATH).unwrap();
+        let mut called = None;
+        let r = admit(
+            &p,
+            Carriage::Absent,
+            Ok(coordinator(&config, digest_of(&config), Script::Full)),
+            &mut called,
+        );
+        assert_eq!(called, None, "a refused packet never connects");
+        match r {
+            Err(e @ AdmitError::FingerprintMismatch { packet, ours }) => {
+                assert_eq!((packet, ours), (old_fp, fp()));
+                assert_eq!(
+                    e.to_string(),
+                    format!(
+                        "literoot initial packet config fingerprint {} is not this build's {}",
+                        std::str::from_utf8(&old_fp).unwrap(),
+                        std::str::from_utf8(&fp()).unwrap()
+                    )
+                );
+            }
+            Err(e) => panic!("refused for another reason: {e}"),
+            Ok(_) => panic!("a packet from another config layout was admitted"),
+        }
+    }
+
     #[test]
     fn carriage_disagreement_and_malformed_carriage_never_connect() {
         let config = in_guest_config();

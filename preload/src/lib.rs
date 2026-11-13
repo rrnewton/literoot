@@ -46,6 +46,8 @@ mod arch;
 mod exec_stage;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
+#[path = "../../src/fake_creds.rs"]
+mod fake_creds;
 #[cfg(all(feature = "mapped-successor", target_env = "musl"))]
 mod initial_image;
 // The initial-image packet: the image decodes and admits. The encoder is

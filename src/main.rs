@@ -16,6 +16,8 @@ mod side_log;
 #[cfg(feature = "tool")]
 mod exec_state;
 #[cfg(feature = "tool")]
+mod fake_creds;
+#[cfg(feature = "tool")]
 mod rootfs_tool;
 #[cfg(all(feature = "private-runtime", feature = "tool"))]
 #[cfg_attr(not(test), allow(dead_code))] // Row e/f's launcher is the first non-test caller.
@@ -211,7 +213,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     let mut fake_root = false;
     let mut fake_ids: Option<(u32, u32)> = None;
     let mut kernel_release: Option<String> = None;
-    let mut identity_only = false;
+    let mut identity_only = true;
     let mut backend = String::from("ptrace");
     let mut verbose = false;
     let mut kill_on_exit = false;
@@ -273,6 +275,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
             "--backend" => backend = take(&mut i, "--backend")?,
             "--kill-on-exit" => kill_on_exit = true,
             "--identity-only" => identity_only = true,
+            "--no-identity-only" => identity_only = false,
             "--check" => check_paths.push(take(&mut i, "--check")?),
             "-v" | "--verbose" => {
                 // proot's -v requires a level argument; only
@@ -378,8 +381,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, CliError> {
     config.fake_root = fake_root;
     config.fake_ids = fake_ids.or(if fake_root { Some((0, 0)) } else { None });
     config.kernel_release = kernel_release;
-    // Requested here; the launcher keeps it only for the caller's own
-    // non-root ids (`tool::identity_only_applies`).
+    // Requested unless --no-identity-only; the launcher keeps it only for
+    // the caller's own non-root ids (`tool::identity_only_applies`), the
+    // rule of the Android launcher's patched proot.
     config.identity_only = identity_only;
     Ok(Cli {
         config,
@@ -404,9 +408,11 @@ fn print_usage() {
          \x20 -w, --cwd, --pwd <dir> initial guest cwd (default / or PROOT_CWD)\n\
          \x20 -0, --root-id          fake uid/gid 0\n\
          \x20 -i, --change-id <u:g>  fake uid and gid\n\
-         \x20 --identity-only        with -i equal to the caller's own non-root ids, emulate\n\
-         \x20                        only the set*id and setxattr calls (an Android launcher's\n\
-         \x20                        patched-proot rule); other ids keep the full -i rules\n\
+         \x20                        -i equal to the caller's own non-root ids emulates only\n\
+         \x20                        the set*id, setfs*id and setxattr calls (an Android\n\
+         \x20                        launcher's patched-proot rule); other ids get every -i rule\n\
+         \x20 --no-identity-only     every -i rule, for the caller's own ids too\n\
+         \x20 --identity-only        the default rule above, requested explicitly\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
          \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3); guest ptrace is refused on in-guest backends\n\
          \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
@@ -767,6 +773,7 @@ mod long_option_value_tests {
         ]);
         assert_eq!(cli.config.kernel_release.as_deref(), Some("6.17.0-generic"));
         assert_eq!(cli.config.fake_ids, Some((10123, 10123)));
+        assert!(cli.config.identity_only);
         assert!(cli.kill_on_exit);
         assert_eq!(cli.cwd_guest, PathBuf::from("/root"));
         assert_eq!(cli.config.binds.len(), 2);
@@ -774,6 +781,17 @@ mod long_option_value_tests {
             cli.command,
             args(&["/usr/bin/env", "-i", "HOME=/root", "/bin/true"])
         );
+    }
+
+    #[test]
+    fn identity_only_is_requested_unless_turned_off() {
+        let on = |v: &[&str]| parse(v).config.identity_only;
+        assert!(on(&["-i", "1:1", "/bin/true"]));
+        assert!(on(&["--identity-only", "-i", "1:1", "/bin/true"]));
+        assert!(!on(&["--no-identity-only", "-i", "1:1", "/bin/true"]));
+        // The last of the two wins.
+        assert!(!on(&["--identity-only", "--no-identity-only", "/bin/true"]));
+        assert!(on(&["--no-identity-only", "--identity-only", "/bin/true"]));
     }
 
     #[test]

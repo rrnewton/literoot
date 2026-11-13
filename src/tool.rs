@@ -727,9 +727,9 @@ pub fn reporter_missing() -> bool {
 
 /// Run `command` (default `/bin/sh`) inside the rootfs under the
 /// requested backend. Returns the guest exit code.
-/// --identity-only takes effect only when the `-i` ids are the caller's
-/// own real ids and not root: then nothing about them needs faking but
-/// the set*id and setxattr calls. Other ids keep the full `-i` rules.
+/// Identity-only takes effect only when the `-i` ids are the caller's own
+/// real ids and not root: then nothing about them needs faking but the
+/// set*id, setfs*id and setxattr calls. Other ids keep the full `-i` rules.
 fn identity_only_applies(fake_ids: Option<(u32, u32)>, (uid, gid): (u32, u32)) -> bool {
     matches!(fake_ids, Some((u, g)) if u != 0 && u == uid && g == gid)
 }

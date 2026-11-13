@@ -32,6 +32,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::exec_state::{ExecState, ExecStateError};
+use crate::fake_creds::Ids;
 use crate::shared_record::{
     shared_record_file, ProcessId, ProcessRecord, RefusalCategory, StoreError, MAX_UTS_BYTES,
 };
@@ -47,7 +48,7 @@ pub struct LiterootConfig {
     pub fake_uid: Option<u32>,
     pub fake_gid: Option<u32>,
     pub kernel_release: Option<String>,
-    /// --identity-only in effect (the launcher checked the `-i` ids
+    /// Identity-only in effect (the launcher checked the `-i` ids
     /// against its own real ids).
     #[serde(default)]
     pub identity_only: bool,
@@ -318,6 +319,10 @@ pub(crate) struct ProcState {
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
     /// setres* must be observable via getres* afterwards.
     pub(crate) fake: Option<[u32; 6]>,
+    /// Fake filesystem uid and gid, once a set*id call under
+    /// identity-only sets them; until then, and after an exec (where
+    /// the kernel resets them), the fake effective ids.
+    pub(crate) fake_fs: Option<(u32, u32)>,
     /// Per-dispatch translation memo (stat-gap fix): one syscall
     /// dispatch translates the same (dirfd, path) through several
     /// helpers; memoize within the dispatch only, keyed by the
@@ -378,6 +383,7 @@ impl Default for RootfsTool {
                 scratch: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
+                fake_fs: None,
                 dispatch_seq: 0,
                 translate_memo: Vec::new(),
                 config_memo: None,
@@ -1038,6 +1044,8 @@ impl Tool for RootfsTool {
             Sysno::setregid,
             Sysno::setresuid,
             Sysno::setresgid,
+            Sysno::setfsuid,
+            Sysno::setfsgid,
             Sysno::setgroups,
             Sysno::sethostname,
             Sysno::setdomainname,
@@ -1156,6 +1164,8 @@ impl Tool for RootfsTool {
             st.scratch = None;
             // A pending self-stop swallow does not survive exec.
             st.swallow_next_self_stop = false;
+            // The kernel resets the filesystem ids to the effective ids.
+            st.fake_fs = None;
         }
         // Pre-allocate the execve scratch page here: injecting
         // an mmap between a guest's two execve calls was
@@ -2900,9 +2910,46 @@ impl Tool for RootfsTool {
                 self.write_one_id(guest, gr.sgid(), f[5]);
                 Ok(0)
             }
+            // ---- identity-only: proot's set*id rules (`fake_creds`) ----
+            Syscall::Setuid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |u, _, root| u.set(s.uid(), root))?;
+                Ok(0)
+            }
+            Syscall::Setgid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |_, g, root| g.set(s.uid(), root))?;
+                Ok(0)
+            }
+            Syscall::Setreuid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |u, _, root| u.set_re(s.ruid(), s.euid(), root))?;
+                Ok(0)
+            }
+            Syscall::Setregid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |_, g, root| g.set_re(s.rgid(), s.egid(), root))?;
+                Ok(0)
+            }
+            Syscall::Setresuid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |u, _, root| {
+                    u.set_res(s.ruid(), s.euid(), s.suid(), root)
+                })?;
+                Ok(0)
+            }
+            Syscall::Setresgid(s) if self.identity_only(guest) => {
+                self.with_reference_ids(guest, |_, g, root| {
+                    g.set_res(s.rgid(), s.egid(), s.sgid(), root)
+                })?;
+                Ok(0)
+            }
+            Syscall::Setfsuid(s) if self.identity_only(guest) => {
+                let fsuid = s.into_parts().1.arg0 as u32;
+                Ok(self.with_reference_ids(guest, |u, _, root| u.set_fs(fsuid, root)) as i64)
+            }
+            Syscall::Setfsgid(s) if self.identity_only(guest) => {
+                let fsgid = s.into_parts().1.arg0 as u32;
+                Ok(self.with_reference_ids(guest, |_, g, root| g.set_fs(fsgid, root)) as i64)
+            }
             Syscall::Setuid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if f[1] == 0 {
@@ -2918,8 +2965,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setgid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if f[4] == 0 {
@@ -2935,8 +2982,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setreuid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.ruid() != u32::MAX {
@@ -2952,8 +2999,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setregid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.rgid() != u32::MAX {
@@ -2969,8 +3016,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setresuid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.ruid() != u32::MAX {
@@ -2988,8 +3035,8 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Setresgid(s) => {
-                if self.fake_cred_ids(guest).is_some() {
-                    let fake_cfg = self.fake_cred_ids(guest);
+                if self.fake_ids(guest).is_some() {
+                    let fake_cfg = self.fake_ids(guest);
                     let mut st = self.state.lock().unwrap();
                     let f = st.fake.get_or_insert_with(|| init_fake(fake_cfg));
                     if s.rgid() != u32::MAX {
@@ -3022,29 +3069,47 @@ impl Tool for RootfsTool {
                     Ok(guest.inject(c).await?)
                 }
             }
+            // Fake root claims every setxattr; otherwise the kernel runs it on
+            // the translated path, and identity-only claims its
+            // permission errors (`identity_xattr_result`).
             Syscall::Setxattr(x) => {
-                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
-                    let _ = x;
-                    Ok(0)
-                } else {
-                    Ok(guest.inject(x).await?)
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    return Ok(0);
                 }
+                let Some(pp) = x.path() else {
+                    let ret = guest.inject(x).await;
+                    return self.identity_xattr_result(guest, ret);
+                };
+                let g = pp.read(&guest.memory())?;
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let (_guard, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| x.with_path(PathPtr::from_ptr(ptr)))
+                    .await?;
+                let ret = guest.inject(rewritten).await;
+                self.identity_xattr_result(guest, ret)
             }
             Syscall::Lsetxattr(x) => {
-                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
-                    let _ = x;
-                    Ok(0)
-                } else {
-                    Ok(guest.inject(x).await?)
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    return Ok(0);
                 }
+                let Some(pp) = x.path() else {
+                    let ret = guest.inject(x).await;
+                    return self.identity_xattr_result(guest, ret);
+                };
+                let g = pp.read(&guest.memory())?;
+                let host = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let (_guard, rewritten) = self
+                    .with_guest_path(guest, &host, |ptr| x.with_path(PathPtr::from_ptr(ptr)))
+                    .await?;
+                let ret = guest.inject(rewritten).await;
+                self.identity_xattr_result(guest, ret)
             }
             Syscall::Fsetxattr(x) => {
-                if self.fake_cred_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
-                    let _ = x;
-                    Ok(0)
-                } else {
-                    Ok(guest.inject(x).await?)
+                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0 {
+                    return Ok(0);
                 }
+                let ret = guest.inject(x).await;
+                self.identity_xattr_result(guest, ret)
             }
             // ---- uname / hostname (design §2 -k) ----
             Syscall::Uname(un) => {
@@ -3101,16 +3166,22 @@ impl Tool for RootfsTool {
             }
             // ---- chroot emulation: re-root replicated state ----
             Syscall::Chroot(cr) => {
-                // Only fake-root may chroot (proot: non-root fake
-                // ids get the kernel EPERM).
-                if self.fake_ids(guest).is_some() && self.fake_state(guest)[1] != 0 {
-                    return Ok(guest.inject(cr).await?);
-                }
                 let Some(pp) = cr.path() else {
                     return Ok(guest.inject(cr).await?);
                 };
                 let g = pp.read(&guest.memory())?;
                 let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                // Only fake root may chroot: proot gives a non-root fake
+                // euid the kernel's answer, and identity-only does not
+                // trace chroot at all; either way on the translated path.
+                if self.identity_only(guest)
+                    || (self.fake_ids(guest).is_some() && self.fake_state(guest)[1] != 0)
+                {
+                    let (_guard, rewritten) = self
+                        .with_guest_path(guest, &host, |ptr| cr.with_path(PathPtr::from_ptr(ptr)))
+                        .await?;
+                    return Ok(guest.inject(rewritten).await?);
+                }
                 if !host.is_dir() {
                     return Err(reverie::syscalls::Errno::ENOTDIR.into());
                 }
@@ -3551,7 +3622,7 @@ impl RootfsTool {
     }
 
     /// The fake ids every fake-identity rule uses; none under
-    /// --identity-only, which emulates only the set*id and setxattr
+    /// identity-only, which emulates only the set*id, setfs*id and setxattr
     /// calls (`fake_cred_ids`).
     fn fake_ids<T: Guest<Self>>(&self, guest: &T) -> Option<(u32, u32)> {
         let cfg = self.config(guest);
@@ -3562,10 +3633,62 @@ impl RootfsTool {
         }
     }
 
-    /// The fake ids the set*id and setxattr emulation starts from,
-    /// --identity-only included.
+    /// The fake ids the set*id emulation starts from, identity-only
+    /// included.
     fn fake_cred_ids<T: Guest<Self>>(&self, guest: &T) -> Option<(u32, u32)> {
         self.config(guest).fake_ids
+    }
+
+    fn identity_only<T: Guest<Self>>(&self, guest: &T) -> bool {
+        self.config(guest).identity_only
+    }
+
+    /// Applies one of proot's set*id rules (`crate::fake_creds`) to the
+    /// fake uids and gids; the caller is privileged when its fake
+    /// effective uid is 0.
+    fn with_reference_ids<T: Guest<Self>, R>(
+        &self,
+        guest: &T,
+        rule: impl FnOnce(&mut Ids, &mut Ids, bool) -> R,
+    ) -> R {
+        let fake_cfg = self.fake_cred_ids(guest);
+        let mut st = self.state.lock().unwrap();
+        let f = *st.fake.get_or_insert_with(|| init_fake(fake_cfg));
+        let (fsuid, fsgid) = st.fake_fs.unwrap_or((f[1], f[4]));
+        let mut u = Ids {
+            r: f[0],
+            e: f[1],
+            s: f[2],
+            fs: fsuid,
+        };
+        let mut g = Ids {
+            r: f[3],
+            e: f[4],
+            s: f[5],
+            fs: fsgid,
+        };
+        let out = rule(&mut u, &mut g, f[1] == 0);
+        st.fake = Some([u.r, u.e, u.s, g.r, g.e, g.s]);
+        st.fake_fs = Some((u.fs, g.fs));
+        out
+    }
+
+    /// A setxattr call's result. Under identity-only, EPERM and EACCES
+    /// become success at any fake euid, as proot's
+    /// `handle_perm_err_exit_end(tracee, config, true)` makes them for the
+    /// three setxattr calls; other errors and successes stand.
+    fn identity_xattr_result<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        ret: Result<i64, reverie::syscalls::Errno>,
+    ) -> Result<i64, Error> {
+        use reverie::syscalls::Errno;
+        match ret {
+            Err(e) if (e == Errno::EPERM || e == Errno::EACCES) && self.identity_only(guest) => {
+                Ok(0)
+            }
+            other => Ok(other?),
+        }
     }
 
     fn fake_state<T: Guest<Self>>(&self, guest: &T) -> [u32; 6] {

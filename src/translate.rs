@@ -174,8 +174,10 @@ pub struct RootConfig {
     pub fake_ids: Option<(u32, u32)>,
     /// Spoofed kernel release (`-k`), if any.
     pub kernel_release: Option<String>,
-    /// `--identity-only`, in effect: the `-i` ids are the caller's own
-    /// non-root ids, and only the set*id and setxattr calls are emulated.
+    /// Identity-only: when the `-i` ids are the caller's own non-root ids,
+    /// only the set*id, setfs*id and setxattr calls are emulated. The CLI
+    /// requests it unless `--no-identity-only`; the launcher passes it on
+    /// only for such ids.
     pub identity_only: bool,
 }
 

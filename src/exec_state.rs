@@ -630,6 +630,7 @@ mod tests {
             dirent_seen: HashMap::new(),
             argv: vec![b"sh".to_vec()],
             fake: None,
+            fake_fs: None,
             dispatch_seq: 7,
             translate_memo: Vec::new(),
             config_memo: None,
