@@ -332,8 +332,31 @@ fn full(dir: &Path, guest: &Path, name: &str, args: &[&str]) -> String {
     stdout(common::run_bounded(cmd, name), name)
 }
 
-fn identity_expected() -> String {
-    NATIVE
+/// The native output for a caller whose own gid is `gid`. With gid 0 the
+/// probe's `root` gid is the caller's own (`role` prints it as `own`), so the
+/// gid calls that name it are allowed; uid calls and the rest are unchanged.
+fn native_for(gid: u32) -> String {
+    if gid != 0 {
+        return NATIVE.to_string();
+    }
+    [
+        ("setgid(root) -1 EPERM", "setgid(own) 0"),
+        ("setregid(root,-1) -1 EPERM", "setregid(own,-1) 0"),
+        ("setregid(-1,root) -1 EPERM", "setregid(-1,own) 0"),
+        ("setresgid(root,-1,-1) -1 EPERM", "setresgid(own,-1,-1) 0"),
+        ("setresgid(-1,root,-1) -1 EPERM", "setresgid(-1,own,-1) 0"),
+        ("setresgid(-1,-1,root) -1 EPERM", "setresgid(-1,-1,own) 0"),
+        ("setfsgid(root) -> own", "setfsgid(own) -> own"),
+    ]
+    .iter()
+    .fold(NATIVE.to_string(), |out, (from, to)| {
+        assert!(out.contains(from), "{from} is not in NATIVE");
+        out.replace(from, to)
+    })
+}
+
+fn identity_expected(native: &str) -> String {
+    native
         .replace(
             "setxattr(file,trusted) -1 EPERM",
             "setxattr(file,trusted) 0",
@@ -352,10 +375,10 @@ fn identity_expected() -> String {
 #[test]
 fn own_ids_get_proots_identity_only_rules() {
     let (uid, gid) = real_ids();
-    if uid == 0 || gid == 0 {
-        // Not a pass: identity-only cannot apply to root, and the probe's
-        // `root` role needs a non-zero own gid. The other test still runs.
-        eprintln!("SKIPPED (real uid {uid}, gid {gid}): identity-only needs non-root ids");
+    if uid == 0 {
+        // Not a pass: identity-only never applies to uid 0. The other test
+        // still asserts that `-i 0:0` keeps every rule.
+        eprintln!("SKIPPED (real uid 0): identity-only needs a non-root uid");
         return;
     }
     let dir = own_dir("probe");
@@ -365,11 +388,12 @@ fn own_ids_get_proots_identity_only_rules() {
     let work = fresh(&dir, "native");
     let mut cmd = Command::new(&guest);
     cmd.arg(&work).args([uid.to_string(), gid.to_string()]);
-    assert_eq!(stdout(common::run_bounded(cmd, "native"), "native"), NATIVE);
+    let native = native_for(gid);
+    assert_eq!(stdout(common::run_bounded(cmd, "native"), "native"), native);
 
-    // No flag needed: own ids switch identity-only on.
+    // No flag needed: own ids switch identity-only on, gid 0 included.
     let own = format!("{uid}:{gid}");
-    let expected = identity_expected();
+    let expected = identity_expected(&native);
     assert_eq!(probe(&dir, &guest, "auto", &own, &[]), expected);
     assert_eq!(
         probe(&dir, &guest, "explicit", &own, &["--identity-only"]),

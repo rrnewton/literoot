@@ -2122,6 +2122,9 @@ mod identity_only_tests {
         assert!(!identity_only_applies(Some((10123, 10123)), me));
         assert!(!identity_only_applies(Some((10124, 10124)), me));
         assert!(!identity_only_applies(Some((0, 0)), me));
+        // Patch 0012 asks only for a non-root uid: a real gid of 0 is eligible.
+        assert!(identity_only_applies(Some((10123, 0)), (10123, 0)));
+        assert!(!identity_only_applies(Some((10123, 0)), me));
         // Root's own ids are still faked in full.
         assert!(!identity_only_applies(Some((0, 0)), (0, 0)));
         assert!(!identity_only_applies(Some((0, 5)), (0, 5)));
