@@ -2162,20 +2162,39 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Fchown(fc) => {
-                // The fd form of fchownat's rule: fake root's chown always
-                // reports success (proot traces fchown for the same rule).
-                if self.config(guest).fake_ids == Some((0, 0))
-                    || (self.fake_ids(guest).is_some() && self.fake_state(guest)[1] == 0)
-                {
-                    return Ok(0);
+                // proot's fake_id0 rule at 4dba3afb: a requested id equal
+                // to the fake real id becomes the caller's real id
+                // (chown.c:10-25), the kernel runs the call, and only
+                // EPERM/EACCES become success, only while the current fake
+                // euid is 0 (fake_id0.c:503-527, :914-921).
+                if self.fake_ids(guest).is_none() {
+                    return Ok(guest.inject(fc).await?);
                 }
-                Ok(guest.inject(fc).await?)
+                let [ruid, euid, _, rgid, _, _] = self.fake_state(guest);
+                let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+                let mut call = fc;
+                if call.owner() == ruid {
+                    call = call.with_owner(uid);
+                }
+                if call.group() == rgid {
+                    call = call.with_group(gid);
+                }
+                use reverie::syscalls::Errno;
+                match guest.inject(call).await {
+                    Err(e) if euid == 0 && (e == Errno::EPERM || e == Errno::EACCES) => Ok(0),
+                    other => Ok(other?),
+                }
             }
             Syscall::Statfs(sf) => {
                 let Some(pp) = sf.path() else {
                     return Ok(guest.inject(sf).await?);
                 };
                 let g = pp.read(&guest.memory())?;
+                if g.as_os_str().is_empty() {
+                    // proot leaves an empty path untranslated
+                    // (syscall/enter.c:58-72), so the kernel says ENOENT.
+                    return Ok(guest.inject(sf).await?);
+                }
                 let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| sf.with_path(PathPtr::from_ptr(ptr)))
@@ -4848,12 +4867,24 @@ fn resolve_symlink_chain(cfg: &RootConfig, host: PathBuf) -> PathBuf {
                 cur = cfg.translate(&target, Path::new("/"), None);
             }
             Ok(target) => {
-                let mut next = cur
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                next.push(target);
-                cur = next;
+                // A relative target names a guest path next to the link,
+                // so resolve it in the guest namespace, where it may cross
+                // a bind (proot: path/canon.c:330-341). A link outside
+                // every mapped tree keeps the host join.
+                let guest_parent = cfg
+                    .reverse(&cur)
+                    .and_then(|g| g.parent().map(Path::to_path_buf));
+                cur = match guest_parent {
+                    Some(parent) => cfg.translate(&target, &parent, None),
+                    None => {
+                        let mut next = cur
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("/"));
+                        next.push(target);
+                        next
+                    }
+                };
             }
             Err(_) => break,
         }
