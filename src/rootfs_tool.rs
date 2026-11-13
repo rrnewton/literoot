@@ -1806,21 +1806,12 @@ impl Tool for RootfsTool {
             Syscall::Fchdir(fch) => {
                 let ret = guest.inject(fch).await?;
                 if ret == 0 {
-                    // Replicated cwd follows the fd's guest path;
-                    // unknown fds recover via /proc/<pid>/fd.
-                    let recovered = {
+                    // Replicated cwd follows the fd's guest path.
+                    let cfg = self.config(guest);
+                    let new_cwd = {
                         let st = self.state.lock().unwrap();
-                        st.fds.get(&fch.fd()).cloned()
+                        self.fd_guest_path(guest, &cfg, &st, fch.fd())
                     };
-                    let new_cwd = recovered.or_else(|| {
-                        let target = std::fs::read_link(format!(
-                            "/proc/{}/fd/{}",
-                            guest.pid().as_raw(),
-                            fch.fd()
-                        ))
-                        .ok()?;
-                        self.config(guest).reverse(&target)
-                    });
                     if let Some(p) = new_cwd {
                         self.state.lock().unwrap().cwd = p;
                     }
@@ -2563,9 +2554,10 @@ impl Tool for RootfsTool {
                                 .unwrap()
                                 .dirent_pending
                                 .insert(fd, Vec::new());
+                            let cfg = self.config(guest);
                             let guest_dir = {
                                 let st = self.state.lock().unwrap();
-                                st.fds.get(&fd).cloned()
+                                self.fd_guest_path(guest, &cfg, &st, fd)
                             };
                             if let Some(gd_path) = guest_dir {
                                 let synth =
@@ -3666,6 +3658,66 @@ impl RootfsTool {
     /// The fake ids every fake-identity rule uses; none under
     /// identity-only, which emulates only the set*id, setfs*id and setxattr
     /// calls (`fake_cred_ids`).
+    /// `config` for a caller that already holds the state lock.
+    fn config_locked<T: Guest<Self>>(&self, guest: &T, st: &ProcState) -> RootConfig {
+        if let Some((seq, root, cfg)) = &st.config_memo {
+            if *seq == st.dispatch_seq && *root == st.root_override {
+                return cfg.clone();
+            }
+        }
+        let mut cfg = guest.config().to_root_config();
+        if let Some(root) = &st.root_override {
+            cfg.rootfs = root.clone();
+        }
+        cfg
+    }
+
+    /// The guest path of the file open as `fd`, or None when it has none.
+    /// The fd table learns a path at open but is not told about close,
+    /// dup, close_range, close-on-exec or fds received over a socket, and
+    /// it is copied across fork and exec, so a number it records can now
+    /// be a different file (measured: rm's directory fd resolved to the
+    /// lock file its parent dpkg had open under that number). So the
+    /// kernel's /proc/<pid>/fd/<fd> decides:
+    /// - the entry stands while its translated host path is the same
+    ///   file (device and inode) as the open one, whichever host spelling
+    ///   a bind gives it;
+    /// - otherwise the link's target mapped back into the guest namespace
+    ///   (`RootConfig::reverse`), as proot resolves every dirfd;
+    /// - None for a closed fd, a deleted file (no links left), a target
+    ///   with no path (pipe:, socket:, anon_inode:) or one outside every
+    ///   mapped tree;
+    /// - the entry, as before, when /proc/<pid>/fd cannot be read at all.
+    fn fd_guest_path<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        cfg: &RootConfig,
+        st: &ProcState,
+        fd: i32,
+    ) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = format!("/proc/{}/fd", guest.pid().as_raw());
+        let link = format!("{dir}/{fd}");
+        let recorded = st.fds.get(&fd);
+        let live = match std::fs::metadata(&link) {
+            Ok(md) => md,
+            Err(_) if std::fs::metadata(&dir).is_ok() => return None,
+            Err(_) => return recorded.cloned(),
+        };
+        if live.nlink() == 0 {
+            return None;
+        }
+        if let Some(p) = recorded {
+            let host = cfg.translate(p, Path::new("/"), None);
+            if let Ok(md) = std::fs::metadata(&host) {
+                if (md.dev(), md.ino()) == (live.dev(), live.ino()) {
+                    return Some(p.clone());
+                }
+            }
+        }
+        std::fs::read_link(&link).ok().and_then(|t| cfg.reverse(&t))
+    }
+
     fn fake_ids<T: Guest<Self>>(&self, guest: &T) -> Option<(u32, u32)> {
         let cfg = self.config(guest);
         if cfg.identity_only {
@@ -4288,9 +4340,9 @@ impl RootfsTool {
         if path.is_absolute() {
             path.to_path_buf()
         } else if dirfd != libc::AT_FDCWD {
-            match st.fds.get(&dirfd) {
-                Some(d) => {
-                    let mut p = d.clone();
+            let cfg = self.config_locked(guest, st);
+            match self.fd_guest_path(guest, &cfg, st, dirfd) {
+                Some(mut p) => {
                     p.push(path);
                     p
                 }
@@ -4303,8 +4355,8 @@ impl RootfsTool {
         }
     }
 
-    /// True when a relative path's dirfd is unknown and not
-    /// recoverable as a directory: the syscall must pass through
+    /// True when a relative path's dirfd has no guest path or is not a
+    /// directory (unknown, stale, deleted, a pipe): the syscall must pass through
     /// untranslated so the kernel reports ENOTDIR/EBADF itself
     /// (test-openat-fd-edge-cases). Recoverable dirfds are
     /// cached into the fd table.
@@ -4312,24 +4364,20 @@ impl RootfsTool {
         if path.is_absolute() || dirfd == libc::AT_FDCWD {
             return false;
         }
-        {
-            let st = self.state.lock().unwrap();
-            if st.fds.contains_key(&dirfd) {
-                return false;
+        let cfg = self.config(guest);
+        let live = std::fs::metadata(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd));
+        let mut st = self.state.lock().unwrap();
+        // fd_guest_path checks a table entry against the open file, so a
+        // stale entry never stops a passthrough.
+        match (self.fd_guest_path(guest, &cfg, &st, dirfd), live) {
+            (Some(g), Ok(md)) if md.is_dir() => {
+                st.fds.insert(dirfd, g);
+                false
             }
+            // /proc unreadable: the table entry stands, as before.
+            (Some(_), Err(_)) => false,
+            _ => true,
         }
-        if let Ok(target) =
-            std::fs::read_link(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd))
-        {
-            let cfg = self.config(guest);
-            if target.is_dir() {
-                if let Some(g) = cfg.reverse(&target) {
-                    self.state.lock().unwrap().fds.insert(dirfd, g);
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     fn translate_for<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
@@ -4364,23 +4412,25 @@ impl RootfsTool {
         } else {
             st.cwd.clone()
         };
+        // Unknown dirfds (inherited, SCM_RIGHTS, stdin...) recover
+        // through /proc/<pid>/fd in fd_guest_path.
         let dirfd_guest = if dirfd == libc::AT_FDCWD {
             None
-        } else if let Some(p) = st.fds.get(&dirfd).cloned() {
-            Some(p)
         } else {
-            // Unknown dirfd (inherited, SCM_RIGHTS, stdin...):
-            // recover its guest path via /proc/<pid>/fd; non-path
-            // fds (pipe/socket) recover to None-of-a-flag: use a
-            // sentinel guest path that makes translate produce a
-            // path under the fd's own name so the kernel still
-            // reports ENOTDIR/EBADF faithfully is NOT possible —
-            // instead record the recovery or mark unknown.
-            match std::fs::read_link(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd)) {
-                Ok(target) => cfg.reverse(&target),
-                Err(_) => None,
-            }
+            self.fd_guest_path(guest, &cfg, &st, dirfd)
         };
+        if dirfd != libc::AT_FDCWD && dirfd_guest.is_none() && !path.is_absolute() {
+            // The fd has no guest path (deleted, pipe, socket, outside
+            // every mapped tree, closed): resolve through the fd itself,
+            // so the kernel answers for the object it holds (ENOENT in a
+            // deleted directory, ENOTDIR for a pipe) instead of the call
+            // landing relative to the cwd.
+            let mut host = PathBuf::from(format!("/proc/{}/fd/{}", guest.pid().as_raw(), dirfd));
+            if !path.as_os_str().is_empty() {
+                host.push(path);
+            }
+            return host;
+        }
         // Unknown non-path dirfd: relative resolution against cwd
         // would fabricate ENOENT where the kernel says ENOTDIR.
         // Signal via cwd sentinel handled by callers is complex;

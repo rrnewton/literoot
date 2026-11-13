@@ -1,7 +1,8 @@
-//! Two calls a package install makes, on the ptrace backend: statfs on a
-//! path (apt's free-space check) goes to the translated path, and fchown
-//! (dpkg-deb's tar sets the owner of the files it extracts) follows proot's
-//! fake_id0 rules. Native runs are the oracle.
+//! Calls a package install makes, on the ptrace backend: statfs on a path
+//! (apt's free-space check) goes to the translated path; fchown (dpkg-deb's
+//! tar sets the owner of the files it extracts) follows proot's fake_id0
+//! rules; and a dirfd that reuses a closed number (rm's dup'd directory fd
+//! under dpkg) resolves to its own directory. Native runs are the oracle.
 
 mod common;
 
@@ -92,6 +93,77 @@ int main(int argc, char **argv) {
     long r = syscall(SYS_setuid, uid + 1);
     say("setuid(other)", r, errno);
     one("fchown(root) after setuid", fd, 0, 0);
+    return 0;
+}
+"#;
+
+/// Dirfds the fd table cannot name from its own records: argv dir, which
+/// holds `lock`, `a/victim`, `b/victim` and an empty `c`.
+/// 1. `lock` (a file) is opened as fd n and closed; `b` is dup'd onto n.
+/// 2. `a` is opened as fd m and closed; `b` is dup'd onto m. A table that
+///    still says m is `a` would unlink `a/victim` and report success.
+/// 3. `c` is opened, then removed: a deleted directory.
+/// 4. A pipe.
+const STALE_FD_C: &str = r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static int exists(const char *dir, const char *name) {
+    char p[4096];
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    return access(p, F_OK) == 0;
+}
+
+static void say(const char *what, int r, int e) {
+    printf("%s %d errno %d\n", what, r, r < 0 ? e : 0);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    char lock[4096], a[4096], b[4096], c[4096];
+    snprintf(lock, sizeof lock, "%s/lock", argv[1]);
+    snprintf(a, sizeof a, "%s/a", argv[1]);
+    snprintf(b, sizeof b, "%s/b", argv[1]);
+    snprintf(c, sizeof c, "%s/c", argv[1]);
+    int fb = open(b, O_RDONLY | O_DIRECTORY);
+    if (fb < 0) return 3;
+
+    int fl = open(lock, O_RDONLY);
+    if (fl < 0) return 3;
+    close(fl);
+    int d1 = fcntl(fb, F_DUPFD, 0);
+    printf("1 dup took the file's number %d\n", d1 == fl);
+    int f = openat(d1, "made1", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    say("1 openat(dup,made1)", f < 0 ? -1 : 0, errno);
+    printf("1 b/made1 %d\n", exists(b, "made1"));
+
+    int fa = open(a, O_RDONLY | O_DIRECTORY);
+    if (fa < 0) return 3;
+    close(fa);
+    int d2 = fcntl(fb, F_DUPFD, 0);
+    printf("2 dup took the directory's number %d\n", d2 == fa);
+    int r = unlinkat(d2, "victim", 0);
+    say("2 unlinkat(dup,victim)", r, errno);
+    printf("2 a/victim %d b/victim %d\n", exists(a, "victim"), exists(b, "victim"));
+    f = openat(d2, "made2", O_WRONLY | O_CREAT | O_EXCL, 0644);
+    say("2 openat(dup,made2)", f < 0 ? -1 : 0, errno);
+    printf("2 a/made2 %d b/made2 %d\n", exists(a, "made2"), exists(b, "made2"));
+
+    int fc = open(c, O_RDONLY | O_DIRECTORY);
+    if (fc < 0 || rmdir(c) != 0) return 3;
+    r = unlinkat(fc, "x", 0);
+    say("3 unlinkat(deleted,x)", r, errno);
+    f = openat(fc, "x", O_WRONLY | O_CREAT, 0644);
+    say("3 openat(deleted,x)", f < 0 ? -1 : 0, errno);
+
+    int p[2];
+    if (pipe(p) != 0) return 3;
+    r = unlinkat(p[0], "x", 0);
+    say("4 unlinkat(pipe,x)", r, errno);
+    r = mkdirat(p[0], "x", 0755);
+    say("4 mkdirat(pipe,x)", r, errno);
     return 0;
 }
 "#;
@@ -307,5 +379,49 @@ fn fchown_follows_proots_fake_id_rules() {
             ]
         )
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A work directory with `lock`, `a/victim`, `b/victim` and an empty `c`.
+fn stale_fd_work(parent: &Path, name: &str) -> PathBuf {
+    let work = parent.join(name);
+    for d in ["a", "b"] {
+        std::fs::create_dir_all(work.join(d)).unwrap();
+        std::fs::write(work.join(d).join("victim"), "x").unwrap();
+    }
+    std::fs::create_dir(work.join("c")).unwrap();
+    std::fs::write(work.join("lock"), "").unwrap();
+    work
+}
+
+#[test]
+fn a_dirfd_the_fd_table_cannot_name_resolves_to_its_own_file() {
+    let dir = own_dir("stale-fd");
+    let guest = build_guest(&dir, "stale", STALE_FD_C);
+    let work = stale_fd_work(&dir, "native");
+    let native = run_native(&guest, "native", &[work.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "1 dup took the file's number 1\n\
+         1 openat(dup,made1) 0 errno 0\n\
+         1 b/made1 1\n\
+         2 dup took the directory's number 1\n\
+         2 unlinkat(dup,victim) 0 errno 0\n\
+         2 a/victim 1 b/victim 0\n\
+         2 openat(dup,made2) 0 errno 0\n\
+         2 a/made2 0 b/made2 1\n\
+         3 unlinkat(deleted,x) -1 errno 2\n\
+         3 openat(deleted,x) -1 errno 2\n\
+         4 unlinkat(pipe,x) -1 errno 20\n\
+         4 mkdirat(pipe,x) -1 errno 20\n"
+    );
+    for (name, flags) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = stale_fd_work(&dir, name);
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
