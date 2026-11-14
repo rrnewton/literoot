@@ -12,7 +12,9 @@
 //! - `/rel` holds a relative target beside it, followed the same way.
 //!
 //! With AT_SYMLINK_NOFOLLOW the call changes the link itself; an invalid
-//! flag stays the kernel's EINVAL.
+//! flag stays the kernel's EINVAL, which the kernel answers before it looks
+//! at the path: even for `/long`, a short link whose dangling absolute
+//! target, once resolved, is longer than literoot stages for a path.
 
 mod common;
 
@@ -48,6 +50,7 @@ int main(int argc, char **argv) {
     res("fchownat(twin,0)", syscall(SYS_fchownat, AT_FDCWD, "/twin", u, g, 0L));
     res("fchownat(rel,0)", syscall(SYS_fchownat, AT_FDCWD, "/rel", u, g, 0L));
     res("fchownat(rel,bad)", syscall(SYS_fchownat, AT_FDCWD, "/rel", u, g, 1L));
+    res("fchownat(long,bad)", syscall(SYS_fchownat, AT_FDCWD, "/long", u, g, 1L));
 #ifdef SYS_chown
     res("chown(abs)", syscall(SYS_chown, "/abs", u, g));
 #endif
@@ -121,6 +124,14 @@ fn fchownat_follows_a_final_symlink_through_the_guest_root() {
     std::os::unix::fs::symlink(&target, root.join("abs")).unwrap();
     std::os::unix::fs::symlink("/twin-dir/target", root.join("twin")).unwrap();
     std::os::unix::fs::symlink("rel-target", root.join("rel")).unwrap();
+    // 120 components of 9 bytes: 1080 bytes, past the 1024-byte staging
+    // bound once resolved under the rootfs, and absent there.
+    let long: String = (0..120).map(|i| format!("/c{i:07}")).collect();
+    assert!(
+        std::fs::symlink_metadata(&long).is_err(),
+        "{long} exists on the host"
+    );
+    std::os::unix::fs::symlink(&long, root.join("long")).unwrap();
     std::fs::write(root.join("twin-dir/target"), "twin").unwrap();
     std::fs::write(root.join("rel-target"), "rel").unwrap();
 
@@ -135,6 +146,7 @@ fn fchownat_follows_a_final_symlink_through_the_guest_root() {
         "fchownat(twin,0) 0".to_string(),
         "fchownat(rel,0) 0".to_string(),
         "fchownat(rel,bad) -1 errno 22".to_string(),
+        "fchownat(long,bad) -1 errno 22".to_string(),
     ];
     if cfg!(target_arch = "x86_64") {
         want.push("chown(abs) -1 errno 2".to_string());

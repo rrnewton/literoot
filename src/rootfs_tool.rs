@@ -2424,6 +2424,12 @@ impl Tool for RootfsTool {
                 {
                     return Ok(0);
                 }
+                // The kernel rejects any other flag with EINVAL before it
+                // looks at the path, so no translation can fail first.
+                let valid = (libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u32;
+                if fc.flags().bits() as u32 & !valid != 0 {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 let Some(pp) = fc.path() else {
                     return Ok(guest.inject(fc).await?);
                 };
