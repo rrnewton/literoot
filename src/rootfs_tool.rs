@@ -2428,7 +2428,17 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(fc).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, fc.dirfd(), &g);
+                // The kernel follows a final symlink unless
+                // AT_SYMLINK_NOFOLLOW; resolve it here, through the guest
+                // root, or the kernel would follow it in the host's.
+                let h = if fc
+                    .flags()
+                    .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
+                {
+                    self.translate_for(guest, fc.dirfd(), &g)
+                } else {
+                    self.translate_follow(guest, fc.dirfd(), &g)
+                };
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         fc.with_path(PathPtr::from_ptr(ptr))
