@@ -14,6 +14,11 @@ the name and tracks the design. Milestones: M1 x86-64 Linux correctness with a
 differential oracle against real proot; M2 aarch64 Linux; M3 aarch64 Android
 app sandbox (seccomp-constrained, no user namespaces).
 
+Known issue: in non-fake-root mode the rootfs is not an isolation boundary.
+Some path system calls can reach host files that the invoking user can already
+access. Do not rely on literoot to confine untrusted programs. A fix is in
+progress.
+
 See [docs/design.md](docs/design.md) for the full design: CLI compatibility
 scope, interception mechanism, Android syscall-emulation requirements, state
 model, dependency pins, and the correctness/performance test plan.
