@@ -1,0 +1,33 @@
+# Libraries for the dlopen-many cell (bench/dlopen_many.c): sonames the
+# dynamic loader searches for, common on glibc-based distributions. A
+# host that lacks one fails the cell, with the loader's message on stderr.
+libacl.so.1
+libattr.so.1
+libblkid.so.1
+libbz2.so.1
+libcap.so.2
+libcrypt.so.2
+libcrypto.so.3
+libelf.so.1
+libexpat.so.1
+libffi.so.8
+libgcc_s.so.1
+libgcrypt.so.20
+libgmp.so.10
+libkeyutils.so.1
+liblzma.so.5
+libm.so.6
+libmount.so.1
+libpcre2-8.so.0
+libreadline.so.8
+libresolv.so.2
+libselinux.so.1
+libsqlite3.so.0
+libssl.so.3
+libstdc++.so.6
+libsystemd.so.0
+libtinfo.so.6
+libuuid.so.1
+libxml2.so.2
+libz.so.1
+libzstd.so.1

@@ -1,0 +1,7 @@
+# The build workload for bench/run.sh, in its own file because it needs
+# --assets: a directory holding lua-5.4.8.tar.gz and a SHA256SUMS that
+# lists it (bench/assets.sha256 is the pinned value to copy there).
+# Every run extracts a clean tree into its own new {RUNDIR} and builds it
+# with make -j4; the extraction is inside the timed region. It prints the
+# number of compiler invocations make ran ("cc=N"), to compare with native.
+lua-build	host	9	900	Lua 5.4.8	sh -c 'tar -xzf {ASSETS}/lua-5.4.8.tar.gz -C {RUNDIR} && make -j4 -C {RUNDIR}/lua-5.4.8 > {RUNDIR}/make.log 2>&1 && echo cc=$(grep -c -- " -c " {RUNDIR}/make.log) && {RUNDIR}/lua-5.4.8/src/lua -v'

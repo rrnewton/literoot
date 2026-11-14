@@ -1,0 +1,23 @@
+# Workloads for bench/run.sh: ID<TAB>ROOT<TAB>ROUNDS<TAB>TIMEOUT<TAB>EXPECT<TAB>COMMAND.
+# "host" cells run on rootfs /; "alpine" cells need --rootfs alpine=DIR,
+# laid out by bench/mktree.sh, with the bench binaries copied to DIR/bench-bin.
+# --bin-host must hold the host-built binaries and stat-list.txt (see README).
+# The build workload (lua) is in workloads-build.tsv.
+# startup-min and startup-min-alpine do almost nothing: they measure the
+# timer, timeout and runner startup that every other cell's wall time includes.
+startup-min	host	31	120	count=1	{BIN}/statloop 1 {BIN}/statloop
+shell-builtins	host	31	120	=20000	sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo $i'
+shell-exec	host	31	120	=children=500	sh -c 'i=0; while [ $i -lt 500 ]; do {BIN}/tick {RUNDIR}/count || exit 9; i=$((i+1)); done; echo children=$(($(wc -c < {RUNDIR}/count)))'
+shell-stat	host	31	120	all-hit	sh -c 't=0; n=0; while IFS= read -r f; do t=$((t+1)); [ -e "$f" ] && n=$((n+1)); done < {BIN}/stat-list.txt; [ "$t" -gt 0 ] && [ "$n" -eq "$t" ] && echo all-hit t=$t'
+python-bare	host	31	120	=py-ok	python3 -I -S -c 'print("py-ok")'
+python-imports	host	31	120	=py-ok	python3 -I -c 'import json, re, ssl, sqlite3, decimal, asyncio, email.parser; print("py-ok")'
+dlopen-many	host	31	120	listed=30	{BIN}/dlopen_many {BENCH}/dlopen-list.txt
+stat-host	host	31	120	count=20000	{BIN}/statloop 20000 /etc/os-release
+startup-min-alpine	alpine	31	120	count=1	{RUN}{BIN}/statloop 1 {P}/bench-marker 'literoot bench marker'
+stat	alpine	31	120	count=20000	{RUN}{BIN}/statloop 20000 {P}/bench-marker 'literoot bench marker'
+openat	alpine	31	120	count=20000	{RUN}{BIN}/opsloop open 20000 {P}/bench-marker 'literoot bench marker'
+readlink	alpine	31	120	count=20000	{RUN}{BIN}/opsloop readlink 20000 {P}/bench-link bench-marker
+stat-8t	alpine	31	120	count=40000	{RUN}{BIN}/threadstat 8 5000 {P}/bench-marker 'literoot bench marker'
+walk-1t	alpine	31	120	bytes=40960000	{RUN}{BIN}/walker 1 5 {P}/bench-tree 2000 'literoot bench fixture block'
+walk-4t	alpine	31	120	bytes=40960000	{RUN}{BIN}/walker 4 5 {P}/bench-tree 2000 'literoot bench fixture block'
+walk-8t	alpine	31	120	bytes=40960000	{RUN}{BIN}/walker 8 5 {P}/bench-tree 2000 'literoot bench fixture block'

@@ -1,0 +1,11 @@
+# Example runners for bench/run.sh: NAME<TAB>MODE<TAB>KIND<TAB>ENV<TAB>PREFIX.
+# The /opt/bench paths are placeholders: a real run gives the absolute
+# paths of the binaries it built, and run.sh records their sha256. Each
+# in-guest row names its own build and preload; the trap row needs a
+# literoot and a preload built with the inguest-trap feature.
+native-plain	host	native	-	
+native-bwrap	translate	native	-	bwrap --bind {ROOT} / --proc /proc --dev /dev
+proot	translate	proot	-	/opt/bench/proot -r {ROOT}
+literoot-liteinst	translate	literoot-liteinst	LITEROOT_PRELOAD=/opt/bench/default/libliteroot_preload.so	/opt/bench/default/literoot --refusal-log {REFUSAL_LOG} --backend liteinst -r {ROOT}
+literoot-trap	translate	literoot-trap	LITEROOT_PRELOAD=/opt/bench/trap/libliteroot_preload.so	/opt/bench/trap/literoot --refusal-log {REFUSAL_LOG} --backend trap -r {ROOT}
+literoot-ptrace	translate	literoot-ptrace	-	/opt/bench/default/literoot --refusal-log {REFUSAL_LOG} --backend ptrace -r {ROOT}
