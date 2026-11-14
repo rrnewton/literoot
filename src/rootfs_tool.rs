@@ -392,10 +392,11 @@ impl FdTable {
     /// Forget the per-fd state of a number that now holds another file (or
     /// none): its virtual-directory record and its stream belong to the file
     /// the number held before. Other tables keep theirs; the stream itself
-    /// goes when no table holds it (`ProcState::forget`).
-    pub(crate) fn forget(&mut self, fd: i32) {
+    /// goes when no table holds it (`ProcState::forget`). Returns the stream
+    /// the number held.
+    pub(crate) fn forget(&mut self, fd: i32) -> Option<StreamId> {
         self.virtual_fds.remove(&fd);
-        self.streams.remove(&fd);
+        self.streams.remove(&fd)
     }
 }
 
@@ -451,32 +452,42 @@ impl ProcState {
         self.streams.entry(id).or_default()
     }
 
-    /// Forget number `fd` of table `files` (see `FdTable::forget`) and drop
-    /// streams no table holds any more.
+    /// Forget number `fd` of table `files` (see `FdTable::forget`), and the
+    /// stream it held once no table holds that stream any more. Only a
+    /// number that held a stream costs a scan of the tables.
     pub(crate) fn forget(&mut self, files: FilesId, fd: i32) {
-        self.fdt_mut(files).forget(fd);
-        self.drop_unheld_streams();
-    }
-
-    fn drop_unheld_streams(&mut self) {
-        let held: std::collections::HashSet<StreamId> = self
+        let Some(id) = self.fdt_mut(files).forget(fd) else {
+            return;
+        };
+        if !self
             .tables
             .values()
-            .flat_map(|t| t.streams.values().copied())
-            .collect();
-        self.streams.retain(|id, _| held.contains(id));
+            .any(|t| t.streams.values().any(|s| *s == id))
+        {
+            self.streams.remove(&id);
+        }
     }
 
     /// A task left table `from` for a private copy of it. The copy starts
     /// with the same records, and with the same streams: the kernel's copy
     /// holds the same open files, whose positions stay shared. Every number
     /// the table knows gets its stream first, so a listing started after
-    /// the split is shared too.
-    pub(crate) fn split_files(&mut self, from: FilesId) -> FilesId {
+    /// the split is shared too, and a stream without an identity takes the
+    /// object the number holds now (`identity`, read while the task is
+    /// stopped): a later dup onto the number in one table must not lend its
+    /// object to the stream the other tables hold.
+    pub(crate) fn split_files(
+        &mut self,
+        from: FilesId,
+        identity: impl Fn(i32) -> Option<(u64, u64)>,
+    ) -> FilesId {
         let t = self.fdt(from);
         let known: Vec<i32> = t.fds.keys().chain(t.virtual_fds.keys()).copied().collect();
         for fd in known {
-            self.stream_mut(from, fd);
+            let s = self.stream_mut(from, fd);
+            if s.obj.is_none() {
+                s.obj = identity(fd);
+            }
         }
         self.next_files += 1;
         let copy = self.fdt(from).clone();
@@ -874,7 +885,10 @@ impl RootfsTool {
         } else if flags & libc::CLONE_FILES as u64 != 0 {
             own
         } else {
-            self.state.lock().unwrap().split_files(own)
+            self.state
+                .lock()
+                .unwrap()
+                .split_files(own, |fd| fd_identity(guest, fd))
         };
         guest.thread_state_mut().child_files = Some(child);
     }
@@ -2980,7 +2994,11 @@ impl Tool for RootfsTool {
                 if ret == 0 && files_flag {
                     // The kernel gave the caller a copy of its table.
                     let own = files_of(guest);
-                    let id = self.state.lock().unwrap().split_files(own);
+                    let id = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .split_files(own, |fd| fd_identity(guest, fd));
                     guest.thread_state_mut().files = id;
                 }
                 Ok(ret)
@@ -2995,7 +3013,11 @@ impl Tool for RootfsTool {
                     if flags & CLOSE_RANGE_UNSHARE != 0 {
                         // A copy of the table first, then the range closes
                         // in the copy only.
-                        files = self.state.lock().unwrap().split_files(files);
+                        files = self
+                            .state
+                            .lock()
+                            .unwrap()
+                            .split_files(files, |fd| fd_identity(guest, fd));
                         guest.thread_state_mut().files = files;
                     }
                     if flags & CLOSE_RANGE_CLOEXEC == 0 {
@@ -5194,6 +5216,15 @@ fn fd_status<T: Guest<RootfsTool>>(guest: &T, fd: i32) -> FdStatus {
     }
 }
 
+/// (dev, ino) of the object a task's fd number holds now, if /proc says.
+fn fd_identity<T: Guest<RootfsTool>>(guest: &T, fd: i32) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    match fd_status(guest, fd) {
+        FdStatus::Open(md) => Some((md.dev(), md.ino())),
+        FdStatus::NoDir | FdStatus::Unknown => None,
+    }
+}
+
 /// Bumps the shared probe-cache generation on drop — placed at
 /// the top of mutating arms so the bump lands AFTER the inject
 /// completes on every return path (early passthroughs included;
@@ -5654,7 +5685,7 @@ mod tests {
         main.fds.insert(4, PathBuf::from("/v"));
         main.virtual_fds.insert(4, PathBuf::from("/v"));
         st.stream_mut(MAIN_FILES, 4).obj = Some((1, 2));
-        let id = st.split_files(MAIN_FILES);
+        let id = st.split_files(MAIN_FILES, |_| None);
         assert_ne!(id, MAIN_FILES);
         assert_eq!(st.fdt(id).virtual_fds.get(&4), Some(&PathBuf::from("/v")));
         st.forget(id, 4);
@@ -5665,7 +5696,26 @@ mod tests {
             Some(&PathBuf::from("/v"))
         );
         assert_eq!(st.stream(MAIN_FILES, 4).and_then(|s| s.obj), Some((1, 2)));
-        assert_ne!(st.split_files(MAIN_FILES), id, "ids are never reused");
+        assert_ne!(
+            st.split_files(MAIN_FILES, |_| None),
+            id,
+            "ids are never reused"
+        );
+    }
+
+    /// A split gives a stream without an identity the object its number
+    /// holds at the split, and leaves an identity already recorded alone.
+    #[test]
+    fn a_split_seeds_missing_stream_identities() {
+        let tool = RootfsTool::default();
+        let mut st = tool.state.lock().unwrap();
+        st.fdt_mut(MAIN_FILES).fds.insert(4, PathBuf::from("/a"));
+        st.fdt_mut(MAIN_FILES).fds.insert(5, PathBuf::from("/b"));
+        st.stream_mut(MAIN_FILES, 5).obj = Some((1, 2));
+        let id = st.split_files(MAIN_FILES, |fd| Some((9, fd as u64)));
+        assert_eq!(st.stream(id, 4).and_then(|s| s.obj), Some((9, 4)));
+        assert_eq!(st.stream(MAIN_FILES, 4).and_then(|s| s.obj), Some((9, 4)));
+        assert_eq!(st.stream(id, 5).and_then(|s| s.obj), Some((1, 2)));
     }
 
     /// The two tables of a split hold the same streams: listing progress
@@ -5681,7 +5731,7 @@ mod tests {
             .insert(4, PathBuf::from("/v"));
         st.stream_mut(MAIN_FILES, 4);
         st.fdt_mut(MAIN_FILES).fds.insert(5, PathBuf::from("/real"));
-        let id = st.split_files(MAIN_FILES);
+        let id = st.split_files(MAIN_FILES, |_| None);
         st.stream_mut(id, 4).emitted = true;
         st.stream_mut(id, 5).pending = Some(vec![7]);
         assert_eq!(

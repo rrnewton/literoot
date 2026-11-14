@@ -675,6 +675,49 @@ static void *unshare_reuse(void *arg) {
     return 0;
 }
 
+/* A stream first listed after the split: worker 2 holds A on n in its own
+ * table while worker 1 dups B onto n in another and lists it. B must not
+ * become the identity of the stream the leader and worker 2 share for A. */
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static int w2_ready, w2_go;
+
+static void *seeded_worker2(void *arg) {
+    (void) arg;
+    int ok = unshare(CLONE_FILES) == 0;
+    pthread_mutex_lock(&mu);
+    w2_ready = 1;
+    pthread_cond_broadcast(&cv);
+    while (!w2_go) pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    if (ok) printf("r9 seeded worker2 rest(a) %d\n", rest(n));
+    return 0;
+}
+
+static void *seeded_worker1(void *arg) {
+    (void) arg;
+    if (unshare(CLONE_FILES) != 0) return 0;
+    dup2(fb, n);
+    list("r9 seeded worker1 list(n)", n);
+    return 0;
+}
+
+static void seeded_case(void) {
+    pthread_t w2;
+    if (pthread_create(&w2, 0, seeded_worker2, 0) != 0) return;
+    pthread_mutex_lock(&mu);
+    while (!w2_ready) pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    run(seeded_worker1);
+    list("r9 seeded leader list(a)", n);
+    fflush(stdout);
+    pthread_mutex_lock(&mu);
+    w2_go = 1;
+    pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mu);
+    pthread_join(w2, 0);
+}
+
 /* A thread made by clone without CLONE_FILES: it gets a copy of the table.
  * No libc in it (it has no thread pointer of its own). */
 static volatile int clone_rest = -1;
@@ -740,6 +783,10 @@ int main(int argc, char **argv) {
     partial3(n);
     run(unshare_reuse);
     printf("r9 reuse leader rest(a) %d\n", rest(n));
+    fb = open_dir("b");
+    n = open_dir("a");
+    if (fb < 0 || n < 0) return 3;
+    seeded_case();
 
     const char *hows[] = {"fork", "exec"};
     for (int i = 0; i < 2; i++) {
@@ -1210,6 +1257,9 @@ fn a_directory_stream_is_shared_by_split_tables_and_survives_fork_and_exec() {
          r9 clone leader getdents(a) 0 errno 0\n\
          r9 reuse worker list(n) b1 b2\n\
          r9 reuse leader rest(a) 1\n\
+         r9 seeded worker1 list(n) b1 b2\n\
+         r9 seeded leader list(a) child v\n\
+         r9 seeded worker2 rest(a) 0\n\
          r8 fork child dup-b list(n) b1 b2\n\
          r8 fork child rest(a2) 1\n\
          r8 fork child status 0\n\

@@ -1141,7 +1141,7 @@ mod tests {
     fn capture_takes_one_table_and_apply_leaves_only_main() {
         let mut st = proc_state();
         st.fdt_mut(MAIN_FILES).fds.insert(3, PathBuf::from("/main"));
-        let other = st.split_files(MAIN_FILES);
+        let other = st.split_files(MAIN_FILES, |_| None);
         st.fdt_mut(other).fds.insert(3, PathBuf::from("/other"));
         st.fdt_mut(other).fds.insert(5, PathBuf::from("/five"));
         let c = cfg("/");
@@ -1151,7 +1151,7 @@ mod tests {
             vec![(3, b"/other".to_vec()), (5, b"/five".to_vec())]
         );
         let mut restored = proc_state();
-        restored.split_files(MAIN_FILES);
+        restored.split_files(MAIN_FILES, |_| None);
         snap.apply_to(&mut restored, &RootConfig::new("/".into(), Vec::new()))
             .expect("apply");
         assert_eq!(restored.tables.len(), 1);
