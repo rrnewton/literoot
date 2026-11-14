@@ -860,11 +860,13 @@ int main(int argc, char **argv) {
 /// Under literoot both aliases are binds of one host tree, and
 /// `/lr-alias-first/target` is a further bind of another.
 const ALIAS_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -891,6 +893,17 @@ static void show(const char *what, const char *path) {
     char lk[64] = {0};
     long k = readlink(path, lk, sizeof lk - 1);
     printf("%s lstat link %d readlink %s\n", what, r == 0 && S_ISLNK(ls.st_mode), k > 0 ? lk : "-");
+    struct statx sx, sl;
+    long xf = syscall(SYS_statx, AT_FDCWD, path, 0, STATX_BASIC_STATS, &sx);
+    long xn = syscall(SYS_statx, AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS, &sl);
+    /* The followed statx must name the object open() reads. */
+    struct stat fo;
+    int ofd = open(path, O_RDONLY);
+    int same = ofd >= 0 && fstat(ofd, &fo) == 0 && xf == 0 && sx.stx_ino == fo.st_ino &&
+               makedev(sx.stx_dev_major, sx.stx_dev_minor) == fo.st_dev;
+    if (ofd >= 0) close(ofd);
+    printf("%s statx size %lld same object as open %d nofollow link %d\n", what,
+           xf == 0 ? (long long) sx.stx_size : -1LL, same, xn == 0 && S_ISLNK(sl.stx_mode));
 }
 
 int main(int argc, char **argv) {
@@ -900,6 +913,41 @@ int main(int argc, char **argv) {
     show("first", p);
     snprintf(p, sizeof p, "%s/lr-alias-second/flink", argv[1]);
     show("second", p);
+    return 0;
+}
+"#;
+
+/// A final relative symlink reached through ".." (argv base). `x/flink -> m`
+/// with `x/m` = "right". Decoys hold the file a resolver reaches when it drops
+/// a ".." without popping the directory before it: `sub/x/m` and `x/x/m`.
+/// `sub/hop -> ../x/flink` (a ".." from a previous target) and
+/// `sub/dl -> ../x` (a ".." after a directory symlink). Cases 4 and 5 are the
+/// review's layout: `b/link -> target` with `b/target` = "correct", decoy
+/// `a/b/target`, and `a/first -> ../b/link`.
+const DOTDOT_C: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void show(const char *what, const char *base, const char *rel) {
+    char path[4096], buf[64] = {0};
+    snprintf(path, sizeof path, "%s/%s", base, rel);
+    int fd = open(path, O_RDONLY);
+    long n = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+    if (fd >= 0) close(fd);
+    struct stat st;
+    int r = stat(path, &st);
+    printf("%s open %s stat %ld\n", what, n > 0 ? buf : "-", r == 0 ? (long) st.st_size : -1L);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    show("1 sub/../x/flink", argv[1], "sub/../x/flink");
+    show("2 sub/hop", argv[1], "sub/hop");
+    show("3 sub/dl/../x/flink", argv[1], "sub/dl/../x/flink");
+    show("4 a/../b/link", argv[1], "a/../b/link");
+    show("5 a/first", argv[1], "a/first");
     return 0;
 }
 "#;
@@ -1409,8 +1457,10 @@ fn a_final_symlink_keeps_the_alias_it_was_reached_through() {
         format!(
             "first open nested stat 6 access 0\n{}\
              first lstat link 1 readlink target/marker\n\
+             first statx size 6 same object as open 1 nofollow link 1\n\
              second open host stat 4 access 0\n{}\
-             second lstat link 1 readlink target/marker\n",
+             second lstat link 1 readlink target/marker\n\
+             second statx size 4 same object as open 1 nofollow link 1\n",
             legacy("first", "nested"),
             legacy("second", "host")
         )
@@ -1438,6 +1488,50 @@ fn a_final_symlink_keeps_the_alias_it_was_reached_through() {
         }
         assert_eq!(
             under_literoot(&work, &guest, name, &flags, &[""]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn dotdot_layout(base: &Path) {
+    for d in ["x/x", "sub/x", "a/b", "b"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    std::fs::write(base.join("x/m"), "right").unwrap();
+    std::fs::write(base.join("sub/x/m"), "wrong-sub").unwrap();
+    std::fs::write(base.join("x/x/m"), "wrong-dl").unwrap();
+    std::os::unix::fs::symlink("m", base.join("x/flink")).unwrap();
+    std::os::unix::fs::symlink("../x/flink", base.join("sub/hop")).unwrap();
+    std::os::unix::fs::symlink("../x", base.join("sub/dl")).unwrap();
+    std::fs::write(base.join("b/target"), "correct").unwrap();
+    std::fs::write(base.join("a/b/target"), "WRONG").unwrap();
+    std::os::unix::fs::symlink("target", base.join("b/link")).unwrap();
+    std::os::unix::fs::symlink("../b/link", base.join("a/first")).unwrap();
+}
+
+#[test]
+fn a_final_symlink_after_dotdot_resolves_from_the_real_parent() {
+    let dir = own_dir("dotdot");
+    let guest = build_guest(&dir, "dotdot", DOTDOT_C);
+    let nat = dir.join("native");
+    dotdot_layout(&nat);
+    let native = run_native(&guest, "native", &[nat.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "1 sub/../x/flink open right stat 5\n\
+         2 sub/hop open right stat 5\n\
+         3 sub/dl/../x/flink open right stat 5\n\
+         4 a/../b/link open correct stat 7\n\
+         5 a/first open correct stat 7\n"
+    );
+    // No bind on the way: rootfs / makes the host path the guest path.
+    for (name, flags) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let base = dir.join(name);
+        dotdot_layout(&base);
+        assert_eq!(
+            under_literoot(&base, &guest, name, &flags, &[base.to_str().unwrap()]),
             native,
             "{name}"
         );

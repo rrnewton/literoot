@@ -5409,12 +5409,15 @@ fn resolve_symlink_chain(cfg: &RootConfig, guest: Option<PathBuf>, host: PathBuf
         }
     }
     let mut cur = host;
-    let mut guest = guest;
+    // Keep the guest path canonical: canonicalize_inner reads only the
+    // Normal components of its base, so a raw ".." in a parent would be
+    // dropped without popping the directory before it.
+    let mut guest = guest.map(|g| cfg.canonical_guest(&g, Path::new("/")));
     for _ in 0..40 {
         match std::fs::read_link(&cur) {
             Ok(target) if target.is_absolute() => {
                 cur = cfg.translate(&target, Path::new("/"), None);
-                guest = Some(target);
+                guest = Some(cfg.canonical_guest(&target, Path::new("/")));
             }
             Ok(target) => {
                 let parent = guest
@@ -5423,7 +5426,7 @@ fn resolve_symlink_chain(cfg: &RootConfig, guest: Option<PathBuf>, host: PathBuf
                 match parent {
                     Some(parent) => {
                         cur = cfg.translate(&target, &parent, None);
-                        guest = Some(parent.join(&target));
+                        guest = Some(cfg.canonical_guest(&target, &parent));
                     }
                     None => {
                         let mut next = cur

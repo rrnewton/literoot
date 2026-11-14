@@ -295,6 +295,19 @@ impl RootConfig {
         self.canonicalize_inner(base, path).0
     }
 
+    /// The guest path `path` names from the canonical guest directory
+    /// `cwd`, walked as `translate` walks it: intermediate symlinks are
+    /// resolved and ".." pops the directory it follows, but the final
+    /// component is not followed.
+    pub fn canonical_guest(&self, path: &Path, cwd: &Path) -> PathBuf {
+        let base = if path.is_absolute() {
+            Path::new("/")
+        } else {
+            cwd
+        };
+        self.canonicalize(base, path)
+    }
+
     fn canonicalize_inner(&self, base: &Path, path: &Path) -> (PathBuf, Option<(Vec<std::ffi::OsString>, PathBuf)>) {
         use std::collections::VecDeque;
         #[derive(Clone)]
