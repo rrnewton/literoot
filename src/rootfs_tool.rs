@@ -475,7 +475,10 @@ impl ProcState {
     /// the split is shared too, and a stream without an identity takes the
     /// object the number holds now (`identity`, read while the task is
     /// stopped): a later dup onto the number in one table must not lend its
-    /// object to the stream the other tables hold.
+    /// object to the stream the other tables hold. A number whose stream was
+    /// built for another object than it holds now (a dup onto it that
+    /// literoot did not see) leaves that stream to its other holders first,
+    /// so both tables share a fresh one for the object it holds.
     pub(crate) fn split_files(
         &mut self,
         from: FilesId,
@@ -484,9 +487,14 @@ impl ProcState {
         let t = self.fdt(from);
         let known: Vec<i32> = t.fds.keys().chain(t.virtual_fds.keys()).copied().collect();
         for fd in known {
+            let now = identity(fd);
+            let held = self.stream(from, fd).and_then(|s| s.obj);
+            if held.is_some() && now.is_some() && held != now {
+                self.forget(from, fd);
+            }
             let s = self.stream_mut(from, fd);
             if s.obj.is_none() {
-                s.obj = identity(fd);
+                s.obj = now;
             }
         }
         self.next_files += 1;
@@ -5712,10 +5720,54 @@ mod tests {
         st.fdt_mut(MAIN_FILES).fds.insert(4, PathBuf::from("/a"));
         st.fdt_mut(MAIN_FILES).fds.insert(5, PathBuf::from("/b"));
         st.stream_mut(MAIN_FILES, 5).obj = Some((1, 2));
-        let id = st.split_files(MAIN_FILES, |fd| Some((9, fd as u64)));
+        let id = st.split_files(MAIN_FILES, |fd| {
+            if fd == 5 {
+                Some((1, 2))
+            } else {
+                Some((9, fd as u64))
+            }
+        });
         assert_eq!(st.stream(id, 4).and_then(|s| s.obj), Some((9, 4)));
         assert_eq!(st.stream(MAIN_FILES, 4).and_then(|s| s.obj), Some((9, 4)));
         assert_eq!(st.stream(id, 5).and_then(|s| s.obj), Some((1, 2)));
+        // /proc cannot say: the recorded identity stands.
+        let id2 = st.split_files(MAIN_FILES, |_| None);
+        assert_eq!(st.stream(id2, 5).and_then(|s| s.obj), Some((1, 2)));
+    }
+
+    /// A number that now holds another object than its stream was built
+    /// for leaves that stream at the split (to tables that still hold the
+    /// old object), and both tables share a fresh stream for the object it
+    /// holds now.
+    #[test]
+    fn a_split_detaches_a_stale_stream_first() {
+        let tool = RootfsTool::default();
+        let mut st = tool.state.lock().unwrap();
+        st.fdt_mut(MAIN_FILES).fds.insert(4, PathBuf::from("/b"));
+        {
+            let s = st.stream_mut(MAIN_FILES, 4);
+            s.obj = Some((1, 2));
+            s.pending = Some(Vec::new());
+        }
+        let earlier = st.split_files(MAIN_FILES, |_| Some((1, 2)));
+        // The number now holds (3, 4) in MAIN_FILES (a dup literoot did not see).
+        let id = st.split_files(MAIN_FILES, |_| Some((3, 4)));
+        let fresh = st.stream(MAIN_FILES, 4).cloned();
+        assert_eq!(
+            fresh.as_ref().map(|s| (s.obj, s.pending.is_some())),
+            Some((Some((3, 4)), false))
+        );
+        assert_eq!(st.stream(id, 4), fresh.as_ref());
+        assert_eq!(
+            st.fdt(id).streams.get(&4),
+            st.fdt(MAIN_FILES).streams.get(&4)
+        );
+        // The earlier copy still holds the stream built for (1, 2).
+        assert_eq!(st.stream(earlier, 4).and_then(|s| s.obj), Some((1, 2)));
+        assert_eq!(
+            st.stream(earlier, 4).map(|s| s.pending.is_some()),
+            Some(true)
+        );
     }
 
     /// The two tables of a split hold the same streams: listing progress

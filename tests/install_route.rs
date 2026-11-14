@@ -718,6 +718,42 @@ static void seeded_case(void) {
     pthread_join(w2, 0);
 }
 
+/* A stream recorded for B on a number that now holds A (a dup onto it
+ * before the split): the split must not share B's stream for A. */
+static int w3_ready, w3_go;
+
+static void *stale_worker(void *arg) {
+    (void) arg;
+    int ok = unshare(CLONE_FILES) == 0;
+    pthread_mutex_lock(&mu);
+    w3_ready = 1;
+    pthread_cond_broadcast(&cv);
+    while (!w3_go) pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    if (ok) printf("r9 stale worker rest(n) %d\n", rest(n));
+    return 0;
+}
+
+static void stale_case(void) {
+    n = open_dir("b");
+    int m = open_dir("a");
+    if (n < 0 || m < 0) return;
+    list("r9 stale leader list(b)", n);
+    dup2(m, n);
+    pthread_t w;
+    if (pthread_create(&w, 0, stale_worker, 0) != 0) return;
+    pthread_mutex_lock(&mu);
+    while (!w3_ready) pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    list("r9 stale leader list(n)", n);
+    fflush(stdout);
+    pthread_mutex_lock(&mu);
+    w3_go = 1;
+    pthread_cond_broadcast(&cv);
+    pthread_mutex_unlock(&mu);
+    pthread_join(w, 0);
+}
+
 /* A thread made by clone without CLONE_FILES: it gets a copy of the table.
  * No libc in it (it has no thread pointer of its own). */
 static volatile int clone_rest = -1;
@@ -787,6 +823,7 @@ int main(int argc, char **argv) {
     n = open_dir("a");
     if (fb < 0 || n < 0) return 3;
     seeded_case();
+    stale_case();
 
     const char *hows[] = {"fork", "exec"};
     for (int i = 0; i < 2; i++) {
@@ -1260,6 +1297,9 @@ fn a_directory_stream_is_shared_by_split_tables_and_survives_fork_and_exec() {
          r9 seeded worker1 list(n) b1 b2\n\
          r9 seeded leader list(a) child v\n\
          r9 seeded worker2 rest(a) 0\n\
+         r9 stale leader list(b) b1 b2\n\
+         r9 stale leader list(n) child v\n\
+         r9 stale worker rest(n) 0\n\
          r8 fork child dup-b list(n) b1 b2\n\
          r8 fork child rest(a2) 1\n\
          r8 fork child status 0\n\
