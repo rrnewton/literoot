@@ -296,6 +296,12 @@ pub(crate) struct ProcState {
     pub(crate) tables: HashMap<FilesId, FdTable>,
     /// Last id handed out by `split_files`.
     pub(crate) next_files: FilesId,
+    /// Directory listing state per open file description (see
+    /// `DirStream`); fd tables refer to it by id, so two tables holding
+    /// one description share its position.
+    pub(crate) streams: HashMap<StreamId, DirStream>,
+    /// Last id handed out for a stream.
+    pub(crate) next_stream: StreamId,
     /// False until the initial (launcher-issued) execve has passed:
     /// its path is already a host path and must not be translated.
     pub(crate) bootstrapped: bool,
@@ -365,36 +371,50 @@ pub(crate) struct ProcState {
 pub(crate) type FilesId = u32;
 pub(crate) const MAIN_FILES: FilesId = 0;
 
+/// Which directory stream (open file description) an fd number holds.
+pub(crate) type StreamId = u64;
+
 /// The fd-number state of one kernel fd table. A number means something
 /// only in its own table: a record another table invalidates stays valid
-/// here.
+/// here. Listing progress is not per number but per open file description
+/// (`DirStream`), shared by every table that still holds it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FdTable {
     /// fd → guest path it denotes (for *at resolution, §4.3).
     pub(crate) fds: HashMap<i32, PathBuf>,
-    /// Fds opened on virtual bind-prefix dirs:
-    /// guest dir -> entries already emitted.
-    pub(crate) virtual_fds: HashMap<i32, (PathBuf, bool)>,
-    /// Synthetic dirents pending for real dir fds with bind
-    /// children (merged listings).
-    pub(crate) dirent_pending: HashMap<i32, Vec<u8>>,
-    /// Names the kernel already returned per dir fd (dedupe).
-    pub(crate) dirent_seen: HashMap<i32, std::collections::HashSet<String>>,
-    /// (dev, ino) of the directory the getdents state above was built
-    /// for: a dup onto the number of another directory makes it stale.
-    pub(crate) dirent_obj: HashMap<i32, (u64, u64)>,
+    /// Fds opened on virtual bind-prefix dirs: fd → guest dir.
+    pub(crate) virtual_fds: HashMap<i32, PathBuf>,
+    /// fd → the directory stream of the description it holds.
+    pub(crate) streams: HashMap<i32, StreamId>,
 }
 
 impl FdTable {
-    /// Forget per-fd state for a number that now holds another file (or
-    /// none): its virtual-directory record and getdents bookkeeping belong
-    /// to the file the number held before.
+    /// Forget the per-fd state of a number that now holds another file (or
+    /// none): its virtual-directory record and its stream belong to the file
+    /// the number held before. Other tables keep theirs; the stream itself
+    /// goes when no table holds it (`ProcState::forget`).
     pub(crate) fn forget(&mut self, fd: i32) {
         self.virtual_fds.remove(&fd);
-        self.dirent_pending.remove(&fd);
-        self.dirent_seen.remove(&fd);
-        self.dirent_obj.remove(&fd);
+        self.streams.remove(&fd);
     }
+}
+
+/// Listing state of one open directory description. Linux keeps the
+/// position in the open file, which a table copy shares (dup_fd,
+/// fs/file.c), so literoot's synthetic part of a listing is shared the
+/// same way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DirStream {
+    /// Virtual bind-prefix dir: its entries were emitted.
+    pub(crate) emitted: bool,
+    /// Real dir with bind children: synthetic dirents still to serve after
+    /// kernel EOF; `Some` (maybe empty) once kernel EOF was reached.
+    pub(crate) pending: Option<Vec<u8>>,
+    /// Names the kernel already returned (dedupe).
+    pub(crate) seen: Option<std::collections::HashSet<String>>,
+    /// (dev, ino) of the directory this listing state was built for: a dup
+    /// of another directory onto the number makes it stale.
+    pub(crate) obj: Option<(u64, u64)>,
 }
 
 impl ProcState {
@@ -408,10 +428,56 @@ impl ProcState {
         self.tables.entry(files).or_default()
     }
 
-    /// A task left table `from` for a private copy of it: the copy starts
-    /// with the same records, as the kernel's copy starts with the same
-    /// open files.
+    /// The stream number `fd` of table `files` holds, if it has one.
+    pub(crate) fn stream(&self, files: FilesId, fd: i32) -> Option<&DirStream> {
+        self.fdt(files)
+            .streams
+            .get(&fd)
+            .and_then(|id| self.streams.get(id))
+    }
+
+    /// The stream number `fd` of table `files` holds, created empty (and
+    /// held by this table only) if it has none.
+    pub(crate) fn stream_mut(&mut self, files: FilesId, fd: i32) -> &mut DirStream {
+        let id = match self.fdt(files).streams.get(&fd) {
+            Some(id) if self.streams.contains_key(id) => *id,
+            _ => {
+                self.next_stream += 1;
+                let id = self.next_stream;
+                self.fdt_mut(files).streams.insert(fd, id);
+                id
+            }
+        };
+        self.streams.entry(id).or_default()
+    }
+
+    /// Forget number `fd` of table `files` (see `FdTable::forget`) and drop
+    /// streams no table holds any more.
+    pub(crate) fn forget(&mut self, files: FilesId, fd: i32) {
+        self.fdt_mut(files).forget(fd);
+        self.drop_unheld_streams();
+    }
+
+    fn drop_unheld_streams(&mut self) {
+        let held: std::collections::HashSet<StreamId> = self
+            .tables
+            .values()
+            .flat_map(|t| t.streams.values().copied())
+            .collect();
+        self.streams.retain(|id, _| held.contains(id));
+    }
+
+    /// A task left table `from` for a private copy of it. The copy starts
+    /// with the same records, and with the same streams: the kernel's copy
+    /// holds the same open files, whose positions stay shared. Every number
+    /// the table knows gets its stream first, so a listing started after
+    /// the split is shared too.
     pub(crate) fn split_files(&mut self, from: FilesId) -> FilesId {
+        let t = self.fdt(from);
+        let known: Vec<i32> = t.fds.keys().chain(t.virtual_fds.keys()).copied().collect();
+        for fd in known {
+            self.stream_mut(from, fd);
+        }
         self.next_files += 1;
         let copy = self.fdt(from).clone();
         self.tables.insert(self.next_files, copy);
@@ -441,6 +507,8 @@ impl Default for RootfsTool {
                 cwd: PathBuf::from("/__literoot_unset__"),
                 tables: HashMap::new(),
                 next_files: MAIN_FILES,
+                streams: HashMap::new(),
+                next_stream: 0,
                 bootstrapped: false,
                 root_override: None,
                 scratch: None,
@@ -770,7 +838,8 @@ impl RootfsTool {
     ) -> Option<i64> {
         use reverie::syscalls::MemoryAccess as _;
         let mut st = self.state.lock().unwrap();
-        let pend = st.fdt_mut(files).dirent_pending.get_mut(&fd)?;
+        let id = *st.fdt(files).streams.get(&fd)?;
+        let pend = st.streams.get_mut(&id)?.pending.as_mut()?;
         if pend.is_empty() {
             return None;
         }
@@ -1733,11 +1802,11 @@ impl Tool for RootfsTool {
                     // Record fd → guest path for future *at calls.
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, openat.dirfd(), &guest_path);
-                    let t = st.fdt_mut(files_of(guest));
+                    let files = files_of(guest);
                     if !opened_virtual {
-                        t.forget(ret as i32);
+                        st.forget(files, ret as i32);
                     }
-                    t.fds.insert(ret as i32, abs);
+                    st.fdt_mut(files).fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -1770,9 +1839,9 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
-                    let t = st.fdt_mut(files_of(guest));
-                    t.forget(ret as i32);
-                    t.fds.insert(ret as i32, abs);
+                    let files = files_of(guest);
+                    st.forget(files, ret as i32);
+                    st.fdt_mut(files).fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -2565,9 +2634,9 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, oa.dirfd(), &guest_path);
-                    let t = st.fdt_mut(files_of(guest));
-                    t.forget(ret as i32);
-                    t.fds.insert(ret as i32, abs);
+                    let files = files_of(guest);
+                    st.forget(files, ret as i32);
+                    st.fdt_mut(files).fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -2666,7 +2735,7 @@ impl Tool for RootfsTool {
                         // Closed, or not a directory: no record of this table
                         // answers for it; the kernel does (EBADF, ENOTDIR).
                         FdStatus::NoDir => {
-                            st.fdt_mut(files).forget(fd);
+                            st.forget(files, fd);
                             None
                         }
                         FdStatus::Open(md) => {
@@ -2677,25 +2746,26 @@ impl Tool for RootfsTool {
                             } else {
                                 // Getdents state built for another directory on
                                 // this number (a dup onto it) is stale.
-                                let other = t
-                                    .dirent_obj
-                                    .get(&fd)
-                                    .is_some_and(|o| *o != (md.dev(), md.ino()));
+                                let other = st
+                                    .stream(files, fd)
+                                    .and_then(|s| s.obj)
+                                    .is_some_and(|o| o != (md.dev(), md.ino()));
                                 (false, other)
                             };
-                            let t = st.fdt_mut(files);
+                            // A stale number leaves its stream to the tables
+                            // that still hold it, and gets a fresh one.
                             if stale {
-                                t.forget(fd);
+                                st.forget(files, fd);
                             }
                             if keep_virtual {
-                                t.virtual_fds.get(&fd).cloned()
+                                virtual_record(&st, files, fd)
                             } else {
-                                t.dirent_obj.insert(fd, (md.dev(), md.ino()));
+                                st.stream_mut(files, fd).obj = Some((md.dev(), md.ino()));
                                 None
                             }
                         }
                         // /proc unreadable: the record stands, as before.
-                        FdStatus::Unknown => st.fdt(files).virtual_fds.get(&fd).cloned(),
+                        FdStatus::Unknown => virtual_record(&st, files, fd),
                     }
                 };
                 match virt {
@@ -2715,20 +2785,15 @@ impl Tool for RootfsTool {
                                 .state
                                 .lock()
                                 .unwrap()
-                                .fdt(files)
-                                .dirent_pending
-                                .contains_key(&fd)
+                                .stream(files, fd)
+                                .is_some_and(|s| s.pending.is_some())
                         {
                             // Kernel EOF (once per fd): stage
                             // synthetic entries for bind children
                             // not yet seen. Mark done first so a
                             // following getdents returns real EOF.
-                            self.state
-                                .lock()
-                                .unwrap()
-                                .fdt_mut(files)
-                                .dirent_pending
-                                .insert(fd, Vec::new());
+                            self.state.lock().unwrap().stream_mut(files, fd).pending =
+                                Some(Vec::new());
                             let cfg = self.config(guest);
                             let guest_dir = {
                                 let st = self.state.lock().unwrap();
@@ -2739,13 +2804,9 @@ impl Tool for RootfsTool {
                                     self.build_synth_dirents(guest, &gd_path, true);
                                 if !synth.is_empty() {
                                     // Serve them now, whole records only;
-                                    // the rest waits in dirent_pending.
-                                    self.state
-                                        .lock()
-                                        .unwrap()
-                                        .fdt_mut(files)
-                                        .dirent_pending
-                                        .insert(fd, synth);
+                                    // the rest waits in the stream.
+                                    self.state.lock().unwrap().stream_mut(files, fd).pending =
+                                        Some(synth);
                                     if let Some(served) = self.serve_pending(guest, files, fd, &gd)
                                     {
                                         return Ok(served);
@@ -2759,10 +2820,9 @@ impl Tool for RootfsTool {
                     Some((guest_dir, false)) => {
                         {
                             let mut st = self.state.lock().unwrap();
-                            if let Some(v) =
-                                st.fdt_mut(files).virtual_fds.get_mut(&(gd.fd() as i32))
-                            {
-                                v.1 = true;
+                            let fd = gd.fd() as i32;
+                            if st.fdt(files).virtual_fds.contains_key(&fd) {
+                                st.stream_mut(files, fd).emitted = true;
                             }
                         }
                         Ok(self.synth_dirents(guest, gd.dirent(), gd.count(), &guest_dir))
@@ -2940,19 +3000,18 @@ impl Tool for RootfsTool {
                     }
                     if flags & CLOSE_RANGE_CLOEXEC == 0 {
                         let mut st = self.state.lock().unwrap();
-                        let t = st.fdt_mut(files);
+                        let t = st.fdt(files);
                         let closed: Vec<i32> = t
                             .fds
                             .keys()
                             .chain(t.virtual_fds.keys())
-                            .chain(t.dirent_pending.keys())
-                            .chain(t.dirent_obj.keys())
+                            .chain(t.streams.keys())
                             .copied()
                             .filter(|fd| *fd >= 0 && (first..=last).contains(&(*fd as u32)))
                             .collect();
                         for fd in closed {
-                            t.forget(fd);
-                            t.fds.remove(&fd);
+                            st.forget(files, fd);
+                            st.fdt_mut(files).fds.remove(&fd);
                         }
                     }
                 }
@@ -3912,7 +3971,7 @@ impl RootfsTool {
                 .fdt(files_of(guest))
                 .virtual_fds
                 .values()
-                .any(|(v, _)| *v == p)
+                .any(|v| *v == p)
                 && same_file(&cfg.rootfs, &live);
             if virt || same_file(&cfg.translate(&p, Path::new("/"), None), &live) {
                 return p;
@@ -4345,10 +4404,10 @@ impl RootfsTool {
                 let fd = guest.inject(rewritten).await?;
                 if fd >= 0 {
                     let mut st = self.state.lock().unwrap();
-                    let t = st.fdt_mut(files_of(guest));
-                    t.forget(fd as i32);
-                    t.virtual_fds
-                        .insert(fd as i32, (guest_abs.to_path_buf(), false));
+                    let files = files_of(guest);
+                    st.forget(files, fd as i32);
+                    let t = st.fdt_mut(files);
+                    t.virtual_fds.insert(fd as i32, guest_abs.to_path_buf());
                     t.fds.insert(fd as i32, guest_abs.to_path_buf());
                 }
                 return Ok(Some(fd));
@@ -4463,12 +4522,8 @@ impl RootfsTool {
             names.insert(String::from_utf8_lossy(&name_bytes[..end]).into_owned());
             off += reclen;
         }
-        self.state
-            .lock()
-            .unwrap()
-            .fdt_mut(files_of(guest))
-            .dirent_seen
-            .insert(fd, names);
+        let files = files_of(guest);
+        self.state.lock().unwrap().stream_mut(files, fd).seen = Some(names);
     }
 
     /// Build synthetic dirents for bind children of `guest_dir`
@@ -5105,8 +5160,15 @@ fn virtual_fd_path(
     fd: i32,
     live: &std::fs::Metadata,
 ) -> Option<PathBuf> {
-    let (v, _) = table.virtual_fds.get(&fd)?;
+    let v = table.virtual_fds.get(&fd)?;
     (live.is_dir() && same_file(&cfg.rootfs, live)).then(|| v.clone())
+}
+
+/// The virtual-directory record of number `fd` in table `files`: its guest
+/// dir and whether its description's entries were emitted.
+fn virtual_record(st: &ProcState, files: FilesId, fd: i32) -> Option<(PathBuf, bool)> {
+    let v = st.fdt(files).virtual_fds.get(&fd)?;
+    Some((v.clone(), st.stream(files, fd).is_some_and(|s| s.emitted)))
 }
 
 /// What a task's fd number holds now, from /proc/<pid>/task/<tid>/fd.
@@ -5590,23 +5652,60 @@ mod tests {
         let mut st = tool.state.lock().unwrap();
         let main = st.fdt_mut(MAIN_FILES);
         main.fds.insert(4, PathBuf::from("/v"));
-        main.virtual_fds.insert(4, (PathBuf::from("/v"), false));
-        main.dirent_obj.insert(4, (1, 2));
+        main.virtual_fds.insert(4, PathBuf::from("/v"));
+        st.stream_mut(MAIN_FILES, 4).obj = Some((1, 2));
         let id = st.split_files(MAIN_FILES);
         assert_ne!(id, MAIN_FILES);
-        assert_eq!(
-            st.fdt(id).virtual_fds.get(&4),
-            Some(&(PathBuf::from("/v"), false))
-        );
-        st.fdt_mut(id).forget(4);
-        assert!(st.fdt(id).virtual_fds.is_empty() && st.fdt(id).dirent_obj.is_empty());
+        assert_eq!(st.fdt(id).virtual_fds.get(&4), Some(&PathBuf::from("/v")));
+        st.forget(id, 4);
+        assert!(st.fdt(id).virtual_fds.is_empty() && st.stream(id, 4).is_none());
         assert_eq!(st.fdt(id).fds.get(&4), Some(&PathBuf::from("/v")));
         assert_eq!(
             st.fdt(MAIN_FILES).virtual_fds.get(&4),
-            Some(&(PathBuf::from("/v"), false))
+            Some(&PathBuf::from("/v"))
         );
-        assert_eq!(st.fdt(MAIN_FILES).dirent_obj.get(&4), Some(&(1, 2)));
+        assert_eq!(st.stream(MAIN_FILES, 4).and_then(|s| s.obj), Some((1, 2)));
         assert_ne!(st.split_files(MAIN_FILES), id, "ids are never reused");
+    }
+
+    /// The two tables of a split hold the same streams: listing progress
+    /// made through one is the other's (R9), including for a number that
+    /// had no listing state before the split. A stream goes once no table
+    /// holds it.
+    #[test]
+    fn a_split_fd_table_shares_its_streams() {
+        let tool = RootfsTool::default();
+        let mut st = tool.state.lock().unwrap();
+        st.fdt_mut(MAIN_FILES)
+            .virtual_fds
+            .insert(4, PathBuf::from("/v"));
+        st.stream_mut(MAIN_FILES, 4);
+        st.fdt_mut(MAIN_FILES).fds.insert(5, PathBuf::from("/real"));
+        let id = st.split_files(MAIN_FILES);
+        st.stream_mut(id, 4).emitted = true;
+        st.stream_mut(id, 5).pending = Some(vec![7]);
+        assert_eq!(
+            virtual_record(&st, MAIN_FILES, 4),
+            Some((PathBuf::from("/v"), true))
+        );
+        assert_eq!(
+            st.stream(MAIN_FILES, 5).and_then(|s| s.pending.clone()),
+            Some(vec![7])
+        );
+        st.forget(id, 5);
+        assert_eq!(
+            st.stream(MAIN_FILES, 5).and_then(|s| s.pending.clone()),
+            Some(vec![7])
+        );
+        // A number the split copy reuses gets a stream of its own.
+        st.stream_mut(id, 5).pending = Some(Vec::new());
+        assert_eq!(
+            st.stream(MAIN_FILES, 5).and_then(|s| s.pending.clone()),
+            Some(vec![7])
+        );
+        st.forget(MAIN_FILES, 5);
+        st.forget(id, 5);
+        assert_eq!(st.streams.len(), 1, "only the stream of fd 4 is still held");
     }
 
     #[test]

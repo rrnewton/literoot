@@ -22,13 +22,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::rootfs_tool::{FdTable, FilesId, LiterootConfig, ProcState, MAIN_FILES};
+use crate::rootfs_tool::{DirStream, FdTable, FilesId, LiterootConfig, ProcState, MAIN_FILES};
 use crate::translate::RootConfig;
 
 /// Wire magic ("LRX1").
 pub const MAGIC: &[u8; 4] = b"LRX1";
-/// Only supported wire version.
-pub const VERSION: u16 = 1;
+/// Only supported wire version. Version 2 added each listing's
+/// directory identity (`dirent_obj`); version 1 is refused.
+pub const VERSION: u16 = 2;
 /// Hard cap on the encoded payload (aligned with the native
 /// route's successor-state cap). Capture refuses by name above
 /// this rather than truncating: a truncated fd map changes `*at`
@@ -53,6 +54,11 @@ pub struct ExecState {
     pub virtual_fds: Vec<(i32, Vec<u8>, bool)>,
     pub dirent_pending: Vec<(i32, Vec<u8>)>,
     pub dirent_seen: Vec<(i32, Vec<Vec<u8>>)>,
+    /// (fd, dev, ino) of the directory each listing state was built for:
+    /// without it a restored pending listing could be served for another
+    /// directory dup'd onto the number.
+    #[serde(default)]
+    pub dirent_obj: Vec<(i32, u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,25 +128,42 @@ impl ExecState {
         let mut virtual_fds: Vec<(i32, Vec<u8>, bool)> = t
             .virtual_fds
             .iter()
-            .map(|(fd, (p, emitted))| (*fd, bytes(p), *emitted))
+            .map(|(fd, p)| {
+                (
+                    *fd,
+                    bytes(p),
+                    st.stream(files, *fd).is_some_and(|s| s.emitted),
+                )
+            })
             .collect();
         virtual_fds.sort();
-        let mut dirent_pending: Vec<(i32, Vec<u8>)> = t
-            .dirent_pending
+        // Each number's listing state comes from the stream it holds; the
+        // successor holds one stream per number.
+        let streams: Vec<(i32, &DirStream)> = t
+            .streams
+            .keys()
+            .filter_map(|fd| st.stream(files, *fd).map(|s| (*fd, s)))
+            .collect();
+        let mut dirent_pending: Vec<(i32, Vec<u8>)> = streams
             .iter()
-            .map(|(fd, b)| (*fd, b.clone()))
+            .filter_map(|(fd, s)| s.pending.clone().map(|b| (*fd, b)))
             .collect();
         dirent_pending.sort();
-        let mut dirent_seen: Vec<(i32, Vec<Vec<u8>>)> = t
-            .dirent_seen
+        let mut dirent_seen: Vec<(i32, Vec<Vec<u8>>)> = streams
             .iter()
-            .map(|(fd, names)| {
+            .filter_map(|(fd, s)| {
+                let names = s.seen.as_ref()?;
                 let mut v: Vec<Vec<u8>> = names.iter().map(|n| n.clone().into_bytes()).collect();
                 v.sort();
-                (*fd, v)
+                Some((*fd, v))
             })
             .collect();
         dirent_seen.sort();
+        let mut dirent_obj: Vec<(i32, u64, u64)> = streams
+            .iter()
+            .filter_map(|(fd, s)| s.obj.map(|(dev, ino)| (*fd, dev, ino)))
+            .collect();
+        dirent_obj.sort();
         // exe_guest is seeded lazily from config on first use, so
         // a fork before any exec (or any exe_guest() call) still
         // holds the empty default. Materialize it the same way:
@@ -177,6 +200,7 @@ impl ExecState {
             virtual_fds,
             dirent_pending,
             dirent_seen,
+            dirent_obj,
         }
     }
 
@@ -253,29 +277,34 @@ impl ExecState {
         st.fake = self.fake;
         st.exe_guest = path_from_bytes(&self.exe_guest);
         st.argv = self.argv.clone();
-        table.virtual_fds = self
-            .virtual_fds
-            .iter()
-            .map(|(fd, p, emitted)| (*fd, (path_from_bytes(p), *emitted)))
-            .collect();
-        table.dirent_pending = self
-            .dirent_pending
-            .iter()
-            .map(|(fd, b)| (*fd, b.clone()))
-            .collect();
-        table.dirent_seen = self
-            .dirent_seen
-            .iter()
-            .map(|(fd, names)| {
-                (
-                    *fd,
-                    names
-                        .iter()
-                        .map(|n| String::from_utf8_lossy(n).into_owned())
-                        .collect::<HashSet<String>>(),
-                )
-            })
-            .collect();
+        // One stream per number with listing state, holding all of it,
+        // the directory identity included (R8).
+        let mut streams: std::collections::BTreeMap<i32, DirStream> = Default::default();
+        for (fd, p, emitted) in &self.virtual_fds {
+            table.virtual_fds.insert(*fd, path_from_bytes(p));
+            streams.entry(*fd).or_default().emitted = *emitted;
+        }
+        for (fd, b) in &self.dirent_pending {
+            streams.entry(*fd).or_default().pending = Some(b.clone());
+        }
+        for (fd, names) in &self.dirent_seen {
+            streams.entry(*fd).or_default().seen = Some(
+                names
+                    .iter()
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .collect::<HashSet<String>>(),
+            );
+        }
+        for (fd, dev, ino) in &self.dirent_obj {
+            streams.entry(*fd).or_default().obj = Some((*dev, *ino));
+        }
+        st.streams = HashMap::new();
+        st.next_stream = 0;
+        for (fd, stream) in streams {
+            st.next_stream += 1;
+            table.streams.insert(fd, st.next_stream);
+            st.streams.insert(st.next_stream, stream);
+        }
         // One table: the snapshot is the capturing task's, and the
         // restored process starts single-threaded on it.
         st.tables = HashMap::from([(MAIN_FILES, table)]);
@@ -319,6 +348,9 @@ impl ExecState {
         for (fd, _) in &self.dirent_seen {
             fd_ok(*fd)?;
         }
+        for (fd, _, _) in &self.dirent_obj {
+            fd_ok(*fd)?;
+        }
         Ok(())
     }
 
@@ -332,6 +364,7 @@ impl ExecState {
             names.sort();
             names.dedup();
         }
+        s.dirent_obj.sort();
         s
     }
 
@@ -346,6 +379,7 @@ impl ExecState {
         check_sorted_fds(s.virtual_fds.iter().map(|(fd, _, _)| *fd))?;
         check_sorted_fds(s.dirent_pending.iter().map(|(fd, _)| *fd))?;
         check_sorted_fds(s.dirent_seen.iter().map(|(fd, _)| *fd))?;
+        check_sorted_fds(s.dirent_obj.iter().map(|(fd, _, _)| *fd))?;
         let mut flags = 0u16;
         if s.fake.is_some() {
             flags |= FLAG_HAS_FAKE;
@@ -394,6 +428,12 @@ impl ExecState {
             for n in names {
                 put_bytes(&mut out, n);
             }
+        }
+        put_count(&mut out, s.dirent_obj.len())?;
+        for (fd, dev, ino) in &s.dirent_obj {
+            out.extend_from_slice(&fd.to_le_bytes());
+            out.extend_from_slice(&dev.to_le_bytes());
+            out.extend_from_slice(&ino.to_le_bytes());
         }
         if out.len() > MAX_ENCODED_BYTES {
             return Err(ExecStateError::TooLarge);
@@ -465,6 +505,15 @@ impl ExecState {
             }
             dirent_seen.push((fd, names));
         }
+        let n_obj = r.count()?;
+        let mut dirent_obj = Vec::new();
+        let mut prev: Option<i32> = None;
+        for _ in 0..n_obj {
+            let fd = r.fd(&mut prev)?;
+            let dev = r.u64()?;
+            let ino = r.u64()?;
+            dirent_obj.push((fd, dev, ino));
+        }
         if r.pos != bytes.len() {
             return Err(ExecStateError::TrailingBytes);
         }
@@ -478,6 +527,7 @@ impl ExecState {
             virtual_fds,
             dirent_pending,
             dirent_seen,
+            dirent_obj,
         };
         state.validate_guest_paths()?;
         Ok(state)
@@ -539,6 +589,10 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32, ExecStateError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, ExecStateError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
     fn i32(&mut self) -> Result<i32, ExecStateError> {
@@ -617,6 +671,7 @@ mod tests {
             virtual_fds: vec![(4, b"/virt".to_vec(), true), (8, b"/v2".to_vec(), false)],
             dirent_pending: vec![(4, vec![1, 2, 3, 0, 255])],
             dirent_seen: vec![(4, vec![b"alpha".to_vec(), b"beta".to_vec()]), (9, vec![])],
+            dirent_obj: vec![(4, 0x801, u64::MAX), (9, 0, 0)],
         }
     }
 
@@ -633,6 +688,8 @@ mod tests {
             cwd: PathBuf::from("/work/dir"),
             tables: HashMap::new(),
             next_files: MAIN_FILES,
+            streams: HashMap::new(),
+            next_stream: 0,
             bootstrapped: true,
             root_override: None,
             scratch: Some(0x1000),
@@ -700,6 +757,7 @@ mod tests {
         for (_, names) in &mut a.dirent_seen {
             names.reverse();
         }
+        a.dirent_obj.reverse();
         assert_ne!(a.fds, b.fds, "test setup: orders must differ");
         assert_eq!(
             a.encode().expect("encode shuffled"),
@@ -740,13 +798,16 @@ mod tests {
         let mut bytes = minimal_state().encode().expect("encode");
         bytes[0] = b'X';
         assert_eq!(ExecState::decode(&bytes), Err(ExecStateError::BadMagic));
-        let mut bytes = minimal_state().encode().expect("encode");
-        bytes[4] = 2;
-        bytes[5] = 0;
-        assert_eq!(
-            ExecState::decode(&bytes),
-            Err(ExecStateError::UnsupportedVersion(2))
-        );
+        // Version 1 (no directory identities) and anything newer refuse.
+        for v in [1u8, 3] {
+            let mut bytes = minimal_state().encode().expect("encode");
+            bytes[4] = v;
+            bytes[5] = 0;
+            assert_eq!(
+                ExecState::decode(&bytes),
+                Err(ExecStateError::UnsupportedVersion(v.into()))
+            );
+        }
     }
 
     #[test]
@@ -783,7 +844,8 @@ mod tests {
             put(&mut out, p);
         }
         put(&mut out, b"/init");
-        for _ in 0..4 {
+        // Empty argv, virtual_fds, dirent_pending, dirent_seen, dirent_obj.
+        for _ in 0..5 {
             out.extend_from_slice(&0u32.to_le_bytes());
         }
         out
@@ -1028,11 +1090,48 @@ mod tests {
             Some(b"/tmp/nonutf8-\xff".as_slice())
         );
         assert_eq!(t.virtual_fds.len(), 2);
-        assert_eq!(t.dirent_pending.get(&4), Some(&vec![1, 2, 3, 0, 255]));
+        let s4 = st.stream(MAIN_FILES, 4).expect("fd 4 has listing state");
+        assert!(s4.emitted);
+        assert_eq!(s4.pending, Some(vec![1, 2, 3, 0, 255]));
         assert_eq!(
-            t.dirent_seen.get(&4).map(|s| s.len()),
+            s4.seen.as_ref().map(|s| s.len()),
             Some(2),
             "dirent names restore as a set"
+        );
+        // R8: the identity a listing was built for restores with it.
+        assert_eq!(s4.obj, Some((0x801, u64::MAX)));
+        assert_eq!(st.stream(MAIN_FILES, 9).and_then(|s| s.obj), Some((0, 0)));
+        assert_eq!(st.stream(MAIN_FILES, 8).map(|s| s.emitted), Some(false));
+        assert_eq!(st.streams.len(), 3, "one stream per fd with listing state");
+    }
+
+    /// R8: every part of a number's listing state survives capture and
+    /// apply together, its directory identity included; numbers keep
+    /// separate streams in the successor.
+    #[test]
+    fn listing_state_and_its_identity_survive_capture_and_apply() {
+        let mut st = proc_state();
+        st.fdt_mut(MAIN_FILES).fds.insert(3, PathBuf::from("/a"));
+        {
+            let s = st.stream_mut(MAIN_FILES, 3);
+            s.pending = Some(vec![9, 9]);
+            s.seen = Some(HashSet::from(["x".to_string()]));
+            s.obj = Some((5, 6));
+        }
+        st.stream_mut(MAIN_FILES, 4).obj = Some((7, 8));
+        let snap = ExecState::capture(&st, MAIN_FILES, &cfg("/"));
+        assert_eq!(snap.dirent_obj, vec![(3, 5, 6), (4, 7, 8)]);
+        let decoded = ExecState::decode(&snap.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded, snap);
+        let mut restored = proc_state();
+        decoded
+            .apply_to(&mut restored, &RootConfig::new("/".into(), Vec::new()))
+            .expect("apply");
+        assert_eq!(restored.stream(MAIN_FILES, 3), st.stream(MAIN_FILES, 3));
+        assert_eq!(restored.stream(MAIN_FILES, 4), st.stream(MAIN_FILES, 4));
+        assert_ne!(
+            restored.fdt(MAIN_FILES).streams.get(&3),
+            restored.fdt(MAIN_FILES).streams.get(&4)
         );
     }
 

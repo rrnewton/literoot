@@ -550,6 +550,225 @@ int main(int argc, char **argv) {
 }
 "#;
 
+/// Directory streams: listing progress belongs to the open file description
+/// (R9: shared by the two tables of a split) and survives fork and exec with
+/// the identity that validates it (R8). Run in `/w` as for FD_TABLES_C, where
+/// `a` has two entries besides "." and ".." (`v` and `child`, from binds
+/// under literoot) and `b` holds `b1` and `b2`.
+const FD_STREAMS_C: &str = r#"
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef CLOSE_RANGE_UNSHARE
+#define CLOSE_RANGE_UNSHARE (1U << 1)
+#endif
+
+static const char *dir;
+static int n, fb;
+
+static void say(const char *what, long r, int e) {
+    printf("%s %ld errno %d\n", what, r < 0 ? -1L : r, r < 0 ? e : 0);
+}
+
+static int cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+/* Every name getdents64 returns on fd, sorted, without "." and "..". */
+static void list(const char *what, int fd) {
+    char *names[64]; int k = 0;
+    char buf[4096];
+    for (;;) {
+        long got = syscall(SYS_getdents64, fd, buf, sizeof buf);
+        if (got <= 0) break;
+        for (long off = 0; off < got;) {
+            struct dirent64 *de = (struct dirent64 *) (buf + off);
+            if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..") && k < 64)
+                names[k++] = strdup(de->d_name);
+            off += de->d_reclen;
+        }
+    }
+    qsort(names, k, sizeof names[0], cmp);
+    printf("%s", what);
+    for (int i = 0; i < k; i++) printf(" %s", names[i]);
+    printf("\n");
+}
+
+/* How many records are left on fd ("." and ".." included). Raw syscalls
+ * only: the clone child below runs it without a thread of its own. */
+static int rest(int fd) {
+    char buf[4096];
+    int k = 0;
+    for (;;) {
+        long got = syscall(SYS_getdents64, fd, buf, sizeof buf);
+        if (got <= 0) return k;
+        for (long off = 0; off < got; k++)
+            off += ((struct dirent64 *) (buf + off))->d_reclen;
+    }
+}
+
+/* Read one small buffer at a time until 3 records arrived. */
+static void partial3(int fd) {
+    char buf[32];
+    int seen = 0;
+    while (seen < 3) {
+        long got = syscall(SYS_getdents64, fd, buf, sizeof buf);
+        if (got <= 0) break;
+        for (long off = 0; off < got; seen++)
+            off += ((struct dirent64 *) (buf + off))->d_reclen;
+    }
+}
+
+static int open_dir(const char *rel) {
+    char p[4096];
+    snprintf(p, sizeof p, "%s/%s", dir, rel);
+    return open(p, O_RDONLY | O_DIRECTORY);
+}
+
+static void leader_getdents(const char *what) {
+    char buf[4096];
+    long r = syscall(SYS_getdents64, n, buf, sizeof buf);
+    say(what, r, errno);
+}
+
+static void run(void *(*fn)(void *)) {
+    pthread_t t;
+    if (pthread_create(&t, 0, fn, 0) == 0) pthread_join(t, 0);
+}
+
+static void *unshare_list(void *arg) {
+    (void) arg;
+    if (unshare(CLONE_FILES) == 0) list("r9 unshare worker list(v)", n);
+    return 0;
+}
+
+static void *unshare_rest(void *arg) {
+    (void) arg;
+    if (unshare(CLONE_FILES) == 0) printf("r9 unshare worker rest(a) %d\n", rest(n));
+    return 0;
+}
+
+static void *close_range_list(void *arg) {
+    (void) arg;
+    if (syscall(SYS_close_range, 1000U, 1000U, CLOSE_RANGE_UNSHARE) == 0)
+        list("r9 close_range worker list(v)", n);
+    return 0;
+}
+
+static void *unshare_reuse(void *arg) {
+    (void) arg;
+    if (unshare(CLONE_FILES) != 0) return 0;
+    dup2(fb, n);
+    list("r9 reuse worker list(n)", n);
+    return 0;
+}
+
+/* A thread made by clone without CLONE_FILES: it gets a copy of the table.
+ * No libc in it (it has no thread pointer of its own). */
+static volatile int clone_rest = -1;
+static volatile pid_t clone_tid;
+
+static int clone_child(void *arg) {
+    (void) arg;
+    clone_rest = rest(n);
+    syscall(SYS_exit, 0);
+    return 0;
+}
+
+static void clone_case(void) {
+    static char stack[64 * 1024] __attribute__((aligned(16)));
+    int flags = CLONE_VM | CLONE_FS | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+        | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+    pid_t t = clone(clone_child, stack + sizeof stack, flags, 0,
+                    (pid_t *) &clone_tid, 0, (pid_t *) &clone_tid);
+    if (t < 0) return;
+    while (clone_tid != 0)
+        syscall(SYS_futex, &clone_tid, FUTEX_WAIT, t, 0, 0, 0);
+    printf("r9 clone worker rest(a) %d\n", clone_rest);
+}
+
+/* After fork or exec: B dup'd onto A's number lists B only; an unchanged
+ * second A keeps its one remaining record. */
+static void r8_child(const char *how, int na, int nb, int na2) {
+    char what[64];
+    dup2(nb, na);
+    snprintf(what, sizeof what, "r8 %s child dup-b list(n)", how);
+    list(what, na);
+    printf("r8 %s child rest(a2) %d\n", how, rest(na2));
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 6 && strcmp(argv[1], "exec-child") == 0) {
+        /* The exec'd image: never execs again. */
+        dir = argv[2];
+        r8_child("exec", atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+        return 0;
+    }
+    if (argc != 2) return 2;
+    dir = argv[1];
+    fb = open_dir("b");
+    if (fb < 0) return 3;
+
+    n = open_dir("a/v");
+    run(unshare_list);
+    leader_getdents("r9 unshare leader getdents(v)");
+    n = open_dir("a");
+    partial3(n);
+    run(unshare_rest);
+    leader_getdents("r9 unshare leader getdents(a)");
+    n = open_dir("a/v");
+    run(close_range_list);
+    leader_getdents("r9 close_range leader getdents(v)");
+    n = open_dir("a");
+    partial3(n);
+    clone_case();
+    leader_getdents("r9 clone leader getdents(a)");
+    n = open_dir("a");
+    partial3(n);
+    run(unshare_reuse);
+    printf("r9 reuse leader rest(a) %d\n", rest(n));
+
+    const char *hows[] = {"fork", "exec"};
+    for (int i = 0; i < 2; i++) {
+        int na = open_dir("a"), nb = open_dir("b"), na2 = open_dir("a");
+        if (na < 0 || nb < 0 || na2 < 0) return 3;
+        partial3(na);
+        partial3(na2);
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (i == 0) {
+                r8_child("fork", na, nb, na2);
+                _exit(0);
+            }
+            char a[16], b[16], a2[16];
+            snprintf(a, sizeof a, "%d", na);
+            snprintf(b, sizeof b, "%d", nb);
+            snprintf(a2, sizeof a2, "%d", na2);
+            execl(argv[0], argv[0], "exec-child", dir, a, b, a2, (char *) 0);
+            _exit(127);
+        }
+        int status = 0;
+        waitpid(pid, &status, 0);
+        printf("r8 %s child status %d\n", hows[i], status);
+    }
+    return 0;
+}
+"#;
+
 fn real_ids() -> (u32, u32) {
     extern "C" {
         fn getuid() -> u32;
@@ -949,6 +1168,55 @@ fn fd_state_belongs_to_its_own_fd_table_and_closed_fds_are_the_kernels() {
          r6 dup-onto-pending getdents b1 b2\n"
     );
     // The same binds as every_fd_table_reader_and_unnamed_fds_and_cwds_match_native.
+    let bound = dir.join("bound-v");
+    std::fs::create_dir(&bound).unwrap();
+    std::fs::write(bound.join("marker"), "m").unwrap();
+    let child = dir.join("bound-child");
+    std::fs::create_dir(&child).unwrap();
+    let binds = [
+        format!("{}:/w/a/v/bound", bound.display()),
+        format!("{}:/w/a/child", child.display()),
+    ];
+    for (name, mode) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = fd_readers_work(&dir, name, false);
+        let mut flags = mode;
+        for b in &binds {
+            flags.extend(["-b", b.as_str()]);
+        }
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_directory_stream_is_shared_by_split_tables_and_survives_fork_and_exec() {
+    let dir = own_dir("fd-streams");
+    let guest = build_guest(&dir, "streams", FD_STREAMS_C);
+    let work = fd_readers_work(&dir, "native", true);
+    let native = run_native(&guest, "native", &[work.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "r9 unshare worker list(v) bound\n\
+         r9 unshare leader getdents(v) 0 errno 0\n\
+         r9 unshare worker rest(a) 1\n\
+         r9 unshare leader getdents(a) 0 errno 0\n\
+         r9 close_range worker list(v) bound\n\
+         r9 close_range leader getdents(v) 0 errno 0\n\
+         r9 clone worker rest(a) 1\n\
+         r9 clone leader getdents(a) 0 errno 0\n\
+         r9 reuse worker list(n) b1 b2\n\
+         r9 reuse leader rest(a) 1\n\
+         r8 fork child dup-b list(n) b1 b2\n\
+         r8 fork child rest(a2) 1\n\
+         r8 fork child status 0\n\
+         r8 exec child dup-b list(n) b1 b2\n\
+         r8 exec child rest(a2) 1\n\
+         r8 exec child status 0\n"
+    );
     let bound = dir.join("bound-v");
     std::fs::create_dir(&bound).unwrap();
     std::fs::write(bound.join("marker"), "m").unwrap();
