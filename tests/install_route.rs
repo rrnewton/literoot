@@ -364,6 +364,192 @@ int main(int argc, char **argv) {
 }
 "#;
 
+/// Fd-number state per fd table, closed fds, and the readers that recover a
+/// virtual directory's name (argv dir, the fd-readers layout: under literoot
+/// `a/v` is a virtual bind-prefix directory over the bind `a/v/bound`, and
+/// `a/child` is a bind under the real directory `a`).
+const FD_TABLES_C: &str = r#"
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static const char *dir;
+static int nv, fb;
+
+static void say(const char *what, long r, int e) {
+    printf("%s %ld errno %d\n", what, r < 0 ? -1L : r, r < 0 ? e : 0);
+}
+
+static int cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+/* Every name getdents64 returns on fd (buffer of size bufsz), sorted,
+ * without "." and "..". */
+static void list(const char *what, int fd, size_t bufsz) {
+    char *names[64]; int n = 0;
+    char buf[4096];
+    for (;;) {
+        long got = syscall(SYS_getdents64, fd, buf, bufsz);
+        if (got <= 0) break;
+        for (long off = 0; off < got;) {
+            struct dirent64 *de = (struct dirent64 *) (buf + off);
+            if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..") && n < 64)
+                names[n++] = strdup(de->d_name);
+            off += de->d_reclen;
+        }
+    }
+    qsort(names, n, sizeof names[0], cmp);
+    printf("%s", what);
+    for (int i = 0; i < n; i++) printf(" %s", names[i]);
+    printf("\n");
+}
+
+/* Read entries one small buffer at a time until `want` names (counting
+ * "." and "..") arrived; returns how many did. */
+static int partial(int fd, int want) {
+    char buf[32];
+    int seen = 0;
+    while (seen < want) {
+        long got = syscall(SYS_getdents64, fd, buf, sizeof buf);
+        if (got <= 0) break;
+        for (long off = 0; off < got;) {
+            off += ((struct dirent64 *) (buf + off))->d_reclen;
+            seen++;
+        }
+    }
+    return seen;
+}
+
+static void read_marker(const char *what, int dfd, const char *rel) {
+    char buf[64] = {0};
+    int f = openat(dfd, rel, O_RDONLY);
+    long r = f < 0 ? -1 : read(f, buf, sizeof buf - 1);
+    if (f >= 0) close(f);
+    printf("%s %s\n", what, r > 0 ? buf : "-");
+}
+
+/* R5: a private table invalidates its own number, not the leader's. */
+static void *worker_getdents(void *arg) {
+    (void) arg;
+    if (unshare(CLONE_FILES) != 0) return 0;
+    dup2(fb, nv);
+    list("r5 worker getdents(n)", nv, 4096);
+    return 0;
+}
+
+static void *worker_open(void *arg) {
+    (void) arg;
+    char b[4096];
+    snprintf(b, sizeof b, "%s/b", dir);
+    if (unshare(CLONE_FILES) != 0) return 0;
+    close(nv);
+    int x = open(b, O_RDONLY | O_DIRECTORY);
+    printf("r5 worker2 b took n %d\n", x == nv);
+    return 0;
+}
+
+static void *worker_fstatat(void *arg) {
+    (void) arg;
+    struct stat st;
+    if (unshare(CLONE_FILES) != 0) return 0;
+    dup2(fb, nv);
+    long r = fstatat(nv, "b1", &st, 0);
+    say("r7 worker3 fstatat(n,b1)", r, errno);
+    return 0;
+}
+
+static void run(void *(*fn)(void *)) {
+    pthread_t t;
+    if (pthread_create(&t, 0, fn, 0) == 0) pthread_join(t, 0);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    dir = argv[1];
+    char p[4096];
+    long r;
+    snprintf(p, sizeof p, "%s/a/v", dir);
+    nv = open(p, O_RDONLY | O_DIRECTORY);
+    snprintf(p, sizeof p, "%s/b", dir);
+    fb = open(p, O_RDONLY | O_DIRECTORY);
+    if (nv < 0 || fb < 0) return 3;
+
+    run(worker_getdents);
+    read_marker("r5 leader openat(n,bound/marker)", nv, "bound/marker");
+    list("r5 leader getdents(n)", nv, 4096);
+    run(worker_open);
+    read_marker("r5 leader2 openat(n,bound/marker)", nv, "bound/marker");
+
+    /* R7 mc, threaded: the worker's passthrough must not rename the
+     * leader's number. */
+    run(worker_fstatat);
+    r = fchdir(nv);
+    say("r7 leader fchdir(n)", r, errno);
+    read_marker("r7 leader open(bound/marker)", AT_FDCWD, "bound/marker");
+    if (chdir(dir) != 0) return 3;
+
+    /* R7 mc, one table: the number's path record says b while it holds the
+     * virtual directory again (a dup of a second fd on it). */
+    snprintf(p, sizeof p, "%s/a/v", dir);
+    int n2 = open(p, O_RDONLY | O_DIRECTORY);
+    int x2 = open(p, O_RDONLY | O_DIRECTORY);
+    struct stat st;
+    dup2(fb, n2);
+    r = fstatat(n2, "b1", &st, 0);
+    say("r7 fstatat(dup-b,b1)", r, errno);
+    dup2(x2, n2);
+    r = fchdir(n2);
+    say("r7 fchdir(dup-v)", r, errno);
+    read_marker("r7 open(bound/marker)", AT_FDCWD, "bound/marker");
+    if (chdir(dir) != 0) return 3;
+
+    /* R7 mq: a closed dirfd keeps the kernel's EBADF; a duplicate the fd
+     * table never saw still resolves through its bind. */
+    snprintf(p, sizeof p, "%s/b", dir);
+    int d = open(p, O_RDONLY | O_DIRECTORY);
+    close(d);
+    r = openat(d, "x", O_RDONLY);
+    say("r7 closed openat(d,x)", r, errno);
+    snprintf(p, sizeof p, "%s/a", dir);
+    int fa = open(p, O_RDONLY | O_DIRECTORY);
+    int hi = dup2(fa, 900);
+    r = openat(hi, "child", O_RDONLY | O_DIRECTORY);
+    say("r7 uncached-dup openat(900,child)", r < 0 ? -1 : 0, errno);
+
+    /* R6: a closed virtual fd and a closed or replaced number with
+     * enumeration state are the kernel's. */
+    snprintf(p, sizeof p, "%s/a/v", dir);
+    int cv = open(p, O_RDONLY | O_DIRECTORY);
+    close(cv);
+    char buf[256];
+    r = syscall(SYS_getdents64, cv, buf, sizeof buf);
+    say("r6 closed-virtual getdents", r, errno);
+    snprintf(p, sizeof p, "%s/a", dir);
+    int dp = open(p, O_RDONLY | O_DIRECTORY);
+    printf("r6 partial read %d\n", partial(dp, 3));
+    close(dp);
+    r = syscall(SYS_getdents64, dp, buf, sizeof buf);
+    say("r6 closed-pending getdents", r, errno);
+    int dq = open(p, O_RDONLY | O_DIRECTORY);
+    printf("r6 partial read %d\n", partial(dq, 3));
+    snprintf(p, sizeof p, "%s/b", dir);
+    int fb2 = open(p, O_RDONLY | O_DIRECTORY);
+    dup2(fb2, dq);
+    list("r6 dup-onto-pending getdents", dq, 4096);
+    return 0;
+}
+"#;
+
 fn real_ids() -> (u32, u32) {
     extern "C" {
         fn getuid() -> u32;
@@ -726,6 +912,58 @@ fn a_thread_with_its_own_fd_table_resolves_its_own_fds() {
     );
     for (name, flags) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
         let work = setup(name);
+        assert_eq!(
+            under_literoot(&work, &guest, name, &flags, &["/w"]),
+            native,
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fd_state_belongs_to_its_own_fd_table_and_closed_fds_are_the_kernels() {
+    let dir = own_dir("fd-tables");
+    let guest = build_guest(&dir, "tables", FD_TABLES_C);
+    let work = fd_readers_work(&dir, "native", true);
+    let native = run_native(&guest, "native", &[work.to_str().unwrap()]);
+    assert_eq!(
+        native,
+        "r5 worker getdents(n) b1 b2\n\
+         r5 leader openat(n,bound/marker) m\n\
+         r5 leader getdents(n) bound\n\
+         r5 worker2 b took n 1\n\
+         r5 leader2 openat(n,bound/marker) m\n\
+         r7 worker3 fstatat(n,b1) 0 errno 0\n\
+         r7 leader fchdir(n) 0 errno 0\n\
+         r7 leader open(bound/marker) m\n\
+         r7 fstatat(dup-b,b1) 0 errno 0\n\
+         r7 fchdir(dup-v) 0 errno 0\n\
+         r7 open(bound/marker) m\n\
+         r7 closed openat(d,x) -1 errno 9\n\
+         r7 uncached-dup openat(900,child) 0 errno 0\n\
+         r6 closed-virtual getdents -1 errno 9\n\
+         r6 partial read 3\n\
+         r6 closed-pending getdents -1 errno 9\n\
+         r6 partial read 3\n\
+         r6 dup-onto-pending getdents b1 b2\n"
+    );
+    // The same binds as every_fd_table_reader_and_unnamed_fds_and_cwds_match_native.
+    let bound = dir.join("bound-v");
+    std::fs::create_dir(&bound).unwrap();
+    std::fs::write(bound.join("marker"), "m").unwrap();
+    let child = dir.join("bound-child");
+    std::fs::create_dir(&child).unwrap();
+    let binds = [
+        format!("{}:/w/a/v/bound", bound.display()),
+        format!("{}:/w/a/child", child.display()),
+    ];
+    for (name, mode) in [("plain", vec![]), ("fake-root", vec!["-0"])] {
+        let work = fd_readers_work(&dir, name, false);
+        let mut flags = mode;
+        for b in &binds {
+            flags.extend(["-b", b.as_str()]);
+        }
         assert_eq!(
             under_literoot(&work, &guest, name, &flags, &["/w"]),
             native,

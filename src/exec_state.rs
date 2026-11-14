@@ -16,13 +16,13 @@
 //!
 //! This module performs no I/O and issues no syscalls.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::rootfs_tool::{LiterootConfig, ProcState};
+use crate::rootfs_tool::{FdTable, FilesId, LiterootConfig, ProcState, MAIN_FILES};
 use crate::translate::RootConfig;
 
 /// Wire magic ("LRX1").
@@ -101,7 +101,7 @@ impl ExecState {
     /// Fake state is captured exactly as-is — capturing must not
     /// initialize it, or `handle_post_exec`'s setuid transition
     /// would apply to the wrong base.
-    pub fn capture(st: &ProcState, cfg: &LiterootConfig) -> Self {
+    pub fn capture(st: &ProcState, files: FilesId, cfg: &LiterootConfig) -> Self {
         fn bytes(p: &PathBuf) -> Vec<u8> {
             p.as_os_str().as_bytes().to_vec()
         }
@@ -114,21 +114,24 @@ impl ExecState {
         } else {
             bytes(&st.cwd)
         };
-        let mut fds: Vec<(i32, Vec<u8>)> = st.fds.iter().map(|(fd, p)| (*fd, bytes(p))).collect();
+        // The fd table of the capturing task: after exec, or in a fork
+        // child, it is the process's only table.
+        let t = st.fdt(files);
+        let mut fds: Vec<(i32, Vec<u8>)> = t.fds.iter().map(|(fd, p)| (*fd, bytes(p))).collect();
         fds.sort();
-        let mut virtual_fds: Vec<(i32, Vec<u8>, bool)> = st
+        let mut virtual_fds: Vec<(i32, Vec<u8>, bool)> = t
             .virtual_fds
             .iter()
             .map(|(fd, (p, emitted))| (*fd, bytes(p), *emitted))
             .collect();
         virtual_fds.sort();
-        let mut dirent_pending: Vec<(i32, Vec<u8>)> = st
+        let mut dirent_pending: Vec<(i32, Vec<u8>)> = t
             .dirent_pending
             .iter()
             .map(|(fd, b)| (*fd, b.clone()))
             .collect();
         dirent_pending.sort();
-        let mut dirent_seen: Vec<(i32, Vec<Vec<u8>>)> = st
+        let mut dirent_seen: Vec<(i32, Vec<Vec<u8>>)> = t
             .dirent_seen
             .iter()
             .map(|(fd, names)| {
@@ -201,11 +204,12 @@ impl ExecState {
     #[allow(dead_code)] // Fork wiring is the first production caller.
     pub fn capture_fork_seed(
         st: &ProcState,
+        files: FilesId,
         cfg: &LiterootConfig,
         current_exe: &Path,
         current_argv: &[Vec<u8>],
     ) -> Self {
-        let mut seed = Self::capture(st, cfg);
+        let mut seed = Self::capture(st, files, cfg);
         seed.exe_guest = current_exe.as_os_str().as_bytes().to_vec();
         seed.argv = current_argv.to_vec();
         seed
@@ -238,25 +242,28 @@ impl ExecState {
         };
         st.cwd = path_from_bytes(&self.cwd);
         st.root_override = root_override;
-        st.fds = self
-            .fds
-            .iter()
-            .map(|(fd, p)| (*fd, path_from_bytes(p)))
-            .collect();
+        let mut table = FdTable {
+            fds: self
+                .fds
+                .iter()
+                .map(|(fd, p)| (*fd, path_from_bytes(p)))
+                .collect(),
+            ..Default::default()
+        };
         st.fake = self.fake;
         st.exe_guest = path_from_bytes(&self.exe_guest);
         st.argv = self.argv.clone();
-        st.virtual_fds = self
+        table.virtual_fds = self
             .virtual_fds
             .iter()
             .map(|(fd, p, emitted)| (*fd, (path_from_bytes(p), *emitted)))
             .collect();
-        st.dirent_pending = self
+        table.dirent_pending = self
             .dirent_pending
             .iter()
             .map(|(fd, b)| (*fd, b.clone()))
             .collect();
-        st.dirent_seen = self
+        table.dirent_seen = self
             .dirent_seen
             .iter()
             .map(|(fd, names)| {
@@ -269,6 +276,10 @@ impl ExecState {
                 )
             })
             .collect();
+        // One table: the snapshot is the capturing task's, and the
+        // restored process starts single-threaded on it.
+        st.tables = HashMap::from([(MAIN_FILES, table)]);
+        st.next_files = MAIN_FILES;
         st.bootstrapped = true;
         st.initial_stack_limit_consumed = true;
         Ok(())
@@ -620,14 +631,12 @@ mod tests {
     fn proc_state() -> ProcState {
         ProcState {
             cwd: PathBuf::from("/work/dir"),
-            fds: HashMap::new(),
+            tables: HashMap::new(),
+            next_files: MAIN_FILES,
             bootstrapped: true,
             root_override: None,
             scratch: Some(0x1000),
             exe_guest: PathBuf::from("/bin/sh"),
-            virtual_fds: HashMap::new(),
-            dirent_pending: HashMap::new(),
-            dirent_seen: HashMap::new(),
             argv: vec![b"sh".to_vec()],
             fake: None,
             fake_fs: None,
@@ -700,17 +709,29 @@ mod tests {
         // Same requirement through capture(): HashMap iteration
         // order must never leak into the bytes.
         let mut p1 = proc_state();
-        p1.fds.insert(9, PathBuf::from("/nine"));
-        p1.fds.insert(3, PathBuf::from("/three"));
-        p1.fds.insert(7, PathBuf::from("/seven"));
+        p1.fdt_mut(MAIN_FILES).fds.insert(9, PathBuf::from("/nine"));
+        p1.fdt_mut(MAIN_FILES)
+            .fds
+            .insert(3, PathBuf::from("/three"));
+        p1.fdt_mut(MAIN_FILES)
+            .fds
+            .insert(7, PathBuf::from("/seven"));
         let mut p2 = proc_state();
-        p2.fds.insert(7, PathBuf::from("/seven"));
-        p2.fds.insert(9, PathBuf::from("/nine"));
-        p2.fds.insert(3, PathBuf::from("/three"));
+        p2.fdt_mut(MAIN_FILES)
+            .fds
+            .insert(7, PathBuf::from("/seven"));
+        p2.fdt_mut(MAIN_FILES).fds.insert(9, PathBuf::from("/nine"));
+        p2.fdt_mut(MAIN_FILES)
+            .fds
+            .insert(3, PathBuf::from("/three"));
         let c = cfg("/work/dir");
         assert_eq!(
-            ExecState::capture(&p1, &c).encode().expect("encode cap1"),
-            ExecState::capture(&p2, &c).encode().expect("encode cap2"),
+            ExecState::capture(&p1, MAIN_FILES, &c)
+                .encode()
+                .expect("encode cap1"),
+            ExecState::capture(&p2, MAIN_FILES, &c)
+                .encode()
+                .expect("encode cap2"),
         );
     }
 
@@ -812,13 +833,13 @@ mod tests {
     fn capture_materializes_sentinel_cwd() {
         let mut st = proc_state();
         st.cwd = PathBuf::from("/__literoot_unset__");
-        let s = ExecState::capture(&st, &cfg("/from/config"));
+        let s = ExecState::capture(&st, MAIN_FILES, &cfg("/from/config"));
         assert_eq!(s.cwd, b"/from/config");
-        let s = ExecState::capture(&st, &cfg(""));
+        let s = ExecState::capture(&st, MAIN_FILES, &cfg(""));
         assert_eq!(s.cwd, b"/");
         // A real cwd is never replaced by config.
         st.cwd = PathBuf::from("/real");
-        let s = ExecState::capture(&st, &cfg("/from/config"));
+        let s = ExecState::capture(&st, MAIN_FILES, &cfg("/from/config"));
         assert_eq!(s.cwd, b"/real");
     }
 
@@ -832,16 +853,16 @@ mod tests {
         st.exe_guest = PathBuf::new();
         let mut c = cfg("/work/dir");
         c.initial_exe = "/bin/sh".to_string();
-        let s = ExecState::capture(&st, &c);
+        let s = ExecState::capture(&st, MAIN_FILES, &c);
         assert_eq!(s.exe_guest, b"/bin/sh");
         assert!(s.encode().is_ok());
         c.initial_exe = "bin/sh".to_string();
-        let s = ExecState::capture(&st, &c);
+        let s = ExecState::capture(&st, MAIN_FILES, &c);
         assert_eq!(s.exe_guest, b"/work/dir/bin/sh");
         assert!(s.encode().is_ok());
         // A materialized exe_guest is never replaced by config.
         st.exe_guest = PathBuf::from("/bin/bash");
-        let s = ExecState::capture(&st, &c);
+        let s = ExecState::capture(&st, MAIN_FILES, &c);
         assert_eq!(s.exe_guest, b"/bin/bash");
     }
 
@@ -857,7 +878,8 @@ mod tests {
         // accessors return for this state; the seed records
         // them rather than deriving a second materialization.
         let current_argv = vec![b"sh".to_vec(), b"-i".to_vec()];
-        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/bin/sh"), &current_argv);
+        let seed =
+            ExecState::capture_fork_seed(&st, MAIN_FILES, &c, Path::new("/bin/sh"), &current_argv);
         assert_eq!(seed.exe_guest, b"/bin/sh");
         assert_eq!(seed.argv, current_argv);
         assert!(seed.encode().is_ok());
@@ -879,23 +901,40 @@ mod tests {
         // seed must preserve it byte-for-byte instead of joining
         // the spelling onto st.cwd (the pre-fix behavior).
         c.initial_exe = "./prog".to_string();
-        let seed =
-            ExecState::capture_fork_seed(&st, &c, Path::new("/work/dir/prog"), &current_argv);
+        let seed = ExecState::capture_fork_seed(
+            &st,
+            MAIN_FILES,
+            &c,
+            Path::new("/work/dir/prog"),
+            &current_argv,
+        );
         assert_eq!(seed.exe_guest, b"/work/dir/prog");
 
         c.initial_exe = "../x/prog".to_string();
-        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/work/x/prog"), &current_argv);
+        let seed = ExecState::capture_fork_seed(
+            &st,
+            MAIN_FILES,
+            &c,
+            Path::new("/work/x/prog"),
+            &current_argv,
+        );
         assert_eq!(seed.exe_guest, b"/work/x/prog");
 
         c.initial_exe = String::new();
-        let seed =
-            ExecState::capture_fork_seed(&st, &c, Path::new("/proc/self/exe"), &current_argv);
+        let seed = ExecState::capture_fork_seed(
+            &st,
+            MAIN_FILES,
+            &c,
+            Path::new("/proc/self/exe"),
+            &current_argv,
+        );
         assert_eq!(seed.exe_guest, b"/proc/self/exe");
         assert_eq!(seed.fake, fake_before);
 
         c.cwd = String::new();
         c.initial_exe = "./prog".to_string();
-        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/prog"), &current_argv);
+        let seed =
+            ExecState::capture_fork_seed(&st, MAIN_FILES, &c, Path::new("/prog"), &current_argv);
         assert_eq!(seed.exe_guest, b"/prog");
         assert_eq!(seed.fake, fake_before);
     }
@@ -910,7 +949,13 @@ mod tests {
         c.initial_exe = "/bin/sh".to_string();
         c.initial_argv = vec!["sh".to_string()];
         let current_argv = vec![b"bash".to_vec()];
-        let seed = ExecState::capture_fork_seed(&st, &c, Path::new("/bin/bash"), &current_argv);
+        let seed = ExecState::capture_fork_seed(
+            &st,
+            MAIN_FILES,
+            &c,
+            Path::new("/bin/bash"),
+            &current_argv,
+        );
         assert_eq!(seed.exe_guest, b"/bin/bash");
         assert_eq!(seed.argv, current_argv);
         assert_eq!(seed.fake, fake_before);
@@ -925,8 +970,13 @@ mod tests {
         c.initial_exe = "./prog".to_string();
         c.initial_argv = vec!["initial-argv".to_string()];
         let current_argv = vec![b"current-argv".to_vec(), b"-x".to_vec()];
-        let seed =
-            ExecState::capture_fork_seed(&st, &c, Path::new("/work/dir/prog"), &current_argv);
+        let seed = ExecState::capture_fork_seed(
+            &st,
+            MAIN_FILES,
+            &c,
+            Path::new("/work/dir/prog"),
+            &current_argv,
+        );
         assert_eq!(seed.argv, current_argv);
         assert_eq!(seed.fake, Some([9, 8, 7, 6, 5, 4]));
     }
@@ -935,16 +985,16 @@ mod tests {
     fn capture_never_initializes_fake() {
         let mut st = proc_state();
         st.fake = None;
-        assert_eq!(ExecState::capture(&st, &cfg("/")).fake, None);
+        assert_eq!(ExecState::capture(&st, MAIN_FILES, &cfg("/")).fake, None);
         st.fake = Some([1, 2, 3, 4, 5, 6]);
         assert_eq!(
-            ExecState::capture(&st, &cfg("/")).fake,
+            ExecState::capture(&st, MAIN_FILES, &cfg("/")).fake,
             Some([1, 2, 3, 4, 5, 6]),
             "capture copies fake exactly; handle_post_exec transitions it"
         );
         // Scratch/dispatch memos never cross: capture output has no
         // place to put them (struct equality covers the rest).
-        let s = ExecState::capture(&st, &cfg("/"));
+        let s = ExecState::capture(&st, MAIN_FILES, &cfg("/"));
         assert_eq!(s.exe_guest, b"/bin/sh");
         assert_eq!(s.argv, vec![b"sh".to_vec()]);
     }
@@ -971,17 +1021,45 @@ mod tests {
             want.exe_guest.as_slice()
         );
         assert_eq!(st.argv, want.argv);
-        assert_eq!(st.fds.len(), 3);
+        let t = st.fdt(MAIN_FILES);
+        assert_eq!(t.fds.len(), 3);
         assert_eq!(
-            st.fds.get(&7).map(|p| p.as_os_str().as_bytes()),
+            t.fds.get(&7).map(|p| p.as_os_str().as_bytes()),
             Some(b"/tmp/nonutf8-\xff".as_slice())
         );
-        assert_eq!(st.virtual_fds.len(), 2);
-        assert_eq!(st.dirent_pending.get(&4), Some(&vec![1, 2, 3, 0, 255]));
+        assert_eq!(t.virtual_fds.len(), 2);
+        assert_eq!(t.dirent_pending.get(&4), Some(&vec![1, 2, 3, 0, 255]));
         assert_eq!(
-            st.dirent_seen.get(&4).map(|s| s.len()),
+            t.dirent_seen.get(&4).map(|s| s.len()),
             Some(2),
             "dirent names restore as a set"
+        );
+    }
+
+    /// capture reads the named fd table only; apply_to leaves exactly one
+    /// table, MAIN_FILES, holding it.
+    #[test]
+    fn capture_takes_one_table_and_apply_leaves_only_main() {
+        let mut st = proc_state();
+        st.fdt_mut(MAIN_FILES).fds.insert(3, PathBuf::from("/main"));
+        let other = st.split_files(MAIN_FILES);
+        st.fdt_mut(other).fds.insert(3, PathBuf::from("/other"));
+        st.fdt_mut(other).fds.insert(5, PathBuf::from("/five"));
+        let c = cfg("/");
+        let snap = ExecState::capture(&st, other, &c);
+        assert_eq!(
+            snap.fds,
+            vec![(3, b"/other".to_vec()), (5, b"/five".to_vec())]
+        );
+        let mut restored = proc_state();
+        restored.split_files(MAIN_FILES);
+        snap.apply_to(&mut restored, &RootConfig::new("/".into(), Vec::new()))
+            .expect("apply");
+        assert_eq!(restored.tables.len(), 1);
+        assert_eq!(restored.next_files, MAIN_FILES);
+        assert_eq!(
+            restored.fdt(MAIN_FILES).fds.get(&5),
+            Some(&PathBuf::from("/five"))
         );
     }
 

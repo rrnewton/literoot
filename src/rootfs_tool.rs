@@ -291,8 +291,11 @@ impl GlobalTool for LiterootGlobal {
 #[derive(Debug)]
 pub(crate) struct ProcState {
     pub(crate) cwd: PathBuf,
-    /// fd → guest path it denotes (for *at resolution, §4.3).
-    pub(crate) fds: HashMap<i32, PathBuf>,
+    /// Fd-number state per kernel fd table (see `FdTable`). Threads
+    /// share MAIN_FILES until one of them gets its own table.
+    pub(crate) tables: HashMap<FilesId, FdTable>,
+    /// Last id handed out by `split_files`.
+    pub(crate) next_files: FilesId,
     /// False until the initial (launcher-issued) execve has passed:
     /// its path is already a host path and must not be translated.
     pub(crate) bootstrapped: bool,
@@ -306,14 +309,6 @@ pub(crate) struct ProcState {
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
     pub(crate) exe_guest: PathBuf,
-    /// Fds opened on virtual bind-prefix dirs:
-    /// guest dir -> entries already emitted.
-    pub(crate) virtual_fds: std::collections::HashMap<i32, (PathBuf, bool)>,
-    /// Synthetic dirents pending for real dir fds with bind
-    /// children (merged listings).
-    pub(crate) dirent_pending: std::collections::HashMap<i32, Vec<u8>>,
-    /// Names the kernel already returned per dir fd (dedupe).
-    pub(crate) dirent_seen: std::collections::HashMap<i32, std::collections::HashSet<String>>,
     /// As-exec'd argv of the current image (cmdline synthesis).
     pub(crate) argv: Vec<Vec<u8>>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
@@ -362,6 +357,73 @@ pub(crate) struct ProcState {
     pub(crate) swallow_next_self_stop: bool,
 }
 
+/// Which kernel fd table a task of this process uses. Every thread starts
+/// on MAIN_FILES (a fork child's tables start from its parent's); a thread
+/// leaves it for a copy on unshare(CLONE_FILES),
+/// close_range(CLOSE_RANGE_UNSHARE), or a thread clone without CLONE_FILES,
+/// as the kernel copies the table then.
+pub(crate) type FilesId = u32;
+pub(crate) const MAIN_FILES: FilesId = 0;
+
+/// The fd-number state of one kernel fd table. A number means something
+/// only in its own table: a record another table invalidates stays valid
+/// here.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FdTable {
+    /// fd → guest path it denotes (for *at resolution, §4.3).
+    pub(crate) fds: HashMap<i32, PathBuf>,
+    /// Fds opened on virtual bind-prefix dirs:
+    /// guest dir -> entries already emitted.
+    pub(crate) virtual_fds: HashMap<i32, (PathBuf, bool)>,
+    /// Synthetic dirents pending for real dir fds with bind
+    /// children (merged listings).
+    pub(crate) dirent_pending: HashMap<i32, Vec<u8>>,
+    /// Names the kernel already returned per dir fd (dedupe).
+    pub(crate) dirent_seen: HashMap<i32, std::collections::HashSet<String>>,
+    /// (dev, ino) of the directory the getdents state above was built
+    /// for: a dup onto the number of another directory makes it stale.
+    pub(crate) dirent_obj: HashMap<i32, (u64, u64)>,
+}
+
+impl FdTable {
+    /// Forget per-fd state for a number that now holds another file (or
+    /// none): its virtual-directory record and getdents bookkeeping belong
+    /// to the file the number held before.
+    pub(crate) fn forget(&mut self, fd: i32) {
+        self.virtual_fds.remove(&fd);
+        self.dirent_pending.remove(&fd);
+        self.dirent_seen.remove(&fd);
+        self.dirent_obj.remove(&fd);
+    }
+}
+
+impl ProcState {
+    /// The fd-number state of table `files` (empty if it has none yet).
+    pub(crate) fn fdt(&self, files: FilesId) -> &FdTable {
+        static EMPTY: std::sync::LazyLock<FdTable> = std::sync::LazyLock::new(FdTable::default);
+        self.tables.get(&files).unwrap_or(&EMPTY)
+    }
+
+    pub(crate) fn fdt_mut(&mut self, files: FilesId) -> &mut FdTable {
+        self.tables.entry(files).or_default()
+    }
+
+    /// A task left table `from` for a private copy of it: the copy starts
+    /// with the same records, as the kernel's copy starts with the same
+    /// open files.
+    pub(crate) fn split_files(&mut self, from: FilesId) -> FilesId {
+        self.next_files += 1;
+        let copy = self.fdt(from).clone();
+        self.tables.insert(self.next_files, copy);
+        self.next_files
+    }
+}
+
+/// The calling task's fd table.
+fn files_of<T: Guest<RootfsTool>>(guest: &T) -> FilesId {
+    guest.thread_state().files
+}
+
 /// The literoot Tool: one instance per guest process.
 #[derive(Debug)]
 pub struct RootfsTool {
@@ -377,7 +439,8 @@ impl Default for RootfsTool {
         Self {
             state: Mutex::new(ProcState {
                 cwd: PathBuf::from("/__literoot_unset__"),
-                fds: HashMap::new(),
+                tables: HashMap::new(),
+                next_files: MAIN_FILES,
                 bootstrapped: false,
                 root_override: None,
                 scratch: None,
@@ -390,9 +453,6 @@ impl Default for RootfsTool {
                 kill_registered: false,
                 swallow_next_self_stop: false,
                 argv: Vec::new(),
-                virtual_fds: std::collections::HashMap::new(),
-                dirent_pending: std::collections::HashMap::new(),
-                dirent_seen: std::collections::HashMap::new(),
                 pending_stack_limit: None,
                 initial_stack_limit_consumed: false,
             }),
@@ -408,6 +468,14 @@ impl Default for RootfsTool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootfsThreadState {
     pub pending: Option<ExecState>,
+    /// The fd table this thread uses (`FilesId`).
+    #[serde(default)]
+    pub files: FilesId,
+    /// Staged by a clone handler for the task it creates: the parent's
+    /// table (CLONE_FILES), a fresh copy (a thread without CLONE_FILES),
+    /// or MAIN_FILES of a new process. Cleared after the inject.
+    #[serde(default)]
+    pub child_files: Option<FilesId>,
 }
 
 // A wrapping Tool with the same thread state forwards its guest to
@@ -541,7 +609,7 @@ impl RootfsTool {
     ) -> Result<(), reverie::syscalls::Errno> {
         let snapshot = {
             let st = self.state.lock().unwrap();
-            ExecState::capture(&st, guest.config())
+            ExecState::capture(&st, files_of(guest), guest.config())
         };
         // Prove the canonical bytes fit the cap now, while refusal
         // is still possible, then stage them into the host birth
@@ -653,7 +721,13 @@ impl RootfsTool {
         let current_argv = self.current_argv(guest.config());
         let snapshot = {
             let st = self.state.lock().unwrap();
-            match fork_seed_if_bootstrapped(&st, guest.config(), &current_exe, &current_argv) {
+            match fork_seed_if_bootstrapped(
+                &st,
+                files_of(guest),
+                guest.config(),
+                &current_exe,
+                &current_argv,
+            ) {
                 Some(seed) => seed?,
                 None => {
                     // Named seed refusal, not a guest clone
@@ -681,6 +755,70 @@ impl RootfsTool {
     /// state, so clearing here is belt-and-braces made explicit.
     fn clear_exec_snapshot<T: Guest<Self>>(&self, guest: &mut T) {
         guest.thread_state_mut().pending = None;
+    }
+
+    /// Serve the whole pending synthetic records of `fd` (table `files`)
+    /// that fit the guest's getdents64 buffer. None when nothing is pending,
+    /// or when the next record does not fit the buffer at all (it is
+    /// dropped): the kernel answers then.
+    fn serve_pending<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        files: FilesId,
+        fd: i32,
+        gd: &reverie::syscalls::Getdents64,
+    ) -> Option<i64> {
+        use reverie::syscalls::MemoryAccess as _;
+        let mut st = self.state.lock().unwrap();
+        let pend = st.fdt_mut(files).dirent_pending.get_mut(&fd)?;
+        if pend.is_empty() {
+            return None;
+        }
+        let mut take = 0usize;
+        while take + 19 <= pend.len() {
+            let reclen = u16::from_ne_bytes([pend[take + 16], pend[take + 17]]) as usize;
+            if reclen < 19 || take + reclen > gd.count() as usize {
+                break;
+            }
+            take += reclen;
+        }
+        if take == 0 {
+            pend.clear();
+            return None;
+        }
+        let chunk: Vec<u8> = pend.drain(..take).collect();
+        drop(st);
+        let dirent = gd.dirent()?;
+        let addr: reverie::syscalls::AddrMut<u8> = unsafe { std::mem::transmute_copy(&dirent) };
+        let _ = guest.memory().write(addr, &chunk);
+        Some(chunk.len() as i64)
+    }
+
+    /// Stage the fd table of the task a clone with `flags` creates: a new
+    /// process starts on MAIN_FILES (its tables come from the fork seed), a
+    /// thread with CLONE_FILES shares the caller's table, and a thread
+    /// without it gets a copy, as the kernel copies the table.
+    fn stage_child_files<T: Guest<Self>>(&self, guest: &mut T, flags: u64) {
+        let own = files_of(guest);
+        let child = if clone_is_process(flags) {
+            MAIN_FILES
+        } else if flags & libc::CLONE_FILES as u64 != 0 {
+            own
+        } else {
+            self.state.lock().unwrap().split_files(own)
+        };
+        guest.thread_state_mut().child_files = Some(child);
+    }
+
+    /// After a clone inject: drop the staged id, and the copy made for a
+    /// thread that was never created.
+    fn end_child_files<T: Guest<Self>>(&self, guest: &mut T, created: bool) {
+        let Some(child) = guest.thread_state_mut().child_files.take() else {
+            return;
+        };
+        if !created && child != MAIN_FILES && child != files_of(guest) {
+            self.state.lock().unwrap().tables.remove(&child);
+        }
     }
 
     /// Read the guest's stack resource limit.
@@ -839,6 +977,8 @@ impl RootfsTool {
                 .apply_to(&mut st, &cfg)
                 .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
         }
+        // apply_to leaves one table, MAIN_FILES, holding the snapshot's.
+        guest.thread_state_mut().files = MAIN_FILES;
         // Backward compatibility for the ptrace-era guard: a
         // restored process is never the initial image.
         LAUNCHER_EXEC_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -900,6 +1040,7 @@ fn initial_exe_guest(initial_exe: &str, launch_cwd: &str, cfg: &RootConfig) -> P
 /// because `ExecState` does not carry that bit.
 fn fork_seed(
     st: &ProcState,
+    files: FilesId,
     cfg: &LiterootConfig,
     current_exe: &Path,
     current_argv: &[Vec<u8>],
@@ -909,6 +1050,7 @@ fn fork_seed(
     }
     Ok(ExecState::capture_fork_seed(
         st,
+        files,
         cfg,
         current_exe,
         current_argv,
@@ -921,6 +1063,7 @@ fn fork_seed(
 /// decision production uses is unit-testable.
 fn fork_seed_if_bootstrapped(
     st: &ProcState,
+    files: FilesId,
     cfg: &LiterootConfig,
     current_exe: &Path,
     current_argv: &[Vec<u8>],
@@ -928,7 +1071,7 @@ fn fork_seed_if_bootstrapped(
     if !st.bootstrapped {
         return None;
     }
-    Some(fork_seed(st, cfg, current_exe, current_argv))
+    Some(fork_seed(st, files, cfg, current_exe, current_argv))
 }
 
 /// B4 step 4 staging decision: snapshot for a new *process*, never
@@ -944,6 +1087,11 @@ fn clone_is_process(flags: u64) -> bool {
 // most 768 bytes of translated path (POC limit — the in-guest
 // backend uses Tool-region scratch instead, design §6).
 const PATH_BUF: usize = 768;
+
+/// close_range(2) flags (include/uapi/linux/close_range.h), defined here
+/// because not every libc target carries them.
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 
 /// `prlimit64`'s resource number for the stack limit, as the syscall
 /// builder's `u32`: glibc's libc defines it as `u32`, musl's as `i32`.
@@ -1069,6 +1217,10 @@ impl Tool for RootfsTool {
             // semantic change to the syscall itself).
             Sysno::clone,
             Sysno::clone3,
+            // Fd-table ownership (FilesId): both can give the caller its
+            // own copy of the table.
+            Sysno::unshare,
+            Sysno::close_range,
         ]);
         // Legacy non-*at syscalls exist only in the x86-64 table; the
         // aarch64 generic table carries the *at forms subscribed above
@@ -1112,6 +1264,8 @@ impl Tool for RootfsTool {
         match parent {
             Some((_, parent)) => RootfsThreadState {
                 pending: parent.pending.clone(),
+                files: parent.child_files.unwrap_or(parent.files),
+                child_files: None,
             },
             None => RootfsThreadState::default(),
         }
@@ -1579,10 +1733,11 @@ impl Tool for RootfsTool {
                     // Record fd → guest path for future *at calls.
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, openat.dirfd(), &guest_path);
+                    let t = st.fdt_mut(files_of(guest));
                     if !opened_virtual {
-                        forget_fd_state(&mut st, ret as i32);
+                        t.forget(ret as i32);
                     }
-                    st.fds.insert(ret as i32, abs);
+                    t.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -1615,8 +1770,9 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
-                    forget_fd_state(&mut st, ret as i32);
-                    st.fds.insert(ret as i32, abs);
+                    let t = st.fdt_mut(files_of(guest));
+                    t.forget(ret as i32);
+                    t.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -2409,8 +2565,9 @@ impl Tool for RootfsTool {
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
                     let abs = self.guest_abs(guest, &st, oa.dirfd(), &guest_path);
-                    forget_fd_state(&mut st, ret as i32);
-                    st.fds.insert(ret as i32, abs);
+                    let t = st.fdt_mut(files_of(guest));
+                    t.forget(ret as i32);
+                    t.fds.insert(ret as i32, abs);
                 }
                 Ok(ret)
             }
@@ -2498,25 +2655,47 @@ impl Tool for RootfsTool {
                 }
             }
             Syscall::Getdents64(gd) => {
+                use std::os::unix::fs::MetadataExt as _;
                 let cfg = self.config(guest);
+                let files = files_of(guest);
+                let status = fd_status(guest, gd.fd() as i32);
                 let virt = {
                     let fd = gd.fd() as i32;
                     let mut st = self.state.lock().unwrap();
-                    let live = std::fs::metadata(format!("{}/fd/{}", task_dir(guest), fd));
-                    match live {
-                        Ok(md) if st.virtual_fds.contains_key(&fd) => {
-                            match virtual_fd_path(&cfg, &st, fd, &md) {
-                                Some(_) => st.virtual_fds.get(&fd).cloned(),
-                                None => {
-                                    // A stale virtual record: the number now
-                                    // holds another directory.
-                                    forget_fd_state(&mut st, fd);
-                                    None
-                                }
+                    match &status {
+                        // Closed, or not a directory: no record of this table
+                        // answers for it; the kernel does (EBADF, ENOTDIR).
+                        FdStatus::NoDir => {
+                            st.fdt_mut(files).forget(fd);
+                            None
+                        }
+                        FdStatus::Open(md) => {
+                            let t = st.fdt(files);
+                            let (keep_virtual, stale) = if t.virtual_fds.contains_key(&fd) {
+                                let keep = virtual_fd_path(&cfg, t, fd, md).is_some();
+                                (keep, !keep)
+                            } else {
+                                // Getdents state built for another directory on
+                                // this number (a dup onto it) is stale.
+                                let other = t
+                                    .dirent_obj
+                                    .get(&fd)
+                                    .is_some_and(|o| *o != (md.dev(), md.ino()));
+                                (false, other)
+                            };
+                            let t = st.fdt_mut(files);
+                            if stale {
+                                t.forget(fd);
+                            }
+                            if keep_virtual {
+                                t.virtual_fds.get(&fd).cloned()
+                            } else {
+                                t.dirent_obj.insert(fd, (md.dev(), md.ino()));
+                                None
                             }
                         }
                         // /proc unreadable: the record stands, as before.
-                        _ => st.virtual_fds.get(&fd).cloned(),
+                        FdStatus::Unknown => st.fdt(files).virtual_fds.get(&fd).cloned(),
                     }
                 };
                 match virt {
@@ -2524,51 +2703,8 @@ impl Tool for RootfsTool {
                         // Real dir: merge bind-child entries
                         // after kernel EOF.
                         let fd = gd.fd() as i32;
-                        let pending = {
-                            let st = self.state.lock().unwrap();
-                            st.dirent_pending.get(&fd).cloned()
-                        };
-                        if let Some(mut pend) = pending {
-                            if pend.is_empty() {
-                                return Ok(guest.inject(gd).await?);
-                            }
-                            use reverie::syscalls::MemoryAccess as _;
-                            // Serve whole records that fit.
-                            let mut take = 0usize;
-                            while take + 19 <= pend.len() {
-                                let reclen = u16::from_ne_bytes([
-                                    pend[take + 16],
-                                    pend[take + 17],
-                                ]) as usize;
-                                if reclen < 19 || take + reclen > gd.count() as usize {
-                                    break;
-                                }
-                                take += reclen;
-                            }
-                            if take == 0 {
-                                // Single record larger than the
-                                // guest buffer: kernel would EINVAL;
-                                // drop pending and defer to kernel.
-                                self.state
-                                    .lock()
-                                    .unwrap()
-                                    .dirent_pending
-                                    .insert(fd, Vec::new());
-                                return Ok(guest.inject(gd).await?);
-                            }
-                            let chunk: Vec<u8> = pend.drain(..take).collect();
-                            {
-                                let mut st = self.state.lock().unwrap();
-                                st.dirent_pending.insert(fd, pend);
-                            }
-                            if let Some(dirent) = gd.dirent() {
-                                let mut mem = guest.memory();
-                                let addr: reverie::syscalls::AddrMut<u8> =
-                                    unsafe { std::mem::transmute_copy(&dirent) };
-                                let _ = mem.write(addr, &chunk);
-                                return Ok(chunk.len() as i64);
-                            }
-                            return Ok(0);
+                        if let Some(served) = self.serve_pending(guest, files, fd, &gd) {
+                            return Ok(served);
                         }
                         let buf = gd.dirent();
                         let ret = guest.inject(gd).await?;
@@ -2579,6 +2715,7 @@ impl Tool for RootfsTool {
                                 .state
                                 .lock()
                                 .unwrap()
+                                .fdt(files)
                                 .dirent_pending
                                 .contains_key(&fd)
                         {
@@ -2589,6 +2726,7 @@ impl Tool for RootfsTool {
                             self.state
                                 .lock()
                                 .unwrap()
+                                .fdt_mut(files)
                                 .dirent_pending
                                 .insert(fd, Vec::new());
                             let cfg = self.config(guest);
@@ -2600,50 +2738,18 @@ impl Tool for RootfsTool {
                                 let synth =
                                     self.build_synth_dirents(guest, &gd_path, true);
                                 if !synth.is_empty() {
-                                    // Serve synthetic entries now
-                                    // (same shape as the pending
-                                    // path above, without recursion).
-                                    use reverie::syscalls::MemoryAccess as _;
-                                    if synth.len() <= gd.count() as usize {
-                                        if let Some(dirent) = gd.dirent() {
-                                            let mut mem = guest.memory();
-                                            let addr: reverie::syscalls::AddrMut<u8> =
-                                                unsafe {
-                                                    std::mem::transmute_copy(&dirent)
-                                                };
-                                            let _ = mem.write(addr, &synth);
-                                            return Ok(synth.len() as i64);
-                                        }
-                                    } else {
-                                        let mut st = self.state.lock().unwrap();
-                                        st.dirent_pending.insert(fd, synth);
-                                        drop(st);
-                                        let pend = {
-                                            let st = self.state.lock().unwrap();
-                                            st.dirent_pending
-                                                .get(&fd)
-                                                .cloned()
-                                                .unwrap_or_default()
-                                        };
-                                        let take =
-                                            pend.len().min(gd.count() as usize);
-                                        if let Some(dirent) = gd.dirent() {
-                                            let mut mem = guest.memory();
-                                            let addr: reverie::syscalls::AddrMut<u8> =
-                                                unsafe {
-                                                    std::mem::transmute_copy(&dirent)
-                                                };
-                                            let _ = mem.write(addr, &pend[..take]);
-                                            let rest = pend[take..].to_vec();
-                                            self.state
-                                                .lock()
-                                                .unwrap()
-                                                .dirent_pending
-                                                .insert(fd, rest);
-                                            return Ok(take as i64);
-                                        }
+                                    // Serve them now, whole records only;
+                                    // the rest waits in dirent_pending.
+                                    self.state
+                                        .lock()
+                                        .unwrap()
+                                        .fdt_mut(files)
+                                        .dirent_pending
+                                        .insert(fd, synth);
+                                    if let Some(served) = self.serve_pending(guest, files, fd, &gd)
+                                    {
+                                        return Ok(served);
                                     }
-                                    return Ok(0);
                                 }
                             }
                         }
@@ -2653,7 +2759,9 @@ impl Tool for RootfsTool {
                     Some((guest_dir, false)) => {
                         {
                             let mut st = self.state.lock().unwrap();
-                            if let Some(v) = st.virtual_fds.get_mut(&(gd.fd() as i32)) {
+                            if let Some(v) =
+                                st.fdt_mut(files).virtual_fds.get_mut(&(gd.fd() as i32))
+                            {
                                 v.1 = true;
                             }
                         }
@@ -2748,28 +2856,40 @@ impl Tool for RootfsTool {
             // to the child inside that inject.
             Syscall::Clone(clone) => {
                 let fam = reverie::syscalls::family::CloneFamily::Clone(clone);
-                if clone_is_process(fam.flags(&guest.memory()).bits()) {
+                let flags = fam.flags(&guest.memory()).bits();
+                if clone_is_process(flags) {
                     if let Err(e) = self.stage_fork_snapshot(guest) {
                         return Err(e.into());
                     }
+                    self.stage_child_files(guest, flags);
                     let ret = guest.inject(clone).await;
                     self.clear_exec_snapshot(guest);
+                    self.end_child_files(guest, ret.is_ok());
                     Ok(ret?)
                 } else {
-                    Ok(guest.inject(clone).await?)
+                    self.stage_child_files(guest, flags);
+                    let ret = guest.inject(clone).await;
+                    self.end_child_files(guest, ret.is_ok());
+                    Ok(ret?)
                 }
             }
             Syscall::Clone3(clone3) => {
                 let fam = reverie::syscalls::family::CloneFamily::Clone3(clone3);
-                if clone_is_process(fam.flags(&guest.memory()).bits()) {
+                let flags = fam.flags(&guest.memory()).bits();
+                if clone_is_process(flags) {
                     if let Err(e) = self.stage_fork_snapshot(guest) {
                         return Err(e.into());
                     }
+                    self.stage_child_files(guest, flags);
                     let ret = guest.inject(clone3).await;
                     self.clear_exec_snapshot(guest);
+                    self.end_child_files(guest, ret.is_ok());
                     Ok(ret?)
                 } else {
-                    Ok(guest.inject(clone3).await?)
+                    self.stage_child_files(guest, flags);
+                    let ret = guest.inject(clone3).await;
+                    self.end_child_files(guest, ret.is_ok());
+                    Ok(ret?)
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
@@ -2777,8 +2897,10 @@ impl Tool for RootfsTool {
                 if let Err(e) = self.stage_fork_snapshot(guest) {
                     return Err(e.into());
                 }
+                self.stage_child_files(guest, libc::SIGCHLD as u64);
                 let ret = guest.inject(fork).await;
                 self.clear_exec_snapshot(guest);
+                self.end_child_files(guest, ret.is_ok());
                 Ok(ret?)
             }
             #[cfg(not(target_arch = "aarch64"))]
@@ -2786,9 +2908,55 @@ impl Tool for RootfsTool {
                 if let Err(e) = self.stage_fork_snapshot(guest) {
                     return Err(e.into());
                 }
+                self.stage_child_files(guest, libc::SIGCHLD as u64);
                 let ret = guest.inject(vfork).await;
                 self.clear_exec_snapshot(guest);
+                self.end_child_files(guest, ret.is_ok());
                 Ok(ret?)
+            }
+            Syscall::Unshare(unshare) => {
+                let files_flag = unshare.flags().bits() & libc::CLONE_FILES != 0;
+                let ret = guest.inject(unshare).await?;
+                if ret == 0 && files_flag {
+                    // The kernel gave the caller a copy of its table.
+                    let own = files_of(guest);
+                    let id = self.state.lock().unwrap().split_files(own);
+                    guest.thread_state_mut().files = id;
+                }
+                Ok(ret)
+            }
+            Syscall::Other(Sysno::close_range, args) => {
+                let (first, last, flags) = (args.arg0 as u32, args.arg1 as u32, args.arg2 as u32);
+                let ret = guest
+                    .inject(Syscall::Other(Sysno::close_range, args))
+                    .await?;
+                if ret == 0 {
+                    let mut files = files_of(guest);
+                    if flags & CLOSE_RANGE_UNSHARE != 0 {
+                        // A copy of the table first, then the range closes
+                        // in the copy only.
+                        files = self.state.lock().unwrap().split_files(files);
+                        guest.thread_state_mut().files = files;
+                    }
+                    if flags & CLOSE_RANGE_CLOEXEC == 0 {
+                        let mut st = self.state.lock().unwrap();
+                        let t = st.fdt_mut(files);
+                        let closed: Vec<i32> = t
+                            .fds
+                            .keys()
+                            .chain(t.virtual_fds.keys())
+                            .chain(t.dirent_pending.keys())
+                            .chain(t.dirent_obj.keys())
+                            .copied()
+                            .filter(|fd| *fd >= 0 && (first..=last).contains(&(*fd as u32)))
+                            .collect();
+                        for fd in closed {
+                            t.forget(fd);
+                            t.fds.remove(&fd);
+                        }
+                    }
+                }
+                Ok(ret)
             }
             Syscall::Execve(execve) => {
                 // Initial launcher execve: its path is already a
@@ -3740,8 +3908,12 @@ impl RootfsTool {
             return PathBuf::from(UNNAMED_CWD);
         }
         if let Some(p) = candidate {
-            let virt =
-                st.virtual_fds.values().any(|(v, _)| *v == p) && same_file(&cfg.rootfs, &live);
+            let virt = st
+                .fdt(files_of(guest))
+                .virtual_fds
+                .values()
+                .any(|(v, _)| *v == p)
+                && same_file(&cfg.rootfs, &live);
             if virt || same_file(&cfg.translate(&p, Path::new("/"), None), &live) {
                 return p;
             }
@@ -3781,7 +3953,8 @@ impl RootfsTool {
         use std::os::unix::fs::MetadataExt as _;
         let dir = format!("{}/fd", task_dir(guest));
         let link = format!("{dir}/{fd}");
-        let recorded = st.fds.get(&fd);
+        let table = st.fdt(files_of(guest));
+        let recorded = table.fds.get(&fd);
         // lstat of the fd link says whether the fd is open; stat follows it
         // to the object, which fails for an O_PATH fd on a dangling symlink.
         if std::fs::symlink_metadata(&link).is_err() {
@@ -3794,7 +3967,7 @@ impl RootfsTool {
         let Ok(live) = std::fs::metadata(&link) else {
             return std::fs::read_link(&link).ok().and_then(|t| cfg.reverse(&t));
         };
-        if let Some(v) = virtual_fd_path(cfg, st, fd, &live) {
+        if let Some(v) = virtual_fd_path(cfg, table, fd, &live) {
             return Some(v);
         }
         if live.nlink() == 0 {
@@ -4172,10 +4345,11 @@ impl RootfsTool {
                 let fd = guest.inject(rewritten).await?;
                 if fd >= 0 {
                     let mut st = self.state.lock().unwrap();
-                    forget_fd_state(&mut st, fd as i32);
-                    st.virtual_fds
+                    let t = st.fdt_mut(files_of(guest));
+                    t.forget(fd as i32);
+                    t.virtual_fds
                         .insert(fd as i32, (guest_abs.to_path_buf(), false));
-                    st.fds.insert(fd as i32, guest_abs.to_path_buf());
+                    t.fds.insert(fd as i32, guest_abs.to_path_buf());
                 }
                 return Ok(Some(fd));
             }
@@ -4292,6 +4466,7 @@ impl RootfsTool {
         self.state
             .lock()
             .unwrap()
+            .fdt_mut(files_of(guest))
             .dirent_seen
             .insert(fd, names);
     }
@@ -4465,7 +4640,7 @@ impl RootfsTool {
         // stale entry never stops a passthrough.
         match (self.fd_guest_path(guest, &cfg, &st, dirfd), live) {
             (Some(g), Ok(md)) if md.is_dir() => {
-                st.fds.insert(dirfd, g);
+                st.fdt_mut(files_of(guest)).fds.insert(dirfd, g);
                 false
             }
             // /proc unreadable: the table entry stands, as before.
@@ -4926,21 +5101,35 @@ fn same_file(path: &Path, live: &std::fs::Metadata) -> bool {
 /// record is stale.
 fn virtual_fd_path(
     cfg: &RootConfig,
-    st: &ProcState,
+    table: &FdTable,
     fd: i32,
     live: &std::fs::Metadata,
 ) -> Option<PathBuf> {
-    let (v, _) = st.virtual_fds.get(&fd)?;
+    let (v, _) = table.virtual_fds.get(&fd)?;
     (live.is_dir() && same_file(&cfg.rootfs, live)).then(|| v.clone())
 }
 
-/// Forget per-fd state for a number a new open just returned: its old
-/// virtual-directory record and getdents bookkeeping belong to the file the
-/// number held before.
-fn forget_fd_state(st: &mut ProcState, fd: i32) {
-    st.virtual_fds.remove(&fd);
-    st.dirent_pending.remove(&fd);
-    st.dirent_seen.remove(&fd);
+/// What a task's fd number holds now, from /proc/<pid>/task/<tid>/fd.
+enum FdStatus {
+    /// An open file, as stat sees it through the link.
+    Open(std::fs::Metadata),
+    /// Closed (the link is gone while the fd directory is readable), or
+    /// open on an object stat cannot reach (an O_PATH fd on a dangling
+    /// symlink): no directory record applies to it.
+    NoDir,
+    /// /proc cannot be read: nothing is known, records stand as before.
+    Unknown,
+}
+
+fn fd_status<T: Guest<RootfsTool>>(guest: &T, fd: i32) -> FdStatus {
+    let dir = format!("{}/fd", task_dir(guest));
+    let link = format!("{dir}/{fd}");
+    match std::fs::metadata(&link) {
+        Ok(md) => FdStatus::Open(md),
+        Err(_) if std::fs::symlink_metadata(&link).is_ok() => FdStatus::NoDir,
+        Err(_) if std::fs::metadata(&dir).is_ok() => FdStatus::NoDir,
+        Err(_) => FdStatus::Unknown,
+    }
 }
 
 /// Bumps the shared probe-cache generation on drop — placed at
@@ -5319,7 +5508,10 @@ mod tests {
         let tool = RootfsTool::from_exec_state(state, &cfg).expect("restore");
         let st = tool.state.lock().unwrap();
         assert_eq!(st.cwd, PathBuf::from("/work"));
-        assert_eq!(st.fds.get(&5), Some(&PathBuf::from("/work")));
+        assert_eq!(
+            st.fdt(MAIN_FILES).fds.get(&5),
+            Some(&PathBuf::from("/work"))
+        );
         assert_eq!(st.fake, Some([1000, 0, 0, 100, 0, 100]));
         assert_eq!(st.exe_guest, PathBuf::from("/bin/sh"));
         assert!(st.bootstrapped);
@@ -5345,6 +5537,7 @@ mod tests {
         };
         let staged = RootfsThreadState {
             pending: Some(snap.clone()),
+            ..Default::default()
         };
         let child = tool.init_thread_state(
             reverie::Tid::from_raw(4243),
@@ -5359,6 +5552,61 @@ mod tests {
         assert_eq!(child.pending, None);
         let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
         assert_eq!(root.pending, None);
+    }
+
+    /// A new task takes the fd table its parent's clone handler staged, and
+    /// the parent's own table when nothing was staged.
+    #[test]
+    fn init_thread_state_takes_the_staged_fd_table() {
+        let tool = RootfsTool::default();
+        let parent = RootfsThreadState {
+            files: 2,
+            child_files: Some(5),
+            ..Default::default()
+        };
+        let child = tool.init_thread_state(
+            reverie::Tid::from_raw(4243),
+            Some((reverie::Tid::from_raw(4242), &parent)),
+        );
+        assert_eq!((child.files, child.child_files), (5, None));
+        let parent = RootfsThreadState {
+            files: 2,
+            ..Default::default()
+        };
+        let child = tool.init_thread_state(
+            reverie::Tid::from_raw(4243),
+            Some((reverie::Tid::from_raw(4242), &parent)),
+        );
+        assert_eq!(child.files, 2);
+        let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
+        assert_eq!(root.files, MAIN_FILES);
+    }
+
+    /// A split table starts as a copy; forgetting a number in it leaves the
+    /// table it came from alone.
+    #[test]
+    fn a_split_fd_table_is_a_copy_and_forgets_on_its_own() {
+        let tool = RootfsTool::default();
+        let mut st = tool.state.lock().unwrap();
+        let main = st.fdt_mut(MAIN_FILES);
+        main.fds.insert(4, PathBuf::from("/v"));
+        main.virtual_fds.insert(4, (PathBuf::from("/v"), false));
+        main.dirent_obj.insert(4, (1, 2));
+        let id = st.split_files(MAIN_FILES);
+        assert_ne!(id, MAIN_FILES);
+        assert_eq!(
+            st.fdt(id).virtual_fds.get(&4),
+            Some(&(PathBuf::from("/v"), false))
+        );
+        st.fdt_mut(id).forget(4);
+        assert!(st.fdt(id).virtual_fds.is_empty() && st.fdt(id).dirent_obj.is_empty());
+        assert_eq!(st.fdt(id).fds.get(&4), Some(&PathBuf::from("/v")));
+        assert_eq!(
+            st.fdt(MAIN_FILES).virtual_fds.get(&4),
+            Some(&(PathBuf::from("/v"), false))
+        );
+        assert_eq!(st.fdt(MAIN_FILES).dirent_obj.get(&4), Some(&(1, 2)));
+        assert_ne!(st.split_files(MAIN_FILES), id, "ids are never reused");
     }
 
     #[test]
@@ -5471,12 +5719,18 @@ mod tests {
             // The exact decision production staging uses:
             // nothing is staged for this clone.
             assert_eq!(
-                fork_seed_if_bootstrapped(&st, &cfg, Path::new("/bin/sh"), &current_argv),
+                fork_seed_if_bootstrapped(
+                    &st,
+                    MAIN_FILES,
+                    &cfg,
+                    Path::new("/bin/sh"),
+                    &current_argv
+                ),
                 None
             );
             // The checked constructor still refuses by name if
             // a future caller bypasses the production gate.
-            let result = fork_seed(&st, &cfg, Path::new("/bin/sh"), &current_argv);
+            let result = fork_seed(&st, MAIN_FILES, &cfg, Path::new("/bin/sh"), &current_argv);
             assert_eq!(result, Err(reverie::syscalls::Errno::EINVAL));
             assert_eq!(st.fake, fake_before);
         }
@@ -5484,9 +5738,15 @@ mod tests {
             let mut st = tool.state.lock().unwrap();
             st.bootstrapped = true;
             st.fake = Some([9, 8, 7, 6, 5, 4]);
-            let seed = fork_seed_if_bootstrapped(&st, &cfg, Path::new("/bin/sh"), &current_argv)
-                .expect("bootstrapped gate stages")
-                .expect("bootstrapped fork seed");
+            let seed = fork_seed_if_bootstrapped(
+                &st,
+                MAIN_FILES,
+                &cfg,
+                Path::new("/bin/sh"),
+                &current_argv,
+            )
+            .expect("bootstrapped gate stages")
+            .expect("bootstrapped fork seed");
             assert_eq!(seed.exe_guest, b"/bin/sh");
             assert_eq!(seed.argv, current_argv);
             assert_eq!(seed.fake, Some([9, 8, 7, 6, 5, 4]));
