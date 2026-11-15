@@ -66,6 +66,8 @@ mod refusal_log;
 mod reporting;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
+mod runtime_memfds;
 #[path = "../../src/shared_record.rs"]
 #[allow(dead_code)] // Future shared-record transports are the first production callers.
 mod shared_record;
@@ -185,6 +187,8 @@ unsafe extern "C" fn initialize(
             Ok(None) => return,
             Err(error) => fail(&format!("invalid preload bootstrap: {error}")),
         };
+        // Before installation: hide the shared memfds' numbers.
+        runtime_memfds::adopt_at_image_start();
         let selected = match String::from_utf8(bootstrap.tool_data) {
             Ok(selected) => selected,
             Err(_) => fail("tool selector is not valid UTF-8"),
@@ -225,6 +229,8 @@ unsafe extern "C" fn initialize(
             Ok(None) => return,
             Err(error) => fail(&format!("invalid preload bootstrap: {error}")),
         };
+        // Before installation: hide the shared memfds' numbers.
+        runtime_memfds::adopt_at_image_start();
         let selected = match String::from_utf8(bootstrap.tool_data) {
             Ok(selected) => selected,
             Err(_) => fail("tool selector is not valid UTF-8"),

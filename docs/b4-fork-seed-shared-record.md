@@ -92,9 +92,14 @@ refusal itself.
 `SharedRecordFile` is the first transport. The launcher
 creates one memfd, initializes it with an empty snapshot,
 and registers it for Tools hosted in the launcher process.
-Only an in-guest Tool receives its number through
-`LITEROOT_SHARED_RECORD_FD`, following the existing
-probe-generation fd precedent; under ptrace the launcher
+Only an in-guest image is told about it, and by file
+identity (`LITEROOT_SHARED_RECORD_ID`, `<st_dev>:<st_ino>`),
+not by number, as for the probe generation
+(`LITEROOT_PROBE_GEN_ID`): the image's preload finds its
+inherited copy by that identity and moves it to a number the
+in-guest runtime keeps the guest away from, before the guest
+runs, and a fork child re-places its own copy
+(preload/src/runtime_memfds.rs). Under ptrace the launcher
 sets close-on-exec and exports neither the descriptor nor
 the env var to the guest. The file holds one whole
 length-framed snapshot, not an in-place shared-memory
