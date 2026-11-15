@@ -13,8 +13,8 @@
 //! unsupported-operation refusal for that dispatch, which the next
 //! dispatch would clear. `RootfsTool` overrides `new`, `subscriptions`,
 //! `init_thread_state`, `handle_thread_start`, `handle_post_exec`,
-//! `handle_syscall_event` and `on_exit_process`; every other method keeps
-//! the trait default here, as it does there.
+//! `handle_syscall_event`, `on_exit_thread` and `on_exit_process`; every
+//! other method keeps the trait default here, as it does there.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -100,6 +100,11 @@ fn drained() -> Vec<Refusal> {
         if tool & (1 << i) != 0 {
             found.push(Refusal::Guest(kind));
         }
+    }
+    found.append(&mut crate::rootfs_tool::PENDING_PATH_REPORTS.lock().unwrap());
+    // The constructor found syscall user dispatch absent (once).
+    if crate::prearm::take_sud_absent() {
+        found.push(Refusal::Note(crate::rootfs_tool::Note::SudAbsent));
     }
     found
 }
@@ -259,7 +264,13 @@ impl Tool for ReportingTool {
         global_state: &G,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        report(global_state, drained()).await;
+        // This process's exit summaries ride its exit drain: one batch,
+        // which the launcher gives one receipt ID. They travel in ONE
+        // message, and if a batch is ever split they stay together in one
+        // part, so both summaries always carry the same receipt ID.
+        let mut found = drained();
+        found.extend(self.inner.take_exit_summaries(pid.as_raw()));
+        report(global_state, found).await;
         self.inner
             .on_exit_process(pid, global_state, exit_status)
             .await

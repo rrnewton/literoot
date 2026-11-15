@@ -37,10 +37,15 @@ use sha2::Sha256;
 use crate::rootfs_tool::ForkKind;
 use crate::rootfs_tool::GuestKind;
 use crate::rootfs_tool::LiterootConfig;
+use crate::dead_base::FlagState;
 use crate::rootfs_tool::LiterootGlobal;
+use crate::rootfs_tool::Note;
+use crate::rootfs_tool::PathAnswer;
 use crate::rootfs_tool::Refusal;
 use crate::rootfs_tool::Refused;
+use crate::rootfs_tool::Summary;
 use crate::rootfs_tool::UnsupportedKind;
+use crate::translate::PathRefusal;
 
 /// The packet's magic.
 pub const MAGIC: [u8; 8] = *b"LRIINIT1";
@@ -219,10 +224,7 @@ pub fn encode(
 // Config wire fingerprint
 // ---------------------------------------------------------------------------
 
-/// Bumped with any change to `Refusal` or its nested kinds, as Detcore's
-/// `GLOBAL_RPC_REVISION` is; the refusal-wire domain catches what a missed
-/// bump would not.
-pub const REFUSAL_RPC_REVISION: u32 = 1;
+pub use crate::wire_id::REFUSAL_RPC_REVISION;
 
 const TAG_CONFIG_WIRE: &[u8] = b"literoot.config.wire.v1";
 const TAG_CONFIG_JSON: &[u8] = b"literoot.config.json.v1";
@@ -250,6 +252,7 @@ pub fn canonical_config() -> LiterootConfig {
         kompat_force: false,
         post_exec_at_exec_stop: true,
         refuse_guest_ptrace: false,
+        refuse_guest_dispatch: true,
         initial_exe: "/canonical/initial_exe".into(),
         initial_argv: vec!["canonical-argv0".into(), "canonical-argv1".into()],
         initial_stack_limit: Some((0x8000_0000_0000_0003, 0x8000_0000_0000_0004)),
@@ -272,6 +275,7 @@ pub const CONFIG_JSON: &str = concat!(
     r#""kompat_force":false,"#,
     r#""post_exec_at_exec_stop":true,"#,
     r#""refuse_guest_ptrace":false,"#,
+    r#""refuse_guest_dispatch":true,"#,
     r#""initial_exe":"/canonical/initial_exe","#,
     r#""initial_argv":["canonical-argv0","canonical-argv1"],"#,
     r#""initial_stack_limit":[9223372036854775811,9223372036854775812]}"#,
@@ -300,12 +304,29 @@ fn refusal_tag(refusal: Refusal) -> u8 {
         Refusal::Guest(GuestKind::DomainnameWrite) => 15,
         Refusal::Guest(GuestKind::KompatAuxv) => 16,
         Refusal::Guest(GuestKind::FakeIdAuxv) => 17,
+        Refusal::Path(PathRefusal::BaseUninspectable) => 18,
+        Refusal::Path(PathRefusal::BaseOutsideRoot) => 19,
+        Refusal::Path(PathRefusal::ProcLinkOutsideRoot) => 20,
+        Refusal::Path(PathRefusal::ProcLinkOtherProcess) => 21,
+        Refusal::Path(PathRefusal::BaseMoved) => 22,
+        Refusal::Path(PathRefusal::NoGuestRoute) => 23,
+        Refusal::Path(PathRefusal::ProbeUnsupported) => 24,
+        Refusal::Answered(PathAnswer::DeadBaseName) => 25,
+        Refusal::Answered(PathAnswer::DeadBaseSearch) => 26,
+        Refusal::Guest(GuestKind::SyscallUserDispatch) => 27,
+        Refusal::Note(Note::FilterInstallAttempted) => 28,
+        Refusal::Note(Note::SudAbsent) => 29,
+        Refusal::Summary(Summary::Seccomp { .. }) => 30,
+        Refusal::Summary(Summary::Probe { .. }) => 31,
+        Refusal::InstallRefused { .. } => 32,
+        Refusal::Path(PathRefusal::SyntheticFileUnavailable) => 33,
     }
 }
 
 /// One `Refused` request per `Refusal` variant and nested kind, in
-/// [`refusal_tag`] order: the request type `LiterootGlobal` sends as
-/// positional bincode outside `LiterootConfig`.
+/// [`refusal_tag`] order, plus one Seccomp summary per `FlagState` (34
+/// logical tags, 36 payload samples): the request type `LiterootGlobal`
+/// sends as positional bincode outside `LiterootConfig`.
 pub fn canonical_refusals() -> Vec<Refused> {
     let all = [
         Refusal::Exec,
@@ -326,19 +347,68 @@ pub fn canonical_refusals() -> Vec<Refused> {
         Refusal::Guest(GuestKind::DomainnameWrite),
         Refusal::Guest(GuestKind::KompatAuxv),
         Refusal::Guest(GuestKind::FakeIdAuxv),
+        Refusal::Path(PathRefusal::BaseUninspectable),
+        Refusal::Path(PathRefusal::BaseOutsideRoot),
+        Refusal::Path(PathRefusal::ProcLinkOutsideRoot),
+        Refusal::Path(PathRefusal::ProcLinkOtherProcess),
+        Refusal::Path(PathRefusal::BaseMoved),
+        Refusal::Path(PathRefusal::NoGuestRoute),
+        Refusal::Path(PathRefusal::ProbeUnsupported),
+        Refusal::Answered(PathAnswer::DeadBaseName),
+        Refusal::Answered(PathAnswer::DeadBaseSearch),
+        Refusal::Guest(GuestKind::SyscallUserDispatch),
+        Refusal::Note(Note::FilterInstallAttempted),
+        Refusal::Note(Note::SudAbsent),
+        // One Seccomp sample per FlagState (C5a.6), with distinct values in
+        // same-typed fields, so a field reorder changes the encoding.
+        Refusal::Summary(Summary::Seccomp {
+            pid: 1,
+            kernel_id: 2,
+            flag: FlagState::None,
+            installs: 3,
+            installs_refused: 4,
+            translated: 5,
+            refused: 6,
+            unseen_best_effort: 7,
+        }),
+        Refusal::Summary(Summary::Seccomp {
+            pid: 11,
+            kernel_id: 12,
+            flag: FlagState::Installed,
+            installs: 13,
+            installs_refused: 14,
+            translated: 15,
+            refused: 16,
+            unseen_best_effort: 8,
+        }),
+        Refusal::Summary(Summary::Seccomp {
+            pid: 21,
+            kernel_id: 22,
+            flag: FlagState::Inherited,
+            installs: 23,
+            installs_refused: 24,
+            translated: 25,
+            refused: 26,
+            unseen_best_effort: 9,
+        }),
+        Refusal::Summary(Summary::Probe {
+            pid: 1,
+            kernel_id: 2,
+            probes: 3,
+            sud_refused: 4,
+            sud_fallback: 5,
+        }),
+        Refusal::InstallRefused { in_flight: 8 },
+        Refusal::Path(PathRefusal::SyntheticFileUnavailable),
     ];
-    debug_assert!(
-        all.iter()
-            .enumerate()
-            .all(|(i, &r)| refusal_tag(r) as usize == i)
-    );
+    debug_assert!(all.windows(2).all(|w| refusal_tag(w[1]) - refusal_tag(w[0]) <= 1));
     all.into_iter().map(|r| Refused(vec![r])).collect()
 }
 
-/// Truncated SHA-256 over `(tag, payload)` domains, each written as an
-/// 8-byte little-endian tag length, the tag, an 8-byte little-endian payload
-/// length, then the payload. Takes any domains, so tests call it directly.
-pub fn hash_domains(domains: &[(&[u8], &[u8])]) -> [u8; 8] {
+/// SHA-256 over `(tag, payload)` domains, each written as an 8-byte
+/// little-endian tag length, the tag, an 8-byte little-endian payload
+/// length, then the payload.
+pub fn hash_domains_full(domains: &[(&[u8], &[u8])]) -> [u8; 32] {
     let mut hash = Sha256::new();
     for (tag, payload) in domains {
         hash.update((tag.len() as u64).to_le_bytes());
@@ -346,10 +416,32 @@ pub fn hash_domains(domains: &[(&[u8], &[u8])]) -> [u8; 8] {
         hash.update((payload.len() as u64).to_le_bytes());
         hash.update(payload);
     }
-    let digest = hash.finalize();
+    hash.finalize().into()
+}
+
+/// [`hash_domains_full`] truncated to 8 bytes. Takes any domains, so tests
+/// call it directly.
+pub fn hash_domains(domains: &[(&[u8], &[u8])]) -> [u8; 8] {
     let mut out = [0; 8];
-    out.copy_from_slice(&digest[..8]);
+    out.copy_from_slice(&hash_domains_full(domains)[..8]);
     out
+}
+
+/// The four domains of the wire identity, for `config_wire` (the canonical
+/// config's encoding, or another layout's in the tests).
+fn wire_domains(config_wire: &[u8], json: &str, refusals: &[u8]) -> [u8; 32] {
+    hash_domains_full(&[
+        (TAG_CONFIG_WIRE, config_wire),
+        (TAG_CONFIG_JSON, json.as_bytes()),
+        (TAG_REFUSAL_REVISION, &REFUSAL_RPC_REVISION.to_le_bytes()),
+        (TAG_REFUSAL_WIRE, refusals),
+    ])
+}
+
+/// This build's full wire digest, recomputed (`wire_id::LITEROOT_WIRE_DIGEST`
+/// is its pasted value).
+pub fn wire_digest() -> [u8; 32] {
+    wire_domains(&encoded(&canonical_config()), CONFIG_JSON, &refusal_wire())
 }
 
 /// Lowercase hex of `bytes`.
@@ -440,6 +532,7 @@ pub fn top_band_floor(soft: u64) -> i32 {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))] // Production placement only.
 fn soft_nofile() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -473,6 +566,7 @@ fn soft_nofile() -> Option<u64> {
 /// during the placement itself. Revisit this choice, and record inside the
 /// placement instead, if literoot ever runs guest code or unblocks signals
 /// between placement and installation.
+#[cfg_attr(test, allow(dead_code))] // Host tests call it under `private-runtime`.
 pub fn place_coordinator_stream(stream: UnixStream) -> Result<UnixStream, ConnectError> {
     let soft = soft_nofile().ok_or(ConnectError::FdMove {
         errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
@@ -496,6 +590,7 @@ pub fn place_coordinator_stream(stream: UnixStream) -> Result<UnixStream, Connec
 
 /// The production connector: `connect`, then [`place_coordinator_stream`].
 /// Used by the mapped first image and by the mapped successor.
+#[cfg_attr(test, allow(dead_code))] // Called by the mapped images.
 pub fn connect_coordinator(path: &Path) -> Result<UnixStream, ConnectError> {
     let stream = UnixStream::connect(path)
         .map_err(|error| ConnectError::Unreachable(error.raw_os_error().unwrap_or(0)))?;
@@ -991,13 +1086,375 @@ mod tests {
         );
     }
 
+    /// The pasted wire digest is this build's: a change to the config
+    /// layout, CONFIG_JSON, the refusal schema or the revision fails here
+    /// until the constant is re-pasted (from this message, never typed).
     #[test]
-    fn canonical_refusals_have_one_value_per_variant() {
+    fn wire_digest_is_pinned() {
+        let computed = wire_digest();
+        assert_eq!(
+            computed,
+            crate::wire_id::LITEROOT_WIRE_DIGEST,
+            "paste into src/wire_id.rs: pub const LITEROOT_WIRE_DIGEST: [u8; 32] = {computed:#04x?};"
+        );
+    }
+
+    /// The mapped route's fingerprint is the wire digest's first 8 bytes.
+    #[test]
+    fn mapped_fingerprint_is_wire_digest_prefix() {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&crate::wire_id::LITEROOT_WIRE_DIGEST[..8]);
+        assert_eq!(*literoot_config_wire_fingerprint(), hex16(prefix));
+    }
+
+    /// The config layout before `refuse_guest_dispatch`, everything else
+    /// this build's: (config wire, CONFIG_JSON, refusal wire).
+    fn old_layout_domains() -> (Vec<u8>, String, Vec<u8>) {
+        #[derive(serde::Serialize)]
+        struct BeforeDispatchRefusal {
+            rootfs: String,
+            binds: Vec<(String, String, bool)>,
+            cwd: String,
+            fake_root: bool,
+            fake_uid: Option<u32>,
+            fake_gid: Option<u32>,
+            kernel_release: Option<String>,
+            identity_only: bool,
+            kill_on_exit: bool,
+            kompat_force: bool,
+            post_exec_at_exec_stop: bool,
+            refuse_guest_ptrace: bool,
+            initial_exe: String,
+            initial_argv: Vec<String>,
+            initial_stack_limit: Option<(u64, u64)>,
+        }
+        let c = canonical_config();
+        let old = BeforeDispatchRefusal {
+            rootfs: c.rootfs,
+            binds: c.binds,
+            cwd: c.cwd,
+            fake_root: c.fake_root,
+            fake_uid: c.fake_uid,
+            fake_gid: c.fake_gid,
+            kernel_release: c.kernel_release,
+            identity_only: c.identity_only,
+            kill_on_exit: c.kill_on_exit,
+            kompat_force: c.kompat_force,
+            post_exec_at_exec_stop: c.post_exec_at_exec_stop,
+            refuse_guest_ptrace: c.refuse_guest_ptrace,
+            initial_exe: c.initial_exe,
+            initial_argv: c.initial_argv,
+            initial_stack_limit: c.initial_stack_limit,
+        };
+        let old_json = CONFIG_JSON.replace(r#""refuse_guest_dispatch":true,"#, "");
+        (encoded(&old), old_json, refusal_wire())
+    }
+
+    /// The old layout's wire digest, after asserting that only its config
+    /// domains differ from this build's: the refusal-wire bytes and the
+    /// revision are this build's (C5d).
+    fn old_layout_digest() -> [u8; 32] {
+        let (config_wire, json, refusals) = old_layout_domains();
+        assert_eq!(refusals, refusal_wire(), "the refusal wire is this build's");
+        assert_eq!(crate::wire_id::REFUSAL_RPC_REVISION, REFUSAL_RPC_REVISION);
+        assert_ne!(config_wire, encoded(&canonical_config()));
+        assert_ne!(json, CONFIG_JSON);
+        let digest = wire_domains(&config_wire, &json, &refusals);
+        assert_ne!(digest, wire_digest());
+        digest
+    }
+
+    /// A preload whose record differs only in the config layout is refused
+    /// by the launcher's pre-spawn check (C5d F1).
+    #[test]
+    fn launcher_rejects_config_only_mismatch() {
+        let old = old_layout_digest();
+        let mut record = crate::wire_id::WIRE_ID_RECORD;
+        record[20..].copy_from_slice(&old);
+        // Only the digest differs: magic and revision are this build's.
+        assert_eq!(record[..20], crate::wire_id::WIRE_ID_RECORD[..20]);
+        let msg = crate::wire_id::check_record("p", Ok(record), REFUSAL_RPC_REVISION, &wire_digest())
+            .unwrap_err();
+        assert!(msg.starts_with(&format!("the preload p has wire {REFUSAL_RPC_REVISION}/")), "{msg}");
+        // The same record in a synthetic preload file, through the
+        // launcher's own reader (C5d F1): refused by name. The record's
+        // refusal-wire revision is this build's.
+        use crate::wire_id::tests::{elf, PROGBITS};
+        let dir = std::env::temp_dir().join(format!("literoot-seam-wire-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let old_file = dir.join("old.so");
+        let this_file = dir.join("this.so");
+        std::fs::write(&old_file, elf(&[(crate::wire_id::WIRE_ID_SECTION, PROGBITS, &record)])).unwrap();
+        let this = crate::wire_id::WIRE_ID_RECORD;
+        std::fs::write(&this_file, elf(&[(crate::wire_id::WIRE_ID_SECTION, PROGBITS, &this)])).unwrap();
+        let old_answer = crate::wire_id::check_preload(&old_file);
+        let this_answer = crate::wire_id::check_preload(&this_file);
+        std::fs::remove_file(&old_file).unwrap();
+        std::fs::remove_file(&this_file).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        let msg = old_answer.unwrap_err();
+        let rev = REFUSAL_RPC_REVISION;
+        assert!(msg.contains(&format!(" has wire {rev}/")) && msg.contains(&format!("not this launcher's {rev}/")), "{msg}");
+        assert_eq!(this_answer, Ok(()), "positive control: this build's record");
+        // No spawn: in the launcher every in-guest launch is preceded by the
+        // check, whose `?` returns before it (source order).
+        let launcher = include_str!("tool.rs");
+        let launches: Vec<usize> =
+            launcher.match_indices("run_with_output_and_preload_data::<").map(|(i, _)| i).collect();
+        assert_eq!(launches.len(), 2, "the two in-guest launches");
+        let mut from = 0;
+        for at in launches {
+            assert!(
+                launcher[from..at].contains("crate::wire_id::check_preload(&preload)?;"),
+                "a launch without the preload check before it"
+            );
+            from = at;
+        }
+    }
+
+    /// A launcher whose identity differs only in the config layout is
+    /// refused by the preload's arming step (C5d F1), before it connects to
+    /// the coordinator or decodes the config. `wire_id::arm_with` is the step
+    /// both preload constructors run; its closure is the only path to the
+    /// coordinator socket and the config decode, so the recording fake
+    /// counts both. Positive control: this build's identity reaches it once.
+    #[test]
+    fn preload_rejects_config_only_mismatch() {
+        use std::cell::Cell;
+        let connects = Cell::new(0);
+        let decodes = Cell::new(0);
+        let recording = |name: &str| {
+            assert_eq!(name, "literoot");
+            connects.set(connects.get() + 1);
+            decodes.set(decodes.get() + 1);
+            Ok(())
+        };
+        let hex = |d: &[u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let old = old_layout_digest();
+        let selector = format!("literoot\u{1f}wire={REFUSAL_RPC_REVISION}:{}", hex(&old));
+        let msg = crate::wire_id::arm_with(selector.into_bytes(), recording).unwrap_err();
+        assert!(msg.starts_with(&format!("launcher wire {REFUSAL_RPC_REVISION}/")), "{msg}");
+        assert_eq!((connects.get(), decodes.get()), (0, 0), "nothing before the identity check");
+        assert_eq!(crate::wire_id::LITEROOT_WIRE_DIGEST, wire_digest());
+        let ours = format!("literoot\u{1f}wire={REFUSAL_RPC_REVISION}:{}", hex(&wire_digest()));
+        assert_eq!(crate::wire_id::arm_with(ours.into_bytes(), recording), Ok(()));
+        assert_eq!((connects.get(), decodes.get()), (1, 1));
+    }
+
+    /// Both preload constructors arm only through `wire_id::arm_with`, and
+    /// the coordinator socket and the install calls appear only inside its
+    /// closure (source tripwire for the seam above).
+    #[test]
+    fn preload_constructors_arm_only_through_the_identity_step() {
+        let source = include_str!("../preload/src/lib.rs");
+        let start = source.find("unsafe extern \"C\" fn initialize(").expect("the constructor");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("the constructor's end");
+        let body = &body[..end];
+        assert_eq!(body.matches("wire_id::arm_with(bootstrap.tool_data, |selected| {").count(), 2);
+        for needle in ["bootstrap.coordinator", "install_tool_with::<", "install_tool_from_bootstrap::<"] {
+            for (at, _) in body.match_indices(needle) {
+                let before = &body[..at];
+                let opened = before.rfind("wire_id::arm_with(").expect("inside an arming closure");
+                assert!(!before[opened..].contains("fail(&msg)"), "{needle} outside the closure");
+            }
+        }
+        assert!(!body.contains("split_selector("), "the constructor splits only through arm_with");
+    }
+
+    #[test]
+    fn canonical_corpus_covers_every_variant_and_nested_kind() {
         let all = canonical_refusals();
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 36, "34 logical tags, 36 payload samples");
         let mut tags: Vec<u8> = all.iter().map(|r| refusal_tag(r.0[0])).collect();
-        tags.sort();
-        assert_eq!(tags, (0..18).collect::<Vec<u8>>());
+        tags.dedup();
+        assert_eq!(tags, (0..34).collect::<Vec<u8>>());
+        let flags: Vec<FlagState> = all
+            .iter()
+            .filter_map(|r| match r.0[0] {
+                Refusal::Summary(Summary::Seccomp { flag, .. }) => Some(flag),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, crate::dead_base::FLAG_STATES);
+    }
+
+    /// The new payloads round-trip at their boundaries.
+    #[test]
+    fn summary_and_install_refusal_round_trip_at_boundaries() {
+        let mut values = Vec::new();
+        for in_flight in [0, 1, u32::MAX] {
+            values.push(Refusal::InstallRefused { in_flight });
+        }
+        for n in [0, u64::MAX] {
+            for flag in crate::dead_base::FLAG_STATES {
+                values.push(Refusal::Summary(Summary::Seccomp {
+                    pid: if n == 0 { 0 } else { i32::MAX },
+                    kernel_id: n,
+                    flag,
+                    installs: n,
+                    installs_refused: n,
+                    translated: n,
+                    refused: n,
+                    unseen_best_effort: n,
+                }));
+            }
+            values.push(Refusal::Summary(Summary::Probe {
+                pid: if n == 0 { 0 } else { i32::MAX },
+                kernel_id: n,
+                probes: n,
+                sud_refused: n,
+                sud_fallback: n,
+            }));
+        }
+        for v in values {
+            let bytes = encoded(&Refused(vec![v]));
+            let back: Refused = codec::decode(&bytes).unwrap();
+            assert_eq!(back.0, vec![v]);
+        }
+    }
+
+    /// C4.1: every canonical refusal value (every variant and nested kind,
+    /// one Seccomp summary per flag) survives the codec round trip, alone
+    /// and as one batch. The side-log half is
+    /// side_log::tests::every_reported_refusal_is_a_grammar_line.
+    #[test]
+    fn refusal_wire_round_trip() {
+        let all = canonical_refusals();
+        let mut batch = Vec::new();
+        for refused in &all {
+            let back: Refused = codec::decode(&encoded(refused)).unwrap();
+            assert_eq!(back.0, refused.0);
+            batch.extend(refused.0.iter().copied());
+        }
+        let mut tags: Vec<u8> = batch.iter().map(|&r| refusal_tag(r)).collect();
+        tags.dedup();
+        assert_eq!(tags, (0..=33).collect::<Vec<u8>>(), "every tag, in order");
+        let back: Refused = codec::decode(&encoded(&Refused(batch.clone()))).unwrap();
+        assert_eq!(back.0, batch);
+    }
+
+    /// The pre-r2 summary schema (r7/C5.4: `seq`, no unseen_best_effort, no
+    /// InstallRefused tag), frozen here, against this build's: the frozen
+    /// corpus reproduces every unchanged sample byte for byte, and its wire
+    /// and digest differ from this build's, so the change is real bytes,
+    /// not a same-width rename (review r3 P3-1).
+    #[test]
+    fn the_seq_era_schema_has_another_wire_and_digest() {
+        #[derive(serde::Serialize, Clone, Copy)]
+        enum SeqSummary {
+            Seccomp {
+                pid: i32,
+                seq: u64,
+                flag: FlagState,
+                installs: u64,
+                installs_refused: u64,
+                translated: u64,
+                refused: u64,
+            },
+            Probe {
+                pid: i32,
+                seq: u64,
+                probes: u64,
+                sud_refused: u64,
+                sud_fallback: u64,
+            },
+        }
+        #[derive(serde::Serialize, Clone, Copy)]
+        enum SeqRefusal {
+            Exec,
+            ForkPolicy(ForkKind),
+            SignalAction(u8),
+            AlternateStack,
+            Unsupported(UnsupportedKind),
+            Guest(GuestKind),
+            Path(PathRefusal),
+            Answered(PathAnswer),
+            Note(Note),
+            Summary(SeqSummary),
+        }
+        #[derive(serde::Serialize)]
+        struct SeqRefused(Vec<SeqRefusal>);
+        let old = |r: Refusal| -> Option<SeqRefusal> {
+            Some(match r {
+                Refusal::Exec => SeqRefusal::Exec,
+                Refusal::ForkPolicy(k) => SeqRefusal::ForkPolicy(k),
+                Refusal::SignalAction(n) => SeqRefusal::SignalAction(n),
+                Refusal::AlternateStack => SeqRefusal::AlternateStack,
+                Refusal::Unsupported(k) => SeqRefusal::Unsupported(k),
+                Refusal::Guest(k) => SeqRefusal::Guest(k),
+                // Not in the seq era: added with revision 3.
+                Refusal::Path(PathRefusal::SyntheticFileUnavailable) => return None,
+                Refusal::Path(k) => SeqRefusal::Path(k),
+                Refusal::Answered(k) => SeqRefusal::Answered(k),
+                Refusal::Note(n) => SeqRefusal::Note(n),
+                Refusal::Summary(Summary::Seccomp {
+                    pid,
+                    kernel_id,
+                    flag,
+                    installs,
+                    installs_refused,
+                    translated,
+                    refused,
+                    unseen_best_effort: _,
+                }) => SeqRefusal::Summary(SeqSummary::Seccomp {
+                    pid,
+                    seq: kernel_id,
+                    flag,
+                    installs,
+                    installs_refused,
+                    translated,
+                    refused,
+                }),
+                Refusal::Summary(Summary::Probe {
+                    pid,
+                    kernel_id,
+                    probes,
+                    sud_refused,
+                    sud_fallback,
+                }) => SeqRefusal::Summary(SeqSummary::Probe {
+                    pid,
+                    seq: kernel_id,
+                    probes,
+                    sud_refused,
+                    sud_fallback,
+                }),
+                Refusal::InstallRefused { .. } => return None,
+            })
+        };
+        let mut old_wire = Vec::new();
+        let mut old_samples = 0;
+        for refused in canonical_refusals() {
+            let Some(r) = old(refused.0[0]) else {
+                continue;
+            };
+            old_samples += 1;
+            let old_bytes = encoded(&SeqRefused(vec![r]));
+            let new_bytes = encoded(&refused);
+            // Every sample outside the Seccomp summary encodes the same:
+            // the Probe summary's seq-to-kernel_id rename keeps its width,
+            // so its bytes are equal, which is why the rename alone would
+            // not change the digest. Seccomp gained unseen_best_effort.
+            if matches!(refused.0[0], Refusal::Summary(Summary::Seccomp { .. })) {
+                assert_ne!(old_bytes, new_bytes, "{:?}", refused.0[0]);
+            } else {
+                assert_eq!(old_bytes, new_bytes, "{:?}", refused.0[0]);
+            }
+            old_wire.extend_from_slice(&(old_bytes.len() as u64).to_le_bytes());
+            old_wire.extend_from_slice(&old_bytes);
+        }
+        assert_eq!(old_samples, 34, "the seq-era corpus: 32 tags, 34 samples");
+        assert_ne!(old_wire, refusal_wire());
+        let digest = |wire: &[u8]| {
+            hash_domains(&[
+                (TAG_CONFIG_WIRE, &encoded(&canonical_config())),
+                (TAG_CONFIG_JSON, CONFIG_JSON.as_bytes()),
+                (TAG_REFUSAL_REVISION, &REFUSAL_RPC_REVISION.to_le_bytes()),
+                (TAG_REFUSAL_WIRE, wire),
+            ])
+        };
+        assert_eq!(hex16(digest(&refusal_wire())), *literoot_config_wire_fingerprint());
+        assert_ne!(digest(&old_wire), digest(&refusal_wire()));
     }
 
     #[test]
@@ -1062,6 +1519,7 @@ mod tests {
         LiterootConfig {
             post_exec_at_exec_stop: false,
             refuse_guest_ptrace: true,
+            refuse_guest_dispatch: true,
             ..canonical_config()
         }
     }
@@ -1221,6 +1679,53 @@ mod tests {
             }
             Err(e) => panic!("refused for another reason: {e}"),
             Ok(_) => panic!("a packet from another config layout was admitted"),
+        }
+    }
+
+    /// C4.1 (4): a packet from a build that differs only in the refusal
+    /// revision (this build's config wire and refusal values, revision - 1)
+    /// is refused at A2 with FingerprintMismatch and never connects; so is
+    /// one whose refusal wire lacks fix 4's variants (tags 18-33) at this
+    /// revision.
+    #[test]
+    fn old_refusal_revision_is_refused_at_a2() {
+        let wire = encoded(&canonical_config());
+        let refusals = refusal_wire();
+        let fp_with = |revision: u32, refusals: &[u8]| {
+            hex16(hash_domains(&[
+                (TAG_CONFIG_WIRE, &wire),
+                (TAG_CONFIG_JSON, CONFIG_JSON.as_bytes()),
+                (TAG_REFUSAL_REVISION, &revision.to_le_bytes()),
+                (TAG_REFUSAL_WIRE, refusals),
+            ]))
+        };
+        assert_eq!(fp_with(REFUSAL_RPC_REVISION, &refusals), fp(), "the recomputation is this build's");
+        let mut dropped = Vec::new();
+        for refused in canonical_refusals().into_iter().filter(|r| refusal_tag(r.0[0]) <= 17) {
+            let bytes = encoded(&refused);
+            dropped.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            dropped.extend_from_slice(&bytes);
+        }
+        let cases = [
+            ("revision - 1", fp_with(REFUSAL_RPC_REVISION - 1, &refusals)),
+            ("fix 4's variants dropped", fp_with(REFUSAL_RPC_REVISION, &dropped)),
+        ];
+        for (what, old) in cases {
+            assert_ne!(old, fp(), "{what}");
+            let config = in_guest_config();
+            let p = encode(&[0; NONCE_LEN], &digest_of(&config), &old, PATH).unwrap();
+            let mut called = None;
+            let r = admit(
+                &p,
+                Carriage::Absent,
+                Ok(coordinator(&config, digest_of(&config), Script::Full)),
+                &mut called,
+            );
+            assert_eq!(called, None, "{what}: never connects");
+            assert!(
+                matches!(r, Err(AdmitError::FingerprintMismatch { packet, ours }) if packet == old && ours == fp()),
+                "{what}"
+            );
         }
     }
 

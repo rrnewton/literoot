@@ -149,6 +149,423 @@ fn probe(host: &Path) -> ProbeKind {
     k
 }
 
+/// [`probe`] without the cache, for procfs entries: pids, tids and fds
+/// come and go without a generation bump.
+fn probe_uncached(host: &Path) -> ProbeKind {
+    match std::fs::symlink_metadata(host) {
+        Ok(m) if m.file_type().is_symlink() => ProbeKind::Symlink,
+        Ok(m) if m.is_dir() => ProbeKind::Dir,
+        Ok(_) => ProbeKind::Other,
+        Err(_) => ProbeKind::Missing,
+    }
+}
+
+/// How many symlinks one path walk may follow: the kernel's MAXSYMLINKS
+/// (include/linux/namei.h), counted over the whole walk, intermediate and
+/// final links alike.
+pub const MAX_SYMLINKS: u32 = 40;
+
+/// A path walk needed more than [`MAX_SYMLINKS`] links; the guest's ELOOP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyLinks;
+
+/// Count one more followed link against a walk's budget: the kernel's
+/// `if (nd->total_link_count++ >= MAXSYMLINKS) return -ELOOP` (pick_link,
+/// fs/namei.c), so the 41st link fails.
+pub fn take_link(links: &mut u32) -> Result<(), TooManyLinks> {
+    if *links >= MAX_SYMLINKS {
+        return Err(TooManyLinks);
+    }
+    *links += 1;
+    Ok(())
+}
+
+/// A path refusal literoot makes by name: the closed family of
+/// `literoot: refused path <kind>` side-log lines (docs/design.md §4.9).
+///
+/// Its wire form (serde) is in rootfs_tool.rs: this file is also built
+/// without serde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRefusal {
+    /// The base of a relative name could not be inspected (a stat or
+    /// readlink error, a /proc text that is not absolute, or a climb the
+    /// Tool may not make).
+    BaseUninspectable,
+    /// A live base whose /proc name leads back to it but has no guest name.
+    BaseOutsideRoot,
+    /// A /proc magic link of the guest's own process whose object has no
+    /// guest name.
+    ProcLinkOutsideRoot,
+    /// A /proc magic link of a process that is not the guest's.
+    ProcLinkOtherProcess,
+    /// The base's /proc name does not lead back to it (moved, or held in
+    /// another mount namespace).
+    BaseMoved,
+    /// A final symlink reached with no guest route to resolve it from.
+    NoGuestRoute,
+    /// literoot has no trustworthy probe for the call.
+    ProbeUnsupported,
+    /// A synthetic cmdline file could not be made in a private directory,
+    /// or was replaced before the guest's open.
+    SyntheticFileUnavailable,
+}
+
+impl PathRefusal {
+    /// The side-log token.
+    pub fn token(self) -> &'static str {
+        match self {
+            PathRefusal::BaseUninspectable => "base_uninspectable",
+            PathRefusal::BaseOutsideRoot => "base_outside_root",
+            PathRefusal::ProcLinkOutsideRoot => "proc_link_outside_root",
+            PathRefusal::ProcLinkOtherProcess => "proc_link_other_process",
+            PathRefusal::BaseMoved => "base_moved",
+            PathRefusal::NoGuestRoute => "no_guest_route",
+            PathRefusal::ProbeUnsupported => "probe_unsupported",
+            PathRefusal::SyntheticFileUnavailable => "synthetic_file_unavailable",
+        }
+    }
+}
+
+/// Every [`PathRefusal`], in side-log order.
+#[cfg_attr(not(test), allow(dead_code))] // The kind-list units are its callers.
+pub const PATH_REFUSALS: [PathRefusal; 8] = [
+    PathRefusal::BaseUninspectable,
+    PathRefusal::BaseOutsideRoot,
+    PathRefusal::ProcLinkOutsideRoot,
+    PathRefusal::ProcLinkOtherProcess,
+    PathRefusal::BaseMoved,
+    PathRefusal::NoGuestRoute,
+    PathRefusal::ProbeUnsupported,
+    PathRefusal::SyntheticFileUnavailable,
+];
+
+/// Why a guest path walk failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkError {
+    /// More than [`MAX_SYMLINKS`] links: the guest's ELOOP.
+    TooManyLinks,
+    /// A refusal by name: the guest's EACCES.
+    Refused(PathRefusal),
+    /// The kernel's own answer for a component the walk cannot pass inside
+    /// the real procfs (ENOENT for a missing entry, ENOTDIR for a
+    /// non-directory), instead of a literal tail for the kernel.
+    Kernel(i32),
+}
+
+impl From<TooManyLinks> for WalkError {
+    fn from(_: TooManyLinks) -> Self {
+        WalkError::TooManyLinks
+    }
+}
+
+/// Which /proc magic link a walk reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagicKind {
+    Root,
+    Cwd,
+    Exe,
+    Fd,
+    MapFiles,
+}
+
+/// A /proc magic link, read from the HOST path the walk selected (through
+/// binds, then [`ProcLinks::tool_view`]): `<procfs>/<pid>[/task/<tid>]/
+/// {root,cwd,exe}` or `.../{fd,map_files}/<entry>`. The kernel follows it
+/// to an object of process `pid` that the guest root does not contain
+/// (literoot does not chroot, so `root` is the host's `/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MagicLink {
+    pub pid: i32,
+    pub tid: Option<i32>,
+    pub kind: MagicKind,
+}
+
+/// A component's place in the real procfs, judged from its host path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcEntry {
+    /// Not an entry of the real procfs.
+    NotProc,
+    /// procfs's own `self` or `thread-self` symlink. Its target, numeric,
+    /// relative to the procfs root: `[P]` or `[P, task, T]`.
+    Prefix(Vec<std::ffi::OsString>),
+    /// A magic link of the real procfs.
+    Magic(MagicLink),
+    /// Any other entry inside the real procfs, missing ones included.
+    Inside,
+}
+
+/// `fs/proc/root.c`'s PROC_SUPER_MAGIC.
+const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+
+/// Whether the file system holding `path` is procfs (statfs, which follows
+/// a final symlink: callers pass a directory).
+fn on_procfs(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a statfs buffer of the right size.
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    rc == 0 && st.f_type as i64 == PROC_SUPER_MAGIC
+}
+
+/// The procfs mount root holding host path `host`, if its parent is on
+/// procfs (F: an entry is procfs's only when its parent is): the topmost
+/// ancestor still on procfs.
+pub fn procfs_root_of(host: &Path) -> Option<PathBuf> {
+    let mut root = host.parent()?.to_path_buf();
+    if !on_procfs(&root) {
+        return None;
+    }
+    while let Some(up) = root.parent() {
+        if up.as_os_str().is_empty() || !on_procfs(up) {
+            break;
+        }
+        root = up.to_path_buf();
+    }
+    Some(root)
+}
+
+/// The components of `host` below the procfs root `root`.
+fn below(root: &Path, host: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let rest = host.strip_prefix(root).ok()?;
+    Some(
+        rest.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Classify a procfs-relative component list, already mapped by the
+/// policy's tool view (no `self`/`thread-self` left in it except as the
+/// whole list).
+fn classify_rel(spelled: &[std::ffi::OsString], view: &[std::ffi::OsString]) -> ProcEntry {
+    if spelled.len() == 1 && matches!(spelled[0].to_str(), Some("self" | "thread-self")) {
+        return ProcEntry::Prefix(view.to_vec());
+    }
+    let num = |c: &std::ffi::OsString| -> Option<i32> {
+        let s = c.to_str()?;
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    let Some(pid) = view.first().and_then(num) else {
+        return ProcEntry::Inside;
+    };
+    let (tid, tail) = if view.len() >= 4 && view[1] == "task" {
+        match num(&view[2]) {
+            Some(t) => (Some(t), &view[3..]),
+            None => return ProcEntry::Inside,
+        }
+    } else {
+        (None, &view[1..])
+    };
+    let kind = match tail {
+        [l] => match l.to_str() {
+            Some("root") => MagicKind::Root,
+            Some("cwd") => MagicKind::Cwd,
+            Some("exe") => MagicKind::Exe,
+            _ => return ProcEntry::Inside,
+        },
+        [l, _] => match l.to_str() {
+            Some("fd") => MagicKind::Fd,
+            Some("map_files") => MagicKind::MapFiles,
+            _ => return ProcEntry::Inside,
+        },
+        _ => return ProcEntry::Inside,
+    };
+    ProcEntry::Magic(MagicLink { pid, tid, kind })
+}
+
+/// [`ProcEntry`] of host path `host` under the procfs root `root`, with
+/// `proc`'s tool view; and the tool-view host path for Tool-side reads.
+fn entry_under(
+    root: &Path,
+    host: &Path,
+    proc: &dyn ProcLinks,
+) -> Option<(ProcEntry, PathBuf)> {
+    let spelled = below(root, host)?;
+    if spelled.is_empty() {
+        return Some((ProcEntry::Inside, host.to_path_buf()));
+    }
+    let view = proc.tool_view(&spelled);
+    let mut tv = root.to_path_buf();
+    for c in &view {
+        tv.push(c);
+    }
+    Some((classify_rel(&spelled, &view), tv))
+}
+
+/// [`ProcEntry`] of `host`, finding its procfs root first, and the
+/// tool-view path. `(NotProc, host)` outside procfs.
+pub fn proc_entry(host: &Path, proc: &dyn ProcLinks) -> (ProcEntry, PathBuf) {
+    match procfs_root_of(host).and_then(|root| entry_under(&root, host, proc)) {
+        Some(found) => found,
+        None => (ProcEntry::NotProc, host.to_path_buf()),
+    }
+}
+
+/// What a guest walk does at a /proc magic link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MagicAction {
+    /// An ordinary component.
+    Walk,
+    /// Continue from this canonical guest directory instead, with the
+    /// same link budget (".." then clamps at the guest root).
+    Reroot(PathBuf),
+    /// Hand the link, and anything after it, to the kernel as spelled.
+    Raw,
+    /// Refuse the walk by name.
+    Refuse(PathRefusal),
+}
+
+/// The guest's answers at /proc: whose process a link belongs to decides
+/// it, and which process `self` names, which only the caller knows.
+pub trait ProcLinks {
+    /// Map procfs-relative components for Tool-side reads: `self` becomes
+    /// the guest's tgid and `thread-self` its `<tgid>/task/<tid>`, as the
+    /// calling task sees them; everything else is kept.
+    fn tool_view(&self, rel: &[std::ffi::OsString]) -> Vec<std::ffi::OsString>;
+    /// The walk continues past `link` (more components, or a trailing
+    /// slash). `host` is the link's tool-view host path.
+    fn traverse(&self, link: &MagicLink, host: &Path) -> MagicAction;
+    /// A call follows `link` itself, as its final component.
+    fn follow(&self, link: &MagicLink, host: &Path) -> MagicAction;
+    /// Whether a walk asked this policy has handed another process's
+    /// directory link to the kernel (a Raw hand-over it could not splice):
+    /// the route past it names no stable guest directory.
+    fn raw_crossed(&self) -> bool {
+        false
+    }
+}
+
+/// Count, against `links`, the plain symlinks the kernel follows in the
+/// intermediate components of `tail` (every component but the last),
+/// walking on from the directory the magic link `start` names: the rest of
+/// a walk after a Raw hand-over, which the kernel walks with the budget the
+/// walk has left. It walks the kernel's
+/// own objects: `start` is opened (the kernel follows the magic link, in
+/// the other process's mount namespace), then each component by `openat`
+/// from that descriptor; an absolute target restarts at the host root, the
+/// calling guest's own (literoot does not chroot). Conservative: over-counting would turn a
+/// native success into ELOOP, so it stops counting, with no error, at
+/// anything it does not model: any directory on procfs (magic links, self,
+/// thread-self), a component it cannot open, stat or read, or a
+/// non-directory. Only the links it actually followed can give ELOOP.
+pub(crate) fn count_raw_tail(
+    start: &Path,
+    tail: &[std::ffi::OsString],
+    links: &mut u32,
+) -> Result<(), WalkError> {
+    use std::collections::VecDeque;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    const DIR: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // A directory descriptor at `name` from `at` (None: an absolute path),
+    // refused when the directory is on procfs.
+    fn open_dir(at: Option<&OwnedFd>, name: &[u8], extra: i32) -> Option<OwnedFd> {
+        let c = std::ffi::CString::new(name).ok()?;
+        let dirfd = at.map(|f| f.as_raw_fd()).unwrap_or(libc::AT_FDCWD);
+        // SAFETY: a NUL-terminated name; the result is checked.
+        let fd = unsafe { libc::openat(dirfd, c.as_ptr(), DIR | extra) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: a descriptor this call just opened and owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: an open descriptor and a statfs buffer of the right size.
+        let rc = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) };
+        (rc == 0 && st.f_type as i64 != PROC_SUPER_MAGIC).then_some(fd)
+    }
+    let Some((_, inner)) = tail.split_last() else {
+        return Ok(());
+    };
+    let Some(mut cur) = open_dir(None, start.as_os_str().as_bytes(), 0) else {
+        return Ok(());
+    };
+    let mut pending: VecDeque<std::ffi::OsString> = inner.iter().cloned().collect();
+    while let Some(c) = pending.pop_front() {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        let Ok(name) = std::ffi::CString::new(c.as_bytes()) else {
+            return Ok(());
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: an open descriptor, a NUL-terminated name, a stat buffer.
+        let rc = unsafe { libc::fstatat(cur.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            return Ok(());
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => match open_dir(Some(&cur), c.as_bytes(), libc::O_NOFOLLOW) {
+                Some(next) => cur = next,
+                None => return Ok(()),
+            },
+            libc::S_IFLNK => {
+                let mut buf = vec![0u8; libc::PATH_MAX as usize];
+                // SAFETY: an open descriptor, a NUL-terminated name, and a
+                // buffer of the length passed.
+                let n = unsafe {
+                    libc::readlinkat(cur.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n < 0 || n as usize >= buf.len() {
+                    return Ok(());
+                }
+                buf.truncate(n as usize);
+                take_link(links)?;
+                let target = PathBuf::from(std::ffi::OsString::from_vec(buf));
+                if target.is_absolute() {
+                    match open_dir(None, b"/", 0) {
+                        Some(root) => cur = root,
+                        None => return Ok(()),
+                    }
+                }
+                for comp in target.components().rev() {
+                    match comp {
+                        Component::Normal(s) => pending.push_front(s.to_os_string()),
+                        Component::ParentDir => pending.push_front("..".into()),
+                        Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// The tool view of the procfs-relative `rel` for guest `pid` (thread
+/// `tid`).
+pub fn tool_view_for(
+    rel: &[std::ffi::OsString],
+    pid: i32,
+    tid: i32,
+) -> Vec<std::ffi::OsString> {
+    let mut out = Vec::with_capacity(rel.len() + 2);
+    match rel.first().and_then(|c| c.to_str()) {
+        Some("self") => out.push(std::ffi::OsString::from(pid.to_string())),
+        Some("thread-self") => {
+            out.push(std::ffi::OsString::from(pid.to_string()));
+            out.push(std::ffi::OsString::from("task"));
+            out.push(std::ffi::OsString::from(tid.to_string()));
+        }
+        _ => return rel.to_vec(),
+    }
+    out.extend(rel[1..].iter().cloned());
+    out
+}
+
+/// A canonical guest path, and the bind its walk crossed, if any: that
+/// bind's guest prefix components and its host prefix.
+type Canonical = (PathBuf, Option<(Vec<std::ffi::OsString>, PathBuf)>);
+
 /// One bind entry: guest prefix → host prefix (proot `-b host[:guest]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
@@ -292,7 +709,10 @@ impl RootConfig {
     /// tail so the kernel reports ENOTDIR/ENOENT itself
     /// (test-path-traversal-conformance).
     fn canonicalize(&self, base: &Path, path: &Path) -> PathBuf {
-        self.canonicalize_inner(base, path).0
+        match self.canonicalize_inner(base, path, None, None) {
+            Ok((p, _)) => p,
+            Err(_) => unreachable!("an uncounted walk with no policy cannot fail"),
+        }
     }
 
     /// The guest path `path` names from the canonical guest directory
@@ -308,7 +728,56 @@ impl RootConfig {
         self.canonicalize(base, path)
     }
 
-    fn canonicalize_inner(&self, base: &Path, path: &Path) -> (PathBuf, Option<(Vec<std::ffi::OsString>, PathBuf)>) {
+    /// [`Self::canonical_guest`] for a walk on a guest's behalf: `proc`
+    /// answers at every /proc magic link the walk passes through, so the
+    /// canonical path names where the guest's call lands (a rerooted
+    /// `/proc/self/root/x` is `/x`).
+    pub fn canonical_guest_walk(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        proc: &dyn ProcLinks,
+    ) -> Result<PathBuf, WalkError> {
+        let base = if path.is_absolute() {
+            Path::new("/")
+        } else {
+            cwd
+        };
+        self.canonicalize_inner(base, path, None, Some(proc))
+            .map(|(p, _)| p)
+    }
+
+    /// A relative `path` is walked from `base` as if spelled after it, so
+    /// `base` need not be canonical. With `links`, every symlink the walk
+    /// splices counts against one budget shared with the caller, and the walk fails with
+    /// [`TooManyLinks`] at the link past [`MAX_SYMLINKS`], as the kernel's
+    /// does. Without it, a walk stops splicing after 40 links and leaves
+    /// the rest literal (callers outside the guest's own path walks).
+    /// With `proc`, the walk asks it at every /proc magic link it passes
+    /// through; without, the link is spliced (`root`) or left for the
+    /// kernel (the others), the context-free behaviour.
+    ///
+    /// With `proc`, an entry counts as the real procfs's only when its host
+    /// path (selected through binds on the spelled stack) has a parent on
+    /// procfs, and its Tool-side reads use `proc`'s tool view, so `self`
+    /// names the guest. Inside procfs:
+    /// - procfs's own `self` and `thread-self`, continued through, cost one
+    ///   link and are never spliced forward (a bind below the spelling
+    ///   still matches); a ".." with one of them on top lands in its
+    ///   target's parent, as the kernel's does;
+    /// - a magic link continued through is the policy's: a Reroot or a Raw
+    ///   hand-over costs one link (the guest's kernel would follow it);
+    /// - a missing or non-directory entry the walk must pass is the
+    ///   kernel's ENOENT or ENOTDIR at once, never a literal tail;
+    /// - the probe cache is not used: pids, tids and fds change without a
+    ///   generation bump.
+    fn canonicalize_inner(
+        &self,
+        base: &Path,
+        path: &Path,
+        mut links: Option<&mut u32>,
+        proc: Option<&dyn ProcLinks>,
+    ) -> Result<Canonical, WalkError> {
         use std::collections::VecDeque;
         #[derive(Clone)]
         enum Comp {
@@ -316,6 +785,10 @@ impl RootConfig {
             Dot,
             DotDot,
             Name(std::ffi::OsString),
+            /// The end of a Reroot's directory, with the link count right
+            /// after the Reroot was charged: walking a canonical guest
+            /// directory charges nothing more.
+            RerootEnd(u32),
         }
         fn to_comp(c: Component) -> Comp {
             match c {
@@ -326,19 +799,31 @@ impl RootConfig {
                 Component::Prefix(_) => Comp::Root,
             }
         }
-        let mut stack: Vec<std::ffi::OsString> = if path.is_absolute() {
-            Vec::new()
+        // One more link the guest's kernel follows: counted against the
+        // walk's budget, or, for a walk without one, against the 40-hop
+        // cap of the context-free walk.
+        fn charge(links: &mut Option<&mut u32>, hops: &mut u32) -> Result<(), WalkError> {
+            *hops += 1;
+            if let Some(n) = links.as_deref_mut() {
+                take_link(n)?;
+            }
+            Ok(())
+        }
+        // A relative path walks its base too, component by component, with
+        // the same link budget and bind handling: a recorded cwd or
+        // directory name that still holds a link (or a "..") must not be
+        // handed to the kernel to follow in the host's namespace. A
+        // canonical base has no link to count.
+        let mut stack: Vec<std::ffi::OsString> = Vec::new();
+        let mut bound = self.bind_at(&stack);
+        let mut pending: VecDeque<Comp> = if path.is_absolute() {
+            path.components().map(to_comp).collect()
         } else {
-            base.components()
-                .filter_map(|c| match c {
-                    Component::Normal(s) => Some(s.to_os_string()),
-                    _ => None,
-                })
+            std::iter::once(Comp::Root)
+                .chain(base.components().map(to_comp))
+                .chain(path.components().map(to_comp))
                 .collect()
         };
-        let mut bound = self.bind_at(&stack);
-        let mut pending: VecDeque<Comp> =
-            path.components().map(to_comp).collect();
         // A trailing slash forces resolution of the final
         // component (kernel directory semantics).
         let force_final = {
@@ -347,19 +832,30 @@ impl RootConfig {
             b.ends_with(b"/") || b.ends_with(b"/.")
         };
         let mut literal: Vec<std::ffi::OsString> = Vec::new();
+        // The tool-view host path of the magic link a Raw hand-over passed to
+        // the kernel, whose literal rest the kernel walks.
+        let mut raw_start: Option<PathBuf> = None;
         let mut unresolved = false;
         let mut hops = 0u32;
+        // The procfs root this walk is inside, once found (policy walks).
+        let mut proc_root: Option<PathBuf> = None;
         while let Some(comp) = pending.pop_front() {
             if !literal.is_empty() {
                 match comp {
                     Comp::Name(s) => literal.push(s),
                     Comp::DotDot => literal.push(std::ffi::OsString::from("..")),
                     Comp::Dot => literal.push(std::ffi::OsString::from(".")),
-                    Comp::Root => {}
+                    Comp::Root | Comp::RerootEnd(_) => {}
                 }
                 continue;
             }
             match comp {
+                Comp::RerootEnd(at) => {
+                    if let Some(n) = links.as_deref() {
+                        debug_assert_eq!(*n, at, "a Reroot's directory re-walk charged a link");
+                    }
+                    let _ = at;
+                }
                 Comp::Root => stack.clear(),
                 Comp::Dot => {}
                 Comp::DotDot => {
@@ -374,14 +870,39 @@ impl RootConfig {
                     // Resolve a symlink at the top first: its
                     // parent is the target's parent, not ours.
                     let host = self.host_of_bound(&stack, bound.as_ref());
-                    match probe(&host) {
+                    let mut read_at = None;
+                    if let Some(policy) = proc {
+                        if let Some((entry, tv)) =
+                            self.proc_class(&host, &mut proc_root, policy, false)
+                        {
+                            if let ProcEntry::Prefix(target) = entry {
+                                // procfs's self/thread-self on top: the
+                                // parent of its target (`[P]` or
+                                // `[P, task, T]`).
+                                stack.pop();
+                                if target.len() > 1 {
+                                    stack.extend(target[..target.len() - 1].iter().cloned());
+                                }
+                                self.rebind(&stack, &mut bound);
+                                continue;
+                            }
+                            read_at = Some(tv);
+                        }
+                    }
+                    let kind = match &read_at {
+                        Some(tv) => probe_uncached(tv),
+                        None => probe(&host),
+                    };
+                    match kind {
                         ProbeKind::Symlink => {
                             hops += 1;
-                            if hops > 40 {
+                            if let Some(n) = links.as_deref_mut() {
+                                take_link(n)?;
+                            } else if hops > 40 {
                                 literal.push(std::ffi::OsString::from(".."));
                                 continue;
                             }
-                            let target = std::fs::read_link(&host)
+                            let target = std::fs::read_link(read_at.as_ref().unwrap_or(&host))
                                 .unwrap_or_default();
                             stack.pop();
                             if target.is_absolute() {
@@ -396,6 +917,12 @@ impl RootConfig {
                         ProbeKind::Dir => {
                             stack.pop();
                         }
+                        ProbeKind::Missing if read_at.is_some() => {
+                            return Err(WalkError::Kernel(libc::ENOENT));
+                        }
+                        ProbeKind::Other if read_at.is_some() => {
+                            return Err(WalkError::Kernel(libc::ENOTDIR));
+                        }
                         ProbeKind::Other | ProbeKind::Missing => {
                             // File/.. : kernel ENOTDIR — keep literal.
                             literal.push(std::ffi::OsString::from(".."));
@@ -406,23 +933,72 @@ impl RootConfig {
                     stack.push(s);
                     // Deepest exact bind wins; re-check on every
                     // push (nested binds /data vs /data/inner).
-                    match self.bind_at(&stack) {
-                        Some(deeper) => {
-                            if std::env::var_os("LITEROOT_DEBUG").is_some() {
-                                eprintln!("literoot: bind_at {stack:?} -> {deeper:?}");
-                            }
-                            bound = Some(deeper)
-                        }
-                        None => {
-                            if let Some((gc, _)) = &bound {
-                                if stack.len() < gc.len()
-                                    || stack[..gc.len()] != gc[..]
-                                {
-                                    bound = None;
+                    let crossed = self.rebind(&stack, &mut bound);
+                    let continuing = !pending.is_empty() || force_final;
+                    let host = self.host_of_bound(&stack, bound.as_ref());
+                    // The real procfs, judged from the host path the walk
+                    // selected: the caller's policy decides at a magic
+                    // link and at self/thread-self, before anything below
+                    // could splice them from the Tool's own process or
+                    // leave them for the kernel to follow on the host.
+                    let mut proc_view: Option<PathBuf> = None;
+                    if let Some(policy) = proc {
+                        if let Some((entry, tv)) =
+                            self.proc_class(&host, &mut proc_root, policy, crossed)
+                        {
+                            if continuing {
+                                match entry {
+                                    ProcEntry::Magic(link) => match policy.traverse(&link, &tv) {
+                                        MagicAction::Walk => {}
+                                        MagicAction::Reroot(dir) => {
+                                            charge(&mut links, &mut hops)?;
+                                            // A fresh walk from the guest
+                                            // directory: what the Tool's own
+                                            // view showed on the way here
+                                            // must not keep a ".." literal.
+                                            unresolved = false;
+                                            let at = links.as_deref().copied().unwrap_or(0);
+                                            let mut rest: VecDeque<Comp> =
+                                                std::iter::once(Comp::Root)
+                                                    .chain(dir.components().map(to_comp))
+                                                    .chain(std::iter::once(Comp::RerootEnd(at)))
+                                                    .collect();
+                                            rest.extend(pending);
+                                            pending = rest;
+                                            continue;
+                                        }
+                                        MagicAction::Raw => {
+                                            charge(&mut links, &mut hops)?;
+                                            if let Some(name) = stack.pop() {
+                                                literal.push(name);
+                                            }
+                                            raw_start = Some(tv.clone());
+                                            continue;
+                                        }
+                                        MagicAction::Refuse(kind) => {
+                                            return Err(WalkError::Refused(kind));
+                                        }
+                                    },
+                                    ProcEntry::Prefix(_) => {
+                                        charge(&mut links, &mut hops)?;
+                                        continue;
+                                    }
+                                    ProcEntry::Inside | ProcEntry::NotProc => {}
                                 }
                             }
+                            proc_view = Some(tv);
                         }
                     }
+                    // Inside procfs the walk passes only what exists, and
+                    // only directories: the kernel's own error otherwise.
+                    let proc_kind = match (continuing, proc_view.as_ref()) {
+                        (true, Some(tv)) => match probe_uncached(tv) {
+                            ProbeKind::Missing => return Err(WalkError::Kernel(libc::ENOENT)),
+                            ProbeKind::Other => return Err(WalkError::Kernel(libc::ENOTDIR)),
+                            k => Some(k),
+                        },
+                        _ => None,
+                    };
                     // Never splice /proc/self (or /proc/<pid>)
                     // itself, or the magic link under it
                     // (fd/exe/cwd/map_files): resolving either
@@ -436,11 +1012,16 @@ impl RootConfig {
                     // /proc/self/root ("/") and re-rooting it
                     // under the rootfs names the guest root,
                     // while passing it through would leak the
-                    // host root to the guest.
-                    let proc_head = stack
-                        .first()
-                        .map(|c| c.as_os_str() == "proc")
-                        .unwrap_or(false)
+                    // host root to the guest. A walk with a policy
+                    // decides those above, from the host path, so the
+                    // spelled rule applies only without one; with one,
+                    // a rootfs `proc/...` that is not the real procfs
+                    // is an ordinary rootfs entry.
+                    let proc_head = proc.is_none()
+                        && stack
+                            .first()
+                            .map(|c| c.as_os_str() == "proc")
+                            .unwrap_or(false)
                         && (stack.len() <= 2
                             || (stack.len() == 3
                                 && matches!(
@@ -454,16 +1035,24 @@ impl RootConfig {
                         .as_ref()
                         .map(|(gc, _)| stack.len() == gc.len())
                         .unwrap_or(false);
-                    if (!pending.is_empty() || force_final) && !proc_head && !at_bound_root {
+                    if continuing && !proc_head && !at_bound_root {
                         // Intermediate component: resolve symlink
                         // splice; stop at nonexistent (literal tail).
-                        let host = self.host_of_bound(&stack, bound.as_ref());
-                        match probe(&host) {
+                        let kind = match proc_kind {
+                            Some(k) => k,
+                            None => probe(&host),
+                        };
+                        match kind {
                             ProbeKind::Symlink => {
                                 hops += 1;
-                                if hops <= 40 {
-                                    let target = std::fs::read_link(&host)
-                                        .unwrap_or_default();
+                                let splice = match links.as_deref_mut() {
+                                    Some(n) => take_link(n).map(|()| true)?,
+                                    None => hops <= 40,
+                                };
+                                if splice {
+                                    let target =
+                                        std::fs::read_link(proc_view.as_ref().unwrap_or(&host))
+                                            .unwrap_or_default();
                                     stack.pop();
                                     if target.is_absolute() {
                                         stack.clear();
@@ -490,13 +1079,34 @@ impl RootConfig {
         if bound.is_none() {
             bound = self.bind_at(&stack);
         }
+        // After a Raw hand-over the kernel walks the literal rest with the
+        // budget this walk has left: its intermediate links count now (the
+        // final component is the caller's to follow or not). A trailing
+        // slash or "/." makes the kernel follow the final component too,
+        // whatever the call (even O_NOFOLLOW), and the caller's final-link
+        // check cannot see a link behind the slash, so it counts here, once,
+        // as an intermediate one.
+        if let (Some(start), Some(n)) = (raw_start.as_ref(), links.as_deref_mut()) {
+            use std::os::unix::ffi::OsStrExt as _;
+            let raw = path.as_os_str().as_bytes();
+            let slash_forced = raw.ends_with(b"/") || raw.ends_with(b"/.");
+            let mut tail = literal[1..].to_vec();
+            if slash_forced {
+                tail.push(std::ffi::OsString::from("."));
+            }
+            if tail.len() > 1 {
+                count_raw_tail(start, &tail, n)?;
+            }
+        }
         // Trailing "/." (invisible to Path::components) forces
         // directory semantics in the kernel: keep it literal
         // when the final component is not a plain directory.
         {
             use std::os::unix::ffi::OsStrExt as _;
             let raw = path.as_os_str().as_bytes();
-            if (raw.ends_with(b"/.") || raw.ends_with(b"/./")) && literal.is_empty() && !stack.is_empty() {
+            // After a Raw hand-over too (a literal tail): dropping it there
+            // made the kernel see the bare final component.
+            if (raw.ends_with(b"/.") || raw.ends_with(b"/./")) && !(literal.is_empty() && stack.is_empty()) {
                 // Always preserve: kernel handles "d/." (open
                 // succeeds, rmdir EINVAL, readlink EINVAL) —
                 // collapsing it changes all three.
@@ -517,26 +1127,134 @@ impl RootConfig {
             }
             bytes.extend_from_slice(c.as_os_str().as_bytes());
         }
-        (PathBuf::from(std::ffi::OsString::from_vec(bytes)), bound)
+        Ok((PathBuf::from(std::ffi::OsString::from_vec(bytes)), bound))
+    }
+
+    /// Bind bookkeeping after the stack changed: the deepest bind whose
+    /// guest prefix equals the stack wins (nested binds /data vs
+    /// /data/inner), and a bind the stack left is dropped. True when a bind
+    /// was crossed exactly here.
+    fn rebind(
+        &self,
+        stack: &[std::ffi::OsString],
+        bound: &mut Option<(Vec<std::ffi::OsString>, PathBuf)>,
+    ) -> bool {
+        match self.bind_at(stack) {
+            Some(deeper) => {
+                if std::env::var_os("LITEROOT_DEBUG").is_some() {
+                    eprintln!("literoot: bind_at {stack:?} -> {deeper:?}");
+                }
+                *bound = Some(deeper);
+                true
+            }
+            None => {
+                if let Some((gc, _)) = bound.as_ref() {
+                    if stack.len() < gc.len() || stack[..gc.len()] != gc[..] {
+                        *bound = None;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// The procfs class of a walk's host path, with its tool-view path.
+    /// The walk enters procfs only at a component whose name procfs uses
+    /// for a process or for itself (`self`, `thread-self`, digits), or at a
+    /// bind's host root, and only when its parent is on procfs; below the
+    /// root it found, every entry is classified.
+    fn proc_class(
+        &self,
+        host: &Path,
+        proc_root: &mut Option<PathBuf>,
+        policy: &dyn ProcLinks,
+        crossed: bool,
+    ) -> Option<(ProcEntry, PathBuf)> {
+        if let Some(root) = proc_root.as_ref() {
+            if host.starts_with(root) && host != root.as_path() {
+                return entry_under(root, host, policy);
+            }
+        }
+        let name = host.file_name()?.to_str()?;
+        let hint = matches!(name, "self" | "thread-self")
+            || (!name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()));
+        if !hint && !crossed {
+            return None;
+        }
+        let root = procfs_root_of(host)?;
+        let found = entry_under(&root, host, policy);
+        *proc_root = Some(root);
+        found
     }
 
     /// Translate a guest path to its host path. `cwd` is the guest cwd
     /// from replicated per-process state; `dirfd_guest` is the guest
     /// path denoted by a real dirfd, when the call is fd-relative.
     pub fn translate(&self, path: &Path, cwd: &Path, dirfd_guest: Option<&Path>) -> PathBuf {
+        match self.translate_links(path, cwd, dirfd_guest, None, None) {
+            Ok(host) => host,
+            Err(_) => unreachable!("an uncounted walk with no policy cannot fail"),
+        }
+    }
+
+    /// [`Self::translate`] for a guest path walk: the symlinks it splices
+    /// count against `links`, shared with the rest of the walk, and more
+    /// than [`MAX_SYMLINKS`] in all is [`TooManyLinks`] (the guest's
+    /// ELOOP) instead of a host path that still holds a link for the
+    /// kernel to follow in the host's namespace.
+    pub fn translate_counted(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        dirfd_guest: Option<&Path>,
+        links: &mut u32,
+    ) -> Result<PathBuf, TooManyLinks> {
+        self.translate_links(path, cwd, dirfd_guest, Some(links), None)
+            .map_err(|e| match e {
+                WalkError::TooManyLinks => TooManyLinks,
+                WalkError::Refused(_) | WalkError::Kernel(_) => {
+                    unreachable!("a walk with no policy refuses nothing")
+                }
+            })
+    }
+
+    /// [`Self::translate_counted`] for a walk on a guest's behalf: `proc`
+    /// answers at every /proc magic link (see [`ProcLinks`]), and may
+    /// refuse ([`WalkError::Refused`]).
+    pub fn translate_walk(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        dirfd_guest: Option<&Path>,
+        links: &mut u32,
+        proc: &dyn ProcLinks,
+    ) -> Result<PathBuf, WalkError> {
+        self.translate_links(path, cwd, dirfd_guest, Some(links), Some(proc))
+    }
+
+    fn translate_links(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        dirfd_guest: Option<&Path>,
+        mut links: Option<&mut u32>,
+        proc: Option<&dyn ProcLinks>,
+    ) -> Result<PathBuf, WalkError> {
         // Empty path (AT_EMPTY_PATH): denotes the dirfd itself.
         if path.as_os_str().is_empty() {
             if let Some(d) = dirfd_guest {
-                return self.translate_absolute(&self.canonicalize(Path::new("/"), d));
+                let (dir, _) =
+                    self.canonicalize_inner(Path::new("/"), d, links.as_deref_mut(), proc)?;
+                return Ok(self.translate_absolute(&dir));
             }
-            return self.rootfs.clone();
+            return Ok(self.rootfs.clone());
         }
         let (guest_abs, bound) = if path.is_absolute() {
-            self.canonicalize_inner(Path::new("/"), path)
+            self.canonicalize_inner(Path::new("/"), path, links, proc)?
         } else if let Some(d) = dirfd_guest {
-            self.canonicalize_inner(d, path)
+            self.canonicalize_inner(d, path, links, proc)?
         } else {
-            self.canonicalize_inner(cwd, path)
+            self.canonicalize_inner(cwd, path, links, proc)?
         };
         let mut host = match &bound {
             Some(_) => {
@@ -565,7 +1283,7 @@ impl RootConfig {
                 host = PathBuf::from(std::ffi::OsString::from_vec(b));
             }
         }
-        host
+        Ok(host)
     }
 
     fn translate_absolute(&self, guest_abs: &Path) -> PathBuf {
@@ -595,52 +1313,6 @@ impl RootConfig {
             }
             None => {
                 let suffix = guest_abs.strip_prefix("/").unwrap_or(guest_abs);
-                let mut p = self.rootfs.clone();
-                if !suffix.as_os_str().is_empty() {
-                    p.push(suffix);
-                }
-                p
-            }
-        }
-    }
-
-    /// Translate WITHOUT lexical normalization (magic /proc paths):
-    /// longest bind guest-prefix match on the raw path, else
-    /// rootfs + raw path. Relative paths join the guest cwd raw.
-    pub fn translate_raw(&self, path: &Path, cwd: &Path) -> PathBuf {
-        use std::os::unix::ffi::OsStrExt as _;
-        let abs: PathBuf = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            let mut p = cwd.to_path_buf();
-            p.push(path);
-            p
-        };
-        let mut best: Option<&Bind> = None;
-        for b in &self.binds {
-            if abs.starts_with(&b.guest) {
-                if best
-                    .map(|p: &Bind| {
-                        b.guest.components().count() > p.guest.components().count()
-                    })
-                    .unwrap_or(true)
-                {
-                    best = Some(b);
-                }
-            }
-        }
-        let _ = abs.as_os_str().as_bytes();
-        match best {
-            Some(b) => {
-                let suffix = abs.strip_prefix(&b.guest).unwrap_or(Path::new(""));
-                let mut p = b.host.clone();
-                if !suffix.as_os_str().is_empty() {
-                    p.push(suffix);
-                }
-                p
-            }
-            None => {
-                let suffix = abs.strip_prefix("/").unwrap_or(&abs);
                 let mut p = self.rootfs.clone();
                 if !suffix.as_os_str().is_empty() {
                     p.push(suffix);

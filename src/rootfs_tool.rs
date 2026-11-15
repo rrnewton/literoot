@@ -26,6 +26,7 @@ use reverie::syscalls::MemoryAccess as _;
 use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo as _;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
@@ -79,6 +80,13 @@ pub struct LiterootConfig {
     /// EPERM, outside-pid SEIZE etc. work).
     #[serde(default)]
     pub refuse_guest_ptrace: bool,
+    /// Refuse a guest call that would turn syscall user dispatch on
+    /// (prctl(PR_SET_SYSCALL_USER_DISPATCH) with a mode other than OFF)
+    /// with EOPNOTSUPP (in-guest backends only, set by the launcher on the
+    /// same line as `refuse_guest_ptrace`). Under the ptrace backend this
+    /// is false: dispatch works natively there and the Tool reads the mode.
+    #[serde(default)]
+    pub refuse_guest_dispatch: bool,
     /// Guest path of the initial program (argv-resolved).
     pub initial_exe: String,
     /// Full initial argv as spelled on the literoot command
@@ -91,6 +99,13 @@ pub struct LiterootConfig {
 }
 
 impl LiterootConfig {
+    /// Whether the Tool runs inside the guest process (trap, liteinst): the
+    /// launcher sets `refuse_guest_ptrace` exactly for those backends
+    /// (tool.rs, the in-guest config).
+    pub(crate) fn tool_in_guest(&self) -> bool {
+        self.refuse_guest_ptrace
+    }
+
     pub(crate) fn to_root_config(&self) -> RootConfig {
         let mut c = RootConfig::new(
             PathBuf::from(&self.rootfs),
@@ -137,6 +152,144 @@ pub enum Refusal {
     Unsupported(UnsupportedKind),
     /// A refusal literoot's own Tool makes.
     Guest(GuestKind),
+    /// A path refusal by name (`refused path <kind>`), one per refused call.
+    Path(crate::translate::PathRefusal),
+    /// Not a refusal: a native answer literoot gave for a path in a deleted
+    /// directory (`answered path <kind>`), one per call.
+    Answered(PathAnswer),
+    /// Not a refusal: a note of something the guest did (`note ...`, or the
+    /// install-attempt line).
+    Note(Note),
+    /// Not a refusal: one of a process's exit summaries, sent only in its
+    /// exit drain. The launcher adds the batch's receipt ID when it writes it.
+    Summary(Summary),
+    /// A guest seccomp filter install refused at once because probes of the
+    /// same thread group were in flight (S.3): their number.
+    InstallRefused { in_flight: u32 },
+}
+
+/// The notes [`Refusal::Note`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Note {
+    /// A guest seccomp filter install is about to be injected (written
+    /// before the injection, so it records the attempt, not its result).
+    FilterInstallAttempted,
+    /// The constructor's dispatch OFF call answered EINVAL where that is
+    /// independent evidence that the kernel has no syscall user dispatch.
+    SudAbsent,
+}
+
+/// A process's exit summaries. `pid` is the pid as the Tool sees it (local
+/// to the process's pid namespace in-guest), a diagnostic. `kernel_id` is
+/// the pidfs inode (Linux 6.9+, else 0): kernel metadata, not
+/// authenticated, not the identity; tracer-collected on ptrace only; 0 =
+/// uncollected. The identity is the receipt ID the launcher assigns to the
+/// whole exit batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Summary {
+    /// `guest seccomp filter summary`, for a process with installs or a set
+    /// flag.
+    Seccomp {
+        pid: i32,
+        /// Kernel metadata, not authenticated, not the identity;
+        /// tracer-collected on ptrace only; 0 = uncollected.
+        kernel_id: u64,
+        flag: crate::dead_base::FlagState,
+        installs: u64,
+        installs_refused: u64,
+        translated: u64,
+        refused: u64,
+        /// The best-effort filter-count detector's refusals; defeatable by a
+        /// guest that jumps to a trusted gate.
+        unseen_best_effort: u64,
+    },
+    /// `probe summary`, for a process with probes.
+    Probe {
+        pid: i32,
+        /// Kernel metadata, not authenticated, not the identity;
+        /// tracer-collected on ptrace only; 0 = uncollected.
+        kernel_id: u64,
+        probes: u64,
+        sud_refused: u64,
+        sud_fallback: u64,
+    },
+}
+
+impl Summary {
+    /// The side-log line, with the batch's receipt ID.
+    pub fn line(self, receipt: crate::refusal_log::ReceiptId) -> String {
+        match self {
+            Summary::Seccomp {
+                pid,
+                kernel_id,
+                flag,
+                installs,
+                installs_refused,
+                translated,
+                refused,
+                unseen_best_effort,
+            } => format!(
+                "literoot: guest seccomp filter summary pid={pid} receipt_id={receipt} \
+                 kernel_id={kernel_id} flag={} installs={installs} \
+                 installs_refused={installs_refused} translated={translated} refused={refused} \
+                 unseen_best_effort={unseen_best_effort}",
+                flag.token()
+            ),
+            Summary::Probe {
+                pid,
+                kernel_id,
+                probes,
+                sud_refused,
+                sud_fallback,
+            } => format!(
+                "literoot: probe summary pid={pid} receipt_id={receipt} kernel_id={kernel_id} \
+                 probes={probes} sud_refused={sud_refused} sud_fallback={sud_fallback}"
+            ),
+        }
+    }
+}
+
+// PathRefusal lives in translate.rs, which the translation-only build
+// compiles without serde, so its wire form is written here, where every
+// build that sends it has serde: its index in PATH_REFUSALS, as a u32, the
+// same value as a derived unit variant's index.
+impl Serialize for crate::translate::PathRefusal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let index = crate::translate::PATH_REFUSALS
+            .iter()
+            .position(|k| k == self)
+            .expect("PATH_REFUSALS lists every PathRefusal");
+        serializer.serialize_u32(index as u32)
+    }
+}
+
+impl<'de> Deserialize<'de> for crate::translate::PathRefusal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let index = u32::deserialize(deserializer)?;
+        crate::translate::PATH_REFUSALS
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom(format!("no path refusal kind {index}")))
+    }
+}
+
+/// The native answers `answered path <kind>` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathAnswer {
+    /// ENOENT for a name in a deleted directory.
+    DeadBaseName,
+    /// EACCES from the guest's own search check of a deleted base.
+    DeadBaseSearch,
+}
+
+impl PathAnswer {
+    /// The side-log token.
+    pub fn token(self) -> &'static str {
+        match self {
+            PathAnswer::DeadBaseName => "dead_base_name",
+            PathAnswer::DeadBaseSearch => "dead_base_search",
+        }
+    }
 }
 
 /// The fork-like kinds of the runtime's record: `clone` split by
@@ -187,11 +340,23 @@ pub enum GuestKind {
     /// AT_EGID), which the ptrace backend applies at the exec stop, is not
     /// implemented in-guest.
     FakeIdAuxv,
+    /// A guest call that would turn syscall user dispatch on, refused: the
+    /// prctl with EOPNOTSUPP, or the ptrace(PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG)
+    /// that in-guest backends refuse with EPERM. One kind for both.
+    SyscallUserDispatch,
 }
 
 impl Refusal {
-    /// The side-log line.
+    /// The side-log line of a refusal written on its own. A summary gets a
+    /// receipt of its own; a batch uses [`Refusal::line_in_batch`].
     pub fn line(self) -> String {
+        self.line_in_batch(&mut None)
+    }
+
+    /// The side-log line of one refusal of a batch: every summary of the
+    /// batch carries the one receipt ID, issued at the batch's first
+    /// summary.
+    pub fn line_in_batch(self, receipt: &mut Option<crate::refusal_log::ReceiptId>) -> String {
         let kind = |k: ForkKind| match k {
             ForkKind::CloneThread => "clone_thread",
             ForkKind::CloneProcess => "clone_process",
@@ -216,8 +381,26 @@ impl Refusal {
                     GuestKind::DomainnameWrite => "domainname_write",
                     GuestKind::KompatAuxv => "kompat_auxv",
                     GuestKind::FakeIdAuxv => "fake_id_auxv",
+                    GuestKind::SyscallUserDispatch => "syscall_user_dispatch",
                 }
             ),
+            // Not a refusal: the kernel's own cmdline file answered
+            // (§4.9.1). The line text is not part of the wire.
+            Refusal::Path(k @ crate::translate::PathRefusal::SyntheticFileUnavailable) => {
+                format!("literoot: answered path {}", k.token())
+            }
+            Refusal::Path(k) => format!("literoot: refused path {}", k.token()),
+            Refusal::Answered(k) => format!("literoot: answered path {}", k.token()),
+            Refusal::Note(Note::FilterInstallAttempted) => {
+                "literoot: guest seccomp filter install attempted".into()
+            }
+            Refusal::Note(Note::SudAbsent) => "literoot: note sud_absent".into(),
+            Refusal::Summary(s) => {
+                s.line(*receipt.get_or_insert_with(crate::refusal_log::next_summary_receipt))
+            }
+            Refusal::InstallRefused { in_flight } => {
+                format!("literoot: refused seccomp_install probes_in_flight in_flight={in_flight}")
+            }
         }
     }
 }
@@ -241,7 +424,7 @@ pub static REPORTER_ACKNOWLEDGED: std::sync::atomic::AtomicBool =
 pub(crate) static PENDING_GUEST_REFUSALS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-pub(crate) const GUEST_KINDS: [GuestKind; 7] = [
+pub(crate) const GUEST_KINDS: [GuestKind; 8] = [
     GuestKind::Ptrace,
     GuestKind::SelfStop,
     GuestKind::SharedRecordPublish,
@@ -249,7 +432,236 @@ pub(crate) const GUEST_KINDS: [GuestKind; 7] = [
     GuestKind::DomainnameWrite,
     GuestKind::KompatAuxv,
     GuestKind::FakeIdAuxv,
+    GuestKind::SyscallUserDispatch,
 ];
+
+/// Path refusals and answers the Tool made in this process and has not yet
+/// reported, in order: unlike the guest kinds, every occurrence is a line.
+/// The in-guest wiring takes them at its next drain. Process-wide: a test
+/// that reads or drains it (or [`PENDING_GUEST_REFUSALS`]) must hold the
+/// seam units' serial lock, or the units' report checks become flaky.
+pub(crate) static PENDING_PATH_REPORTS: Mutex<Vec<Refusal>> = Mutex::new(Vec::new());
+
+/// Note one path refusal or answer: written at once where the side log is
+/// open here (the ptrace backend), queued for the drain in a guest process.
+fn note_path_report(report: Refusal) {
+    if crate::refusal_log::is_open() {
+        crate::refusal_log::write_line(&report.line());
+    } else {
+        PENDING_PATH_REPORTS.lock().unwrap().push(report);
+    }
+}
+
+/// The kernel's `struct ptrace_sud_config` (include/uapi/linux/ptrace.h).
+#[repr(C)]
+#[derive(Default)]
+struct PtraceSudConfig {
+    mode: u64,
+    selector: u64,
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`RootfsTool::shared_process_record`] looks the
+    /// pid up in these rows on the calling thread instead of the store.
+    pub(crate) static SHARED_ROW_SEAM: std::cell::RefCell<Option<Vec<ProcessRecord>>> =
+        const { std::cell::RefCell::new(None) };
+    /// With the row seam set: how many more lookups find a row (None: all
+    /// of them), so a unit can make a row vanish between two lookups.
+    pub(crate) static SHARED_ROW_SEAM_LOOKUPS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seams for [`RootfsTool::open_argv_memfd`]'s Tool-side write on
+    /// the calling thread: skip the pidfd route (so the /proc/<tid>/fd
+    /// route writes), and make the write fail (so the memfd is closed and
+    /// the kernel's file answers).
+    pub(crate) static MEMFD_PIDFD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static MEMFD_WRITE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The route that last wrote a memfd on this thread, so a unit can tell
+    /// a pidfd write from a fall back to /proc/<tid>/fd.
+    pub(crate) static MEMFD_ROUTE: std::cell::Cell<Option<MemfdRoute>> = const { std::cell::Cell::new(None) };
+    /// The ptrace cmdline route reports itself unusable (a non-dumpable
+    /// tracer).
+    pub(crate) static TRACER_ROUTE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A magic link's identity check fails, as when its process moves
+    /// between the readlink and the stat.
+    pub(crate) static LINK_IDENTITY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A magic link's readlink answers this path instead, as when the text
+    /// names another object than the link (a moved or shadowed directory):
+    /// the identity check must refuse it.
+    pub(crate) static LINK_TARGET_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The tracer cannot inspect the guest's descriptors, as for a
+    /// non-dumpable guest (such a guest still reads
+    /// the synthesized argv).
+    pub(crate) static GUEST_FDS_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`LayoutCopy::new`]'s mprotect fails and leaves the page as it was,
+    /// as when a filter on the tracer answers it EPERM.
+    pub(crate) static LAYOUT_COPY_PROTECT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many [`LayoutCopy`] mappings made on this thread are still
+    /// mapped, so a unit can tell that a refused copy was unmapped.
+    pub(crate) static LAYOUT_COPY_LIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The route [`write_guest_fd`] wrote through (test record).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemfdRoute {
+    Pidfd,
+    Procfs,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`read_dispatch_config`] answers this on the
+    /// calling thread instead of asking the kernel.
+    pub(crate) static DISPATCH_READ_SEAM: std::cell::Cell<Option<Result<bool, i32>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG on tracee `tid`, from the
+/// tracer: whether its mode is ON, or the errno.
+fn read_dispatch_config(tid: i32) -> Result<bool, i32> {
+    #[cfg(test)]
+    if let Some(answer) = DISPATCH_READ_SEAM.with(|s| s.get()) {
+        return answer;
+    }
+    let mut config = PtraceSudConfig::default();
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            crate::dead_base::PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG as libc::c_long,
+            tid as libc::c_long,
+            std::mem::size_of::<PtraceSudConfig>() as libc::c_long,
+            &mut config as *mut PtraceSudConfig,
+        )
+    };
+    if r < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(config.mode != 0)
+    }
+}
+
+/// Set by the first [`note_dispatch_fallback`] of the run.
+static DISPATCH_FALLBACK_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write `literoot: sud config read unavailable errno=<name>` once per run,
+/// at the first probe whose mode falls back to tracking (ptrace backend).
+fn note_dispatch_fallback(errno: i32) {
+    if !DISPATCH_FALLBACK_NOTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        crate::refusal_log::write_line(&dispatch_fallback_line(errno));
+    }
+}
+
+/// The fallback line for `errno`, one of the three that fall back.
+fn dispatch_fallback_line(errno: i32) -> String {
+    let name = match errno {
+        libc::EIO => "EIO",
+        libc::EINVAL => "EINVAL",
+        _ => "ENOSYS",
+    };
+    format!("literoot: sud config read unavailable errno={name}")
+}
+
+/// The filter count expected right after arming in this image: set by the
+/// preload constructor to P + 1 before Reverie's single in-process install
+/// (P read before it), or 1 on the mapped route, where the image controller
+/// verifies Reverie's one filter (that route is not wired yet). Unset
+/// (u32::MAX), it is unknown, and the detector refuses probes. A fork child
+/// inherits it with the address space; exec starts a new image.
+static FILTER_BASELINE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Set this image's filter-count baseline (the expected count after arming).
+#[allow(dead_code)] // The preload constructor is its caller.
+pub(crate) fn set_filter_baseline(expected: u32) {
+    FILTER_BASELINE.store(expected, std::sync::atomic::Ordering::Release);
+}
+
+/// This image's filter-count baseline, if set.
+fn filter_baseline() -> Option<u32> {
+    let n = FILTER_BASELINE.load(std::sync::atomic::Ordering::Acquire);
+    (n != u32::MAX).then_some(n)
+}
+
+/// The pidfs inode of process `pid`, through a pidfd the caller (the
+/// ptrace tracer) opens and closes itself: None before Linux 6.9, where a
+/// pidfd is an anonymous inode that names no process, or on any failure.
+fn pidfs_inode(pid: i32) -> Option<u64> {
+    // include/uapi/linux/magic.h
+    const PID_FS_MAGIC: i64 = 0x5049_4446;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as libc::c_int;
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let on_pidfs = unsafe { libc::fstatfs(fd, &mut fs) } == 0 && fs.f_type as i64 == PID_FS_MAGIC;
+    let ino = (on_pidfs && unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino as u64);
+    unsafe { libc::close(fd) };
+    ino
+}
+
+/// Report a note at once, before the call it precedes: written directly
+/// where the side log is open here (the ptrace backend), sent to the
+/// launcher from a guest process, where a queued note would be lost with
+/// the process if that call kills it.
+async fn note_now<T: Guest<RootfsTool>>(guest: &T, note: Note) {
+    if crate::refusal_log::is_open() {
+        crate::refusal_log::write_line(&Refusal::Note(note).line());
+    } else if guest.config().tool_in_guest() { // note_now: sends the note itself
+        guest.send_rpc(Refused(vec![Refusal::Note(note)])).await;
+    }
+}
+
+/// An install between its gate and its result (S.3). Dropped
+/// without [`PendingInstall::finish`] (the installer's handler was
+/// cancelled: a sibling's exec, exit_group, SIGKILL), it gives
+/// install_pending back, and sets the flag if the injection may have run.
+struct PendingInstall<'a> {
+    state: &'a Mutex<ProcState>,
+    pid: i32,
+    ticket: Option<crate::dead_base::InstallTicket>,
+    injecting: bool,
+}
+
+impl PendingInstall<'_> {
+    /// The injection's result: a value, or a negative errno.
+    fn finish(mut self, result: i64) {
+        if let Some(ticket) = self.ticket.take() {
+            let mut st = self.state.lock().unwrap();
+            st.admission(self.pid).finish_install(ticket, Some(result));
+        }
+    }
+}
+
+impl Drop for PendingInstall<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        // No panic here: a poisoned lock still holds the record.
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let admission = st.admission(self.pid);
+        if self.injecting {
+            admission.finish_install(ticket, None);
+        } else {
+            admission.abandon_install(ticket);
+        }
+    }
+}
+
+/// Note the refusal a failed walk makes by name, if it is one.
+fn note_walk_error(e: &crate::translate::WalkError) {
+    if let crate::translate::WalkError::Refused(kind) = e {
+        note_path_report(Refusal::Path(*kind));
+    }
+}
 
 /// Note a refusal the Tool made. Where the Tool runs in the launcher
 /// process (the ptrace backend) the side log is open here and the line is
@@ -278,10 +690,36 @@ impl GlobalTool for LiterootGlobal {
 
     async fn receive_rpc(&self, _from: Pid, msg: Refused) {
         REPORTER_ACKNOWLEDGED.store(true, std::sync::atomic::Ordering::SeqCst);
+        // One receipt per batch: an exit drain's summaries are one
+        // process's emission.
+        let mut receipt = None;
         for refusal in msg.0 {
-            crate::refusal_log::write_line(&refusal.line());
+            crate::refusal_log::write_line(&refusal.line_in_batch(&mut receipt));
         }
     }
+}
+
+/// A per-dispatch translation memo key: (dispatch counter, dirfd, guest
+/// path, final symlink followed).
+type MemoKey = (u64, i32, PathBuf, bool);
+/// A translation: the host path, the symlinks its walk followed, the guest
+/// route it came through (None when the name went to the kernel as is),
+/// and whether it went through another process's directory link.
+type Walked = (PathBuf, u32, Option<PathBuf>, OtherLink);
+
+/// Whether a walk went through another process's directory link (`root`,
+/// `cwd`, a directory `fd/<n>`), and how.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OtherLink {
+    /// No such link.
+    #[default]
+    None,
+    /// Continued from the directory's verified guest path: the route names
+    /// where the walk landed.
+    Spliced,
+    /// Handed to the kernel with the rest of the path: the route past it
+    /// names no stable guest directory.
+    Raw,
 }
 
 /// Per-process replicated state (design §6).
@@ -307,14 +745,26 @@ pub(crate) struct ProcState {
     pub(crate) bootstrapped: bool,
     /// Emulated chroot: host directory acting as the new root.
     pub(crate) root_override: Option<PathBuf>,
-    /// Guest scratch page (injected mmap) for execve path
-    /// staging: guest-stack staging corrupts the execve
-    /// caller's frame in interp-route processes (measured
-    /// EFAULT on second execve, test-execve-eacces-enoexec).
-    pub(crate) scratch: Option<usize>,
+    /// The current image's number, for the scratch pages: each thread
+    /// stages in a page of its own ([`RootfsThreadState::scratch`]),
+    /// tagged with the image it was mapped in. Exec draws a new one, so a
+    /// page of the old image is never reused. Numbers come from one
+    /// process-wide counter ([`next_scratch_image`]), so no two images
+    /// share one: on ptrace a fork child's fresh state would otherwise
+    /// count from 0 again and match the tag of the page it inherited.
+    pub(crate) scratch_image: u64,
+    /// Scratch pages of this image's exited threads, for the next new
+    /// thread (zeroed before reuse): thread churn reuses pages rather
+    /// than mapping one per thread ever created. Cleared at exec.
+    pub(crate) free_scratch: Vec<usize>,
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
     pub(crate) exe_guest: PathBuf,
+    /// `exe_guest` is a HOST path: the file an execve reached through
+    /// another process's directory link has no guest name.
+    /// An open of the own exe opens that file as is,
+    /// readlink answers it, and the shared row publishes no exe.
+    pub(crate) exe_host: bool,
     /// As-exec'd argv of the current image (cmdline synthesis).
     pub(crate) argv: Vec<Vec<u8>>,
     /// Stateful fake identity (r/e/s uid+gid) under -0/-i:
@@ -330,7 +780,24 @@ pub(crate) struct ProcState {
     /// dispatch counter below. Never lives across dispatches, so no
     /// cross-syscall staleness is possible.
     pub(crate) dispatch_seq: u64,
-    pub(crate) translate_memo: Vec<((u64, i32, PathBuf, bool), PathBuf)>,
+    /// Per-dispatch translations, with the symlinks each walk followed and
+    /// the guest route it came through.
+    pub(crate) translate_memo: Vec<(MemoKey, Result<Walked, crate::translate::WalkError>)>,
+    /// The (dispatch, dirfd) bases whose ".." climb out of a deleted
+    /// directory the guest's own search check passed in this dispatch
+    /// (E1): only those climbs translate.
+    pub(crate) searched_bases: Vec<(u64, i32)>,
+    /// The dispatch whose dead-base gate was found closed at the top of the
+    /// route (S.3 placement), with the dispatch mode it read: the arm's own
+    /// dead-base refusal counts it once (`probes`, `refused`, `sud_refused`).
+    /// One slot per process, keyed by the shared `dispatch_seq`: when sibling
+    /// threads dispatch at once, a closed-gate count can be lost or land on
+    /// another thread's dispatch. Only these diagnostic counters can be
+    /// wrong; the refusal itself never depends on the slot. Same class as
+    /// `translate_memo` and `searched_bases`.
+    pub(crate) gate_closed_at: Option<GateClosed>,
+    /// Probe admission for this thread group (S.3).
+    pub(crate) admission: crate::dead_base::Admission,
     /// RootConfig built for the current dispatch (same keying: a
     /// RootConfig rebuild re-canonicalizes every bind prefix, which
     /// probes the host filesystem; several helpers per dispatch ask
@@ -419,6 +886,29 @@ pub(crate) struct DirStream {
 }
 
 impl ProcState {
+    /// Exec's new image for the scratch pages: the number advances, so a
+    /// page of the old image (a thread exec killed holds one) is never
+    /// queued, and the queued ones, unmapped now, are dropped.
+    pub(crate) fn new_scratch_image(&mut self) {
+        self.scratch_image = next_scratch_image();
+        self.free_scratch.clear();
+    }
+
+    /// This process's S.3 record, made its own first (a fork child's copy
+    /// of its parent's record is replaced: `Admission::adopt`).
+    pub(crate) fn admission(&mut self, pid: i32) -> &mut crate::dead_base::Admission {
+        self.admission.adopt(pid);
+        &mut self.admission
+    }
+
+    /// A new thread group starts here (its first thread's start carried
+    /// the flag its parent's clone staged): its record replaces whatever
+    /// this state held, whatever the pid.
+    pub(crate) fn start_new_group(&mut self, pid: i32, group: crate::dead_base::NewGroup) {
+        self.admission = crate::dead_base::Admission::for_child(group);
+        self.admission.adopt(pid);
+    }
+
     /// The fd-number state of table `files` (empty if it has none yet).
     pub(crate) fn fdt(&self, files: FilesId) -> &FdTable {
         static EMPTY: std::sync::LazyLock<FdTable> = std::sync::LazyLock::new(FdTable::default);
@@ -530,12 +1020,17 @@ impl Default for RootfsTool {
                 next_stream: 0,
                 bootstrapped: false,
                 root_override: None,
-                scratch: None,
+                scratch_image: next_scratch_image(),
+                free_scratch: Vec::new(),
                 exe_guest: PathBuf::new(),
+                exe_host: false,
                 fake: None,
                 fake_fs: None,
                 dispatch_seq: 0,
                 translate_memo: Vec::new(),
+                searched_bases: Vec::new(),
+                gate_closed_at: None,
+                admission: Default::default(),
                 config_memo: None,
                 kill_registered: false,
                 swallow_next_self_stop: false,
@@ -563,6 +1058,51 @@ pub struct RootfsThreadState {
     /// or MAIN_FILES of a new process. Cleared after the inject.
     #[serde(default)]
     pub child_files: Option<FilesId>,
+    /// Staged by a process-creating clone handler: what the new thread
+    /// group's S.3 record starts with (`Admission::new_group`: the
+    /// conservative flag and the expected-count addend). Staged for every
+    /// process-creating clone, independent of the fork seed, so it is never
+    /// lost. Cleared after the inject.
+    #[serde(default)]
+    pub child_group: Option<crate::dead_base::NewGroup>,
+    /// A new thread group's first thread: what its record starts with,
+    /// applied at its start (the lifecycle signal of a new group).
+    #[serde(default)]
+    pub new_group: Option<crate::dead_base::NewGroup>,
+    /// Staged by a clone handler whose child would share this process's
+    /// address space, and so its S.3 record, in-guest
+    /// ([`shares_record_in_guest`]). Cleared after the inject.
+    #[serde(default)]
+    pub child_shares_record: bool,
+    /// This thread's tracked syscall-user-dispatch mode (true = ON), from
+    /// its own prctl calls (C1.1, C2.2). A new thread starts OFF, as the
+    /// kernel clears it (kernel/fork.c), and exec resets it.
+    #[serde(default)]
+    pub sud_on: bool,
+    /// This thread's scratch page, where it stages the paths, names and
+    /// arguments of its injections. One per thread: a page shared by the
+    /// process's threads let one thread's staging overwrite another's
+    /// before that one's call read it. None until first used.
+    #[serde(default)]
+    pub scratch: Option<ScratchPage>,
+    /// Staged by a clone handler for the task it creates: the caller's
+    /// page for a new process that cannot run while the caller stages
+    /// (fork's copy is the child's own; a vfork caller is suspended until
+    /// the child execs or exits), else none, as for a thread or a
+    /// CLONE_VM process. Cleared after the inject.
+    #[serde(default)]
+    pub child_scratch: Option<ScratchPage>,
+}
+
+/// A thread's scratch slot (4096 bytes of an injected anonymous mmap) and
+/// the image it was mapped in ([`ProcState::scratch_image`]). On a 64 KiB
+/// kernel the 16 slots of one mmap share one kernel page with no guard page
+/// between them, so the explicit length checks are what bound every staged
+/// write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchPage {
+    pub addr: usize,
+    pub image: u64,
 }
 
 // A wrapping Tool with the same thread state forwards its guest to
@@ -666,6 +1206,45 @@ fn report_shared_record_refusal(
 }
 
 impl RootfsTool {
+    /// This process's exit summaries (S.3, C3): the seccomp summary for a
+    /// process with installs or a set flag, the probe summary for one with
+    /// probes. Exactly one emission per process: empty once taken. The
+    /// caller sends them in one batch, which the launcher gives one receipt
+    /// ID; on the ptrace backend [`RootfsTool::on_exit_process`] writes
+    /// them itself.
+    pub fn take_exit_summaries(&self, pid: i32) -> Vec<Refusal> {
+        let mut st = self.state.lock().unwrap();
+        let a = st.admission(pid);
+        let (seccomp, probe) = (a.seccomp_summary_due(), a.probe_summary_due());
+        if !(seccomp || probe) || !a.begin_emission() {
+            return Vec::new();
+        }
+        let kernel_id = a.kernel_id.unwrap_or(0);
+        let mut out = Vec::new();
+        if seccomp {
+            out.push(Refusal::Summary(Summary::Seccomp {
+                pid,
+                kernel_id,
+                flag: a.flag,
+                installs: a.installs,
+                installs_refused: a.installs_refused,
+                translated: a.translated,
+                refused: a.refused,
+                unseen_best_effort: a.unseen_best_effort,
+            }));
+        }
+        if probe {
+            out.push(Refusal::Summary(Summary::Probe {
+                pid,
+                kernel_id,
+                probes: a.probes,
+                sud_refused: a.sud_refused,
+                sud_fallback: a.sud_fallback,
+            }));
+        }
+        out
+    }
+
     /// Reconstruct a Tool from a predecessor snapshot. The
     /// successor consumer seam (B4 step 3) builds on this; B4-1
     /// ships it behind unit tests only — no successor transport
@@ -679,6 +1258,9 @@ impl RootfsTool {
         {
             let mut st = tool.state.lock().unwrap();
             state.apply_to(&mut st, cfg)?;
+            // Exec keeps the S.3 record; only a successor
+            // applies it, never a fork restore.
+            st.admission = state.record.admission();
         }
         Ok(tool)
     }
@@ -751,10 +1333,16 @@ impl RootfsTool {
             return;
         };
         let raw_exe = self.exe_guest(guest);
-        let canonical_exe = self.canonical_exe(guest, &raw_exe);
+        // An exe with no guest name publishes none: other processes then
+        // read the kernel's link.
+        let exe_guest = if self.state.lock().unwrap().exe_host {
+            Vec::new()
+        } else {
+            self.canonical_exe(guest, &raw_exe).as_os_str().as_bytes().to_vec()
+        };
         let row = ProcessRecord {
             id,
-            exe_guest: canonical_exe.as_os_str().as_bytes().to_vec(),
+            exe_guest,
             argv: self.current_argv(guest.config()),
         };
         if let Err(err) = store.publish(row) {
@@ -767,6 +1355,17 @@ impl RootfsTool {
     }
 
     fn shared_process_record(pid: i32) -> Option<ProcessRecord> {
+        #[cfg(test)]
+        if let Some(rows) = SHARED_ROW_SEAM.with(|s| s.borrow().clone()) {
+            let left = SHARED_ROW_SEAM_LOOKUPS.with(|n| n.get());
+            if let Some(n) = left {
+                if n == 0 {
+                    return None;
+                }
+                SHARED_ROW_SEAM_LOOKUPS.with(|c| c.set(Some(n - 1)));
+            }
+            return rows.into_iter().find(|row| row.id.pid == pid);
+        }
         let id = Self::guest_process_id(pid)?;
         shared_record_file()?.lookup(id).ok().flatten()
     }
@@ -792,6 +1391,27 @@ impl RootfsTool {
                     err.to_string(),
                 );
             }
+        }
+    }
+
+    /// A clone's mount-namespace record: a new
+    /// process left the tracer's mount namespace with CLONE_NEWNS, or
+    /// inherits its parent's having left it. A thread cloned with
+    /// CLONE_NEWNS (the kernel refuses it with CLONE_FS) has a namespace of
+    /// its own; the record is per process, so the caller's process counts
+    /// as moved, conservatively, as an unshare does.
+    fn note_child_mount_ns<T: Guest<Self>>(&self, guest: &T, flags: u64, ret: &Result<i64, reverie::syscalls::Errno>) {
+        let Ok(child) = ret else { return };
+        if *child <= 0 {
+            return;
+        }
+        let new_ns = flags & libc::CLONE_NEWNS as u64 != 0;
+        if !clone_is_process(flags) {
+            if new_ns {
+                note_mount_ns_moved(guest.pid().as_raw());
+            }
+        } else if new_ns || mount_ns_moved(guest.pid().as_raw()) {
+            note_mount_ns_moved(*child as i32);
         }
     }
 
@@ -888,7 +1508,24 @@ impl RootfsTool {
     /// without it gets a copy, as the kernel copies the table.
     fn stage_child_files<T: Guest<Self>>(&self, guest: &mut T, flags: u64) {
         let own = files_of(guest);
+        let in_guest = guest.config().tool_in_guest(); // shared-record tripwire
+        guest.thread_state_mut().child_shares_record = shares_record_in_guest(in_guest, flags);
+        // A vfork child shares the caller's page. A caller without one takes
+        // a free page first: otherwise the child, on ptrace a new process
+        // with a fresh Tool and no free pages, maps a whole pool in the
+        // shared address space on every spawn, which the caller's process
+        // never reuses. With no page free (or a failed zeroing) the caller
+        // stays without one and the child maps its own, as before.
+        let vm_vfork = (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
+        if clone_is_process(flags) && flags & vm_vfork == vm_vfork && guest.thread_state().scratch.is_none() {
+            let _ = self.take_free_page(guest);
+        }
+        let page = guest.thread_state().scratch;
+        guest.thread_state_mut().child_scratch = child_scratch(flags, page);
         let child = if clone_is_process(flags) {
+            let pid = guest.pid().as_raw();
+            let group = self.state.lock().unwrap().admission(pid).new_group();
+            guest.thread_state_mut().child_group = Some(group);
             MAIN_FILES
         } else if flags & libc::CLONE_FILES as u64 != 0 {
             own
@@ -904,6 +1541,17 @@ impl RootfsTool {
     /// After a clone inject: drop the staged id, and the copy made for a
     /// thread that was never created.
     fn end_child_files<T: Guest<Self>>(&self, guest: &mut T, created: bool) {
+        guest.thread_state_mut().child_group = None;
+        guest.thread_state_mut().child_scratch = None;
+        if std::mem::take(&mut guest.thread_state_mut().child_shares_record) && created {
+            // The tripwire of `shares_record_in_guest`: Reverie created a
+            // child that shares this record. Stop rather than run on.
+            eprintln!(
+                "literoot: fatal: an in-guest clone created a process sharing literoot's \
+                 process record (CLONE_VM without CLONE_THREAD)"
+            );
+            std::process::abort();
+        }
         let Some(child) = guest.thread_state_mut().child_files.take() else {
             return;
         };
@@ -1024,6 +1672,37 @@ impl RootfsTool {
         self.set_stack_limit(guest, limits).await?;
         self.state.lock().unwrap().pending_stack_limit = None;
         Ok(())
+    }
+
+    /// What an execve handler writes before its injection: the exe record,
+    /// its host flag, the argv, and this pid's entries in the bare-pid maps.
+    fn exec_identity<T: Guest<Self>>(&self, guest: &T) -> ExecIdentity {
+        let pid = guest.pid().as_raw();
+        let st = self.state.lock().unwrap();
+        ExecIdentity {
+            exe_guest: st.exe_guest.clone(),
+            exe_host: st.exe_host,
+            argv: st.argv.clone(),
+            pid_exe: pid_exe_map().lock().unwrap().get(&pid).cloned(),
+            pid_argv: pid_argv_map().lock().unwrap().get(&pid).cloned(),
+        }
+    }
+
+    /// Put back what [`Self::exec_identity`] took, after a failed exec.
+    fn restore_exec_identity<T: Guest<Self>>(&self, guest: &T, prior: ExecIdentity) {
+        let pid = guest.pid().as_raw();
+        match prior.pid_exe {
+            Some(exe) => pid_exe_map().lock().unwrap().insert(pid, exe),
+            None => pid_exe_map().lock().unwrap().remove(&pid),
+        };
+        match prior.pid_argv {
+            Some(argv) => pid_argv_map().lock().unwrap().insert(pid, argv),
+            None => pid_argv_map().lock().unwrap().remove(&pid),
+        };
+        let mut st = self.state.lock().unwrap();
+        st.exe_guest = prior.exe_guest;
+        st.exe_host = prior.exe_host;
+        st.argv = prior.argv;
     }
 
     /// Invalidate a mailbox-staged exec snapshot after a failed
@@ -1174,6 +1853,36 @@ fn clone_is_process(flags: u64) -> bool {
     flags & (libc::CLONE_THREAD as u64) == 0
 }
 
+/// Whether a clone with `flags` creates a new process that shares the
+/// caller's address space (CLONE_VM without CLONE_THREAD; vfork) while the
+/// Tool runs in the guest: that child would share this process's S.3 record
+/// rather than hold a copy, and `Admission::adopt` relies on a copy.
+/// Reverie's in-guest host forwards only plain forks and refuses every
+/// other clone, clone3 and vfork (R reverie-inguest guest/host.rs:5282-5298),
+/// so none is ever created; the clone handlers make a created one a named
+/// fatal error (`end_child_files`), never a shared record.
+fn shares_record_in_guest(in_guest: bool, flags: u64) -> bool {
+    in_guest && clone_is_process(flags) && flags & libc::CLONE_VM as u64 != 0
+}
+
+/// The scratch page the task a clone with `flags` starts with, given the
+/// caller's `page`. A new process without CLONE_VM keeps it: fork copies
+/// the mapping, so the child's copy is its own. A vfork child
+/// (CLONE_VM | CLONE_VFORK) shares it: the caller is suspended until the
+/// child execs or exits, with nothing staged (its clone handler stages no
+/// slot), and the child writes every slot before reading it. A thread or
+/// any other CLONE_VM process gets none and maps or reuses its own, as two
+/// tasks that run at once must never stage in one page.
+fn child_scratch(flags: u64, page: Option<ScratchPage>) -> Option<ScratchPage> {
+    let vm = flags & libc::CLONE_VM as u64 != 0;
+    let vfork = flags & libc::CLONE_VFORK as u64 != 0;
+    if clone_is_process(flags) && (!vm || vfork) {
+        page
+    } else {
+        None
+    }
+}
+
 // Reverie's ptrace guest-stack arena is ~896 bytes total; stage at
 // most 768 bytes of translated path (POC limit — the in-guest
 // backend uses Tool-region scratch instead, design §6).
@@ -1222,6 +1931,15 @@ impl Tool for RootfsTool {
         _global_state: &G,
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
+        // The exit summaries, where the side log is open here (the ptrace
+        // backend): one receipt for this process's emission. A guest
+        // process's reporter takes them into its exit drain instead.
+        if crate::refusal_log::is_open() {
+            let mut receipt = None;
+            for summary in self.take_exit_summaries(pid.as_raw()) {
+                crate::refusal_log::write_line(&summary.line_in_batch(&mut receipt));
+            }
+        }
         // Preserve the root guest's real exit status for the
         // launcher: if it later terminates a wedged tracer
         // session (kill-on-exit grace expiry), wait() surfaces
@@ -1309,9 +2027,17 @@ impl Tool for RootfsTool {
             Sysno::clone,
             Sysno::clone3,
             // Fd-table ownership (FilesId): both can give the caller its
-            // own copy of the table.
+            // own copy of the table. unshare and setns can also move the
+            // caller out of the tracer's mount namespace, which the ptrace
+            // cmdline route depends on.
             Sysno::unshare,
             Sysno::close_range,
+            Sysno::setns,
+            // S.3: a guest seccomp filter install is tracked and admitted
+            // (`seccomp_install`); every other call of either is forwarded
+            // unchanged.
+            Sysno::seccomp,
+            Sysno::prctl,
         ]);
         // Legacy non-*at syscalls exist only in the x86-64 table; the
         // aarch64 generic table carries the *at forms subscribed above
@@ -1357,6 +2083,12 @@ impl Tool for RootfsTool {
                 pending: parent.pending.clone(),
                 files: parent.child_files.unwrap_or(parent.files),
                 child_files: None,
+                child_group: None,
+                new_group: parent.child_group,
+                child_shares_record: false,
+                sud_on: false,
+                scratch: parent.child_scratch,
+                child_scratch: None,
             },
             None => RootfsThreadState::default(),
         }
@@ -1382,6 +2114,48 @@ impl Tool for RootfsTool {
         if restored {
             self.publish_self_shared(guest);
         }
+        // A new thread group's record (S.3): fresh counters, and the flag
+        // and addend its parent's clone staged. The staged value arrives
+        // through init_thread_state (`new_group`) or, in-guest, as the
+        // memory copy of the forking thread's own state (`child_group`),
+        // which is cleared here. It is the lifecycle signal: the visible
+        // pid can equal the copied record's owner (pid 1 of a new pid
+        // namespace).
+        let staged = {
+            let ts = guest.thread_state_mut();
+            ts.new_group.take().or(ts.child_group.take())
+        };
+        if let Some(group) = staged {
+            let pid = guest.pid().as_raw();
+            self.state.lock().unwrap().start_new_group(pid, group);
+            self.note_kernel_id(guest);
+        }
+        self.first_callback_check(guest).await;
+        Ok(())
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<LiterootGlobal>>(
+        &self,
+        tid: reverie::Tid,
+        _global_state: &G,
+        thread_state: RootfsThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        let mut st = self.state.lock().unwrap();
+        // An exited thread's admitted probes can no longer inject (S.3).
+        st.admission.release_thread(tid.as_raw());
+        // Its scratch page, for the next new thread: only a page of this
+        // image (a thread that exec killed held a page of the old one, now
+        // unmapped), and never twice (a vfork child shares its caller's
+        // page, but a vfork child is another process, with its own state).
+        if let Some(page) = thread_state.scratch {
+            if page.image == st.scratch_image && !st.free_scratch.contains(&page.addr) {
+                st.free_scratch.push(page.addr);
+            }
+        }
+        drop(st);
+        // A tracer memfd held for a restarted cmdline open of it is done.
+        release_held_tracer_fd(tid.as_raw());
         Ok(())
     }
 
@@ -1407,46 +2181,33 @@ impl Tool for RootfsTool {
         {
             let mut st = self.state.lock().unwrap();
             st.bootstrapped = true;
-            // New image: any previous scratch mapping is gone.
-            st.scratch = None;
+            // New image: every previous scratch mapping is gone.
+            st.new_scratch_image();
             // A pending self-stop swallow does not survive exec.
             st.swallow_next_self_stop = false;
             // The kernel resets the filesystem ids to the effective ids.
             st.fake_fs = None;
         }
-        // Pre-allocate the execve scratch page here: injecting
-        // an mmap between a guest's two execve calls was
-        // measured to make the second fail EFAULT.
-        {
-            let needs = self.state.lock().unwrap().scratch.is_none();
-            if needs {
-                let mmap = reverie::syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(4096)
-                    .with_prot(
-                        reverie::syscalls::ProtFlags::PROT_READ
-                            | reverie::syscalls::ProtFlags::PROT_WRITE,
-                    )
-                    .with_flags(
-                        reverie::syscalls::MapFlags::MAP_PRIVATE
-                            | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
-                    )
-                    .with_fd(-1)
-                    .with_offset(0);
-                if let Ok(addr) = guest.inject(mmap).await {
-                    self.state.lock().unwrap().scratch = Some(addr as usize);
-                }
-            }
-        }
+        // Exec resets the thread's syscall user dispatch mode.
+        guest.thread_state_mut().sud_on = false;
+        guest.thread_state_mut().scratch = None;
+        // Pre-allocate the exec'ing thread's scratch page here, with the
+        // pool for this image's new threads: injecting an mmap between a
+        // guest's two execve calls was measured to make the second fail
+        // EFAULT, and a new thread then maps nothing until the pool is used
+        // up.
+        let _ = self.map_scratch(guest).await;
         self.publish_self_shared(guest);
         // Setuid/setgid exec under fake identity: euid/suid take
         // the file owner's fake id (owner == real caller maps to
         // 0 by proot's fake-id rule; test-getresid-native).
         if self.fake_ids(guest).is_some() {
             use std::os::unix::fs::MetadataExt as _;
-            let exe = self.exe_guest(guest);
+            let exe = self.own_exe_route(guest, libc::AT_FDCWD);
+            // Best-effort, as before the link budget: a tree changed
+            // after the exec (now past 40 links) skips the mapping.
             let host = self.translate_follow(guest, libc::AT_FDCWD, &exe);
-            if let Ok(md) = std::fs::metadata(&host) {
+            if let Some(md) = host.ok().and_then(|host| std::fs::metadata(host).ok()) {
                 use std::os::unix::fs::PermissionsExt as _;
                 let mode = md.permissions().mode();
                 let real_uid = unsafe { libc::getuid() };
@@ -1703,6 +2464,7 @@ impl Tool for RootfsTool {
             let mut st = self.state.lock().unwrap();
             st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
             st.translate_memo.clear();
+            st.searched_bases.clear();
             std::mem::take(&mut st.swallow_next_self_stop)
         };
         self.note_process_for_kill_on_exit(guest);
@@ -1735,6 +2497,15 @@ impl Tool for RootfsTool {
             reverie::syscalls::Sysno::clone | reverie::syscalls::Sysno::clone3 => true,
             _ => false,
         };
+        if let Some(answer) = self.seccomp_install(guest, syscall).await {
+            return answer;
+        }
+        if let Some(answer) = self.dispatch_setter(guest, syscall).await {
+            return answer;
+        }
+        if let Some(answer) = self.dead_base_gate(guest, syscall).await {
+            return answer;
+        }
         let result = match syscall {
             Syscall::Openat(openat) => {
                 // O_CREAT opens can create components (kind
@@ -1752,24 +2523,39 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(openat).await?);
                 };
                 let mut guest_path = path_ptr.read(&guest.memory())?;
-                if is_self_exe(&guest_path, guest.pid().as_raw()) {
-                    guest_path = self.exe_guest(guest);
-                }
-                if let Some(fd) = self.open_synthetic_cmdline(guest, &guest_path).await {
-                    return Ok(fd);
-                }
                 if self.dirfd_passthrough(guest, openat.dirfd(), &guest_path) {
                     return Ok(guest.inject(openat).await?);
                 }
+                // The self links are decided by the selected final
+                // entry, not by the spelling. Another process's entries are
+                // the kernel's.
+                let follow = open_follows(openat.flags().bits() as u64);
+                match self.self_link_route(guest, openat.dirfd(), &guest_path, follow)? {
+                    SelfLink::Exe => guest_path = self.own_exe_route(guest, openat.dirfd()),
+                    SelfLink::RowExe(pid) => {
+                        if let Some(exe) = Self::row_exe_guest(pid) {
+                            guest_path = exe;
+                        }
+                    }
+                    SelfLink::Cmdline(pid) => {
+                        if let Some(fd) = self.open_synthetic_cmdline(guest, pid, CmdlineOpen::Openat(openat)).await? {
+                            return Ok(fd);
+                        }
+                    }
+                    SelfLink::SharedCmdline(pid) => {
+                        if let Some(fd) = self.open_shared_cmdline(guest, pid, CmdlineOpen::Openat(openat)).await? {
+                            return Ok(fd);
+                        }
+                    }
+                    SelfLink::Walk => {}
+                }
                 // O_NOFOLLOW opens the final symlink itself (O_PATH) or
-                // fails ELOOP, so the final component is not followed here.
-                let host = if openat
-                    .flags()
-                    .contains(reverie::syscalls::OFlag::O_NOFOLLOW)
-                {
-                    self.translate_for(guest, openat.dirfd(), &guest_path)
+                // fails ELOOP, and O_CREAT|O_EXCL fails EEXIST at it, so the
+                // final component is not followed here.
+                let host = if !follow {
+                    self.translate_for(guest, openat.dirfd(), &guest_path)?
                 } else {
-                    self.translate_follow(guest, openat.dirfd(), &guest_path)
+                    self.translate_follow(guest, openat.dirfd(), &guest_path)?
                 };
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -1846,11 +2632,33 @@ impl Tool for RootfsTool {
                 let Some(path_ptr) = open.path() else {
                     return Ok(guest.inject(open).await?);
                 };
-                let guest_path = path_ptr.read(&guest.memory())?;
-                let host = if open.flags().contains(reverie::syscalls::OFlag::O_NOFOLLOW) {
-                    self.translate_for(guest, libc::AT_FDCWD, &guest_path)
+                let mut guest_path = path_ptr.read(&guest.memory())?;
+                // Legacy open decides as openat does, by the selected
+                // final entry.
+                let follow = open_follows(open.flags().bits() as u64);
+                match self.self_link_route(guest, libc::AT_FDCWD, &guest_path, follow)? {
+                    SelfLink::Exe => guest_path = self.own_exe_route(guest, libc::AT_FDCWD),
+                    SelfLink::RowExe(pid) => {
+                        if let Some(exe) = Self::row_exe_guest(pid) {
+                            guest_path = exe;
+                        }
+                    }
+                    SelfLink::Cmdline(pid) => {
+                        if let Some(fd) = self.open_synthetic_cmdline(guest, pid, CmdlineOpen::Open(open)).await? {
+                            return Ok(fd);
+                        }
+                    }
+                    SelfLink::SharedCmdline(pid) => {
+                        if let Some(fd) = self.open_shared_cmdline(guest, pid, CmdlineOpen::Open(open)).await? {
+                            return Ok(fd);
+                        }
+                    }
+                    SelfLink::Walk => {}
+                }
+                let host = if !follow {
+                    self.translate_for(guest, libc::AT_FDCWD, &guest_path)?
                 } else {
-                    self.translate_follow(guest, libc::AT_FDCWD, &guest_path)
+                    self.translate_follow(guest, libc::AT_FDCWD, &guest_path)?
                 };
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -1873,7 +2681,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(stat).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path);
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path)?;
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -1892,7 +2700,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(stat).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path);
+                let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path)?;
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
@@ -1911,7 +2719,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(acc).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path);
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         acc.with_path(PathPtr::from_ptr(ptr))
@@ -1937,9 +2745,9 @@ impl Tool for RootfsTool {
                     .flags()
                     .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
                 {
-                    self.translate_for(guest, stat.dirfd(), &guest_path)
+                    self.translate_for(guest, stat.dirfd(), &guest_path)?
                 } else {
-                    self.translate_follow(guest, stat.dirfd(), &guest_path)
+                    self.translate_follow(guest, stat.dirfd(), &guest_path)?
                 };
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
@@ -2004,9 +2812,9 @@ impl Tool for RootfsTool {
                     .flags()
                     .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
                 {
-                    self.translate_for(guest, stat.dirfd(), &guest_path)
+                    self.translate_for(guest, stat.dirfd(), &guest_path)?
                 } else {
-                    self.translate_follow(guest, stat.dirfd(), &guest_path)
+                    self.translate_follow(guest, stat.dirfd(), &guest_path)?
                 };
                 let buf_raw = stat.stat().map(|p| p.0.as_raw());
                 let (_guard, rewritten) = self
@@ -2058,19 +2866,33 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(link).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, link.dirfd(), &guest_path);
+                let host = self.translate_for(guest, link.dirfd(), &guest_path)?;
                 if std::env::var_os("LITEROOT_DEBUG").is_some() {
                     eprintln!("literoot-tool: readlinkat {guest_path:?} -> {host:?} magic={}", is_magic_proc_path(&guest_path));
                 }
+                // Decided by the selected final entry (a shared
+                // row's exe answers from the row). An empty name reads the
+                // fd's own link, judged by the fd's own host path.
+                let final_entry = if host.as_os_str().is_empty() && link.dirfd() != libc::AT_FDCWD {
+                    match std::fs::read_link(format!("{}/fd/{}", task_dir(guest), link.dirfd())) {
+                        Ok(fd_host) if fd_host.is_absolute() => self.final_proc(guest, &fd_host),
+                        _ => FinalProc::Ordinary,
+                    }
+                } else {
+                    self.final_proc(guest, &host)
+                };
                 let buf = link.buf();
                 let buf_len = link.buf_len();
+                if let Some(answer) = self.shared_row_readlink(guest, final_entry, buf, buf_len) {
+                    return answer;
+                }
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         link.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
                 let ret = guest.inject(rewritten).await?;
-                Ok(self.detranslate_into(guest, &host, &guest_path, buf, buf_len, ret))
+                Ok(self.detranslate_into(guest, &host, &guest_path, final_entry, buf, buf_len, ret))
             }
             #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(link) => {
@@ -2078,16 +2900,21 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(link).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path);
+                let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path)?;
+                // As for readlinkat.
+                let final_entry = self.final_proc(guest, &host);
                 let buf = link.buf();
                 let buf_len = link.bufsize();
+                if let Some(answer) = self.shared_row_readlink(guest, final_entry, buf, buf_len) {
+                    return answer;
+                }
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         link.with_path(PathPtr::from_ptr(ptr))
                     })
                     .await?;
                 let ret = guest.inject(rewritten).await?;
-                Ok(self.detranslate_into(guest, &host, &guest_path, buf, buf_len, ret))
+                Ok(self.detranslate_into(guest, &host, &guest_path, final_entry, buf, buf_len, ret))
             }
             Syscall::Fchdir(fch) => {
                 let ret = guest.inject(fch).await?;
@@ -2097,7 +2924,11 @@ impl Tool for RootfsTool {
                     // be replaced between the call and this check).
                     let cfg = self.config(guest);
                     let mut st = self.state.lock().unwrap();
-                    let candidate = self.fd_guest_path(guest, &cfg, &st, fch.fd());
+                    // Recorded as opened, the name can still hold links:
+                    // the cwd is the directory they resolve to.
+                    let candidate = self
+                        .fd_guest_path(guest, &cfg, &st, fch.fd())
+                        .map(|p| canonical_dir(&cfg, &p));
                     st.cwd = self.live_cwd_guest_path(guest, &cfg, &st, candidate);
                 }
                 Ok(ret)
@@ -2107,7 +2938,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(acc).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_follow(guest, acc.dirfd(), &guest_path);
+                let host = self.translate_follow(guest, acc.dirfd(), &guest_path)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         acc.with_path(PathPtr::from_ptr(ptr))
@@ -2121,7 +2952,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(unlink).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, unlink.dirfd(), &guest_path);
+                let host = self.translate_for(guest, unlink.dirfd(), &guest_path)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         unlink.with_path(PathPtr::from_ptr(ptr))
@@ -2154,7 +2985,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(mkdir).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, mkdir.dirfd(), &guest_path);
+                let host = self.translate_for(guest, mkdir.dirfd(), &guest_path)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         mkdir.with_path(PathPtr::from_ptr(ptr))
@@ -2169,8 +3000,8 @@ impl Tool for RootfsTool {
                 };
                 let old_g = op.read(&guest.memory())?;
                 let new_g = np.read(&guest.memory())?;
-                let old_h = self.translate_for(guest, rn.olddirfd(), &old_g);
-                let new_h = self.translate_for(guest, rn.newdirfd(), &new_g);
+                let old_h = self.translate_for(guest, rn.olddirfd(), &old_g)?;
+                let new_h = self.translate_for(guest, rn.newdirfd(), &new_g)?;
                 let (_g, rewritten) = self
                     .with_two_guest_paths(guest, &old_h, &new_h, |a, b| {
                         rn.with_oldpath(PathPtr::from_ptr(a))
@@ -2190,8 +3021,8 @@ impl Tool for RootfsTool {
                 };
                 let old_g = op.read(&guest.memory())?;
                 let new_g = np.read(&guest.memory())?;
-                let old_h = self.translate_for(guest, rn.olddirfd(), &old_g);
-                let new_h = self.translate_for(guest, rn.newdirfd(), &new_g);
+                let old_h = self.translate_for(guest, rn.olddirfd(), &old_g)?;
+                let new_h = self.translate_for(guest, rn.newdirfd(), &new_g)?;
                 let (_g, rewritten) = self
                     .with_two_guest_paths(guest, &old_h, &new_h, |a, b| {
                         rn.with_oldpath(PathPtr::from_ptr(a))
@@ -2209,10 +3040,21 @@ impl Tool for RootfsTool {
                 let (Some(op), Some(np)) = (ln.oldpath(), ln.newpath()) else {
                     return Ok(guest.inject(ln).await?);
                 };
+                // do_linkat: any other flag is EINVAL before either path
+                // is looked up; AT_SYMLINK_FOLLOW follows oldpath's final
+                // symlink, which must then resolve through the guest root.
+                let flags = ln.flags().bits() as u32;
+                if flags & !((libc::AT_SYMLINK_FOLLOW | libc::AT_EMPTY_PATH) as u32) != 0 {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 let old_g = op.read(&guest.memory())?;
                 let new_g = np.read(&guest.memory())?;
-                let old_h = self.translate_for(guest, ln.olddirfd(), &old_g);
-                let new_h = self.translate_for(guest, ln.newdirfd(), &new_g);
+                let old_h = if flags & libc::AT_SYMLINK_FOLLOW as u32 != 0 {
+                    self.translate_follow(guest, ln.olddirfd(), &old_g)?
+                } else {
+                    self.translate_for(guest, ln.olddirfd(), &old_g)?
+                };
+                let new_h = self.translate_for(guest, ln.newdirfd(), &new_g)?;
                 let (_g, rewritten) = self
                     .with_two_guest_paths(guest, &old_h, &new_h, |a, b| {
                         ln.with_oldpath(PathPtr::from_ptr(a))
@@ -2230,7 +3072,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(sl).await?);
                 };
                 let link_g = lp.read(&guest.memory())?;
-                let link_h = self.translate_for(guest, sl.newdirfd(), &link_g);
+                let link_h = self.translate_for(guest, sl.newdirfd(), &link_g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &link_h, |ptr| {
                         sl.with_linkpath(PathPtr::from_ptr(ptr))
@@ -2246,8 +3088,8 @@ impl Tool for RootfsTool {
                 };
                 let old_g = op.read(&guest.memory())?;
                 let new_g = np.read(&guest.memory())?;
-                let old_h = self.translate_for(guest, libc::AT_FDCWD, &old_g);
-                let new_h = self.translate_for(guest, libc::AT_FDCWD, &new_g);
+                let old_h = self.translate_for(guest, libc::AT_FDCWD, &old_g)?;
+                let new_h = self.translate_for(guest, libc::AT_FDCWD, &new_g)?;
                 let (_g, rewritten) = self
                     .with_two_guest_paths(guest, &old_h, &new_h, |a, b| {
                         rn.with_oldpath(PathPtr::from_ptr(a))
@@ -2274,8 +3116,8 @@ impl Tool for RootfsTool {
                 };
                 let old_g = op.read(&guest.memory())?;
                 let new_g = np.read(&guest.memory())?;
-                let old_h = self.translate_for(guest, libc::AT_FDCWD, &old_g);
-                let new_h = self.translate_for(guest, libc::AT_FDCWD, &new_g);
+                let old_h = self.translate_for(guest, libc::AT_FDCWD, &old_g)?;
+                let new_h = self.translate_for(guest, libc::AT_FDCWD, &new_g)?;
                 let (_g, rewritten) = self
                     .with_two_guest_paths(guest, &old_h, &new_h, |a, b| {
                         ln.with_oldpath(PathPtr::from_ptr(a))
@@ -2291,7 +3133,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(sl).await?);
                 };
                 let link_g = lp.read(&guest.memory())?;
-                let link_h = self.translate_for(guest, libc::AT_FDCWD, &link_g);
+                let link_h = self.translate_for(guest, libc::AT_FDCWD, &link_g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &link_h, |ptr| {
                         sl.with_linkpath(PathPtr::from_ptr(ptr))
@@ -2306,7 +3148,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(rd).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_for(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         rd.with_path(PathPtr::from_ptr(ptr))
@@ -2340,7 +3182,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(un).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_for(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         un.with_path(PathPtr::from_ptr(ptr))
@@ -2374,7 +3216,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(md).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_for(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         md.with_path(PathPtr::from_ptr(ptr))
@@ -2389,7 +3231,7 @@ impl Tool for RootfsTool {
                 };
                 if self.fake_ids(guest).is_some() {
                     let g = pp.read(&guest.memory())?;
-                    let h = self.translate_for(guest, mk.dirfd(), &g);
+                    let h = self.translate_for(guest, mk.dirfd(), &g)?;
                     use std::os::unix::fs::PermissionsExt as _;
                     return match std::fs::File::create(&h) {
                         Ok(_) => {
@@ -2407,7 +3249,7 @@ impl Tool for RootfsTool {
                     };
                 }
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, mk.dirfd(), &g);
+                let h = self.translate_for(guest, mk.dirfd(), &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         mk.with_path(PathPtr::from_ptr(ptr))
@@ -2441,9 +3283,9 @@ impl Tool for RootfsTool {
                     .flags()
                     .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
                 {
-                    self.translate_for(guest, fc.dirfd(), &g)
+                    self.translate_for(guest, fc.dirfd(), &g)?
                 } else {
-                    self.translate_follow(guest, fc.dirfd(), &g)
+                    self.translate_follow(guest, fc.dirfd(), &g)?
                 };
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
@@ -2486,7 +3328,7 @@ impl Tool for RootfsTool {
                     // (syscall/enter.c:58-72), so the kernel says ENOENT.
                     return Ok(guest.inject(sf).await?);
                 }
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &g)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| sf.with_path(PathPtr::from_ptr(ptr)))
                     .await?;
@@ -2497,7 +3339,10 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(fc).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, fc.dirfd(), &g);
+                // fchmodat has no flags argument and always follows a
+                // final symlink (do_fchmodat): resolve it through the
+                // guest root.
+                let h = self.translate_follow(guest, fc.dirfd(), &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         fc.with_path(PathPtr::from_ptr(ptr))
@@ -2528,11 +3373,39 @@ impl Tool for RootfsTool {
                 let Some(pp) = ut.path() else {
                     return Ok(guest.inject(ut).await?);
                 };
+                // The kernel's checks before the path lookup come first,
+                // in its order: unreadable times are EFAULT and two
+                // UTIME_OMITs succeed without the path (utimensat,
+                // fs/utimes.c); then any flag other than
+                // AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH is EINVAL
+                // (do_utimes_path).
+                if let Some(times) = ut.times() {
+                    match guest.memory().read_value(times) {
+                        Ok([a, m])
+                            if a.tv_nsec == libc::UTIME_OMIT && m.tv_nsec == libc::UTIME_OMIT =>
+                        {
+                            return Ok(0);
+                        }
+                        Ok(_) => {}
+                        // The kernel faults on the times before it reads
+                        // the path.
+                        Err(_) => return Ok(guest.inject(ut).await?),
+                    }
+                }
+                let flags = ut.flags() as u32;
+                if flags & !((libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u32) != 0 {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 let g = pp.read(&guest.memory())?;
                 if g.as_os_str().is_empty() {
                     return Ok(guest.inject(ut).await?);
                 }
-                let h = self.translate_for(guest, ut.dirfd(), &g);
+                // A final symlink is followed unless AT_SYMLINK_NOFOLLOW.
+                let h = if flags & libc::AT_SYMLINK_NOFOLLOW as u32 != 0 {
+                    self.translate_for(guest, ut.dirfd(), &g)?
+                } else {
+                    self.translate_follow(guest, ut.dirfd(), &g)?
+                };
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         ut.with_path(PathPtr::from_ptr(ptr))
@@ -2552,9 +3425,9 @@ impl Tool for RootfsTool {
                     .flags()
                     .contains(reverie::syscalls::AtFlags::AT_SYMLINK_NOFOLLOW)
                 {
-                    self.translate_for(guest, sx.dirfd(), &g)
+                    self.translate_for(guest, sx.dirfd(), &g)?
                 } else {
-                    self.translate_follow(guest, sx.dirfd(), &g)
+                    self.translate_follow(guest, sx.dirfd(), &g)?
                 };
                 if std::env::var_os("LITEROOT_DEBUG").is_some() {
                     eprintln!("literoot-tool: statx dirfd={} {g:?} -> {h:?}", sx.dirfd());
@@ -2614,7 +3487,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(cm).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_follow(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         cm.with_path(PathPtr::from_ptr(ptr))
@@ -2650,7 +3523,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(co).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_follow(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         co.with_path(PathPtr::from_ptr(ptr))
@@ -2667,7 +3540,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(co).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let h = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let h = self.translate_for(guest, libc::AT_FDCWD, &g)?;
                 let (_g, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         co.with_path(PathPtr::from_ptr(ptr))
@@ -2676,23 +3549,84 @@ impl Tool for RootfsTool {
                 Ok(guest.inject(rewritten).await?)
             }
             Syscall::Openat2(oa) => {
-                // Translate the path only; open_how passes
-                // through (resolve flags honoured by our own
-                // clamping canonicalization, design S5.1).
+                // Translate the path only; open_how passes through
+                // unchanged. literoot does not emulate the resolve flags:
+                // RESOLVE_IN_ROOT re-roots the absolute host path at the
+                // guest's dirfd, a known limit (design §4.9.8, (2b)).
                 let _probe_bump = ProbeBumpOnDrop;
                 let Some(path_ptr) = oa.path() else {
                     return Ok(guest.inject(oa).await?);
                 };
-                let guest_path = path_ptr.read(&guest.memory())?;
+                let mut guest_path = path_ptr.read(&guest.memory())?;
                 if self.dirfd_passthrough(guest, oa.dirfd(), &guest_path) {
                     return Ok(guest.inject(oa).await?);
                 }
-                let host = self.translate_follow(guest, oa.dirfd(), &guest_path);
-                let (_g, rewritten) = self
-                    .with_guest_path(guest, &host, |ptr| {
-                        oa.with_path(PathPtr::from_ptr(ptr))
-                    })
-                    .await?;
+                // The kernel copies open_how before it looks at the path
+                // (an unreadable one is its EFAULT), then follows a final
+                // symlink unless O_NOFOLLOW.
+                let Some(how) = oa.how() else {
+                    return Ok(guest.inject(oa).await?);
+                };
+                let Ok(how) = guest.memory().read_value(how) else {
+                    return Ok(guest.inject(oa).await?);
+                };
+                let how: reverie::syscalls::OpenHow = how;
+                // As for openat, by the selected final entry. A
+                // synthesized cmdline is answered only for arguments the
+                // kernel accepts, asked through the guarded probe; when the
+                // probe cannot tell, the kernel's own file answers. A walk
+                // error is the guest's, after the kernel's argument errors
+                // (no gate, no count).
+                let follow = open_follows(how.flags);
+                // On ptrace the route checks the arguments in the tracer;
+                // in-guest the guarded probe does.
+                let probe_first = guest.config().tool_in_guest(); // cmdline: probe first in-guest
+                match self.self_link_route(guest, oa.dirfd(), &guest_path, follow) {
+                    Ok(SelfLink::Exe) => guest_path = self.own_exe_route(guest, oa.dirfd()),
+                    Ok(SelfLink::RowExe(pid)) => {
+                        if let Some(exe) = Self::row_exe_guest(pid) {
+                            guest_path = exe;
+                        }
+                    }
+                    Ok(SelfLink::Cmdline(pid)) => {
+                        if !probe_first || self.openat2_guarded_probe(guest, oa).await? {
+                            if let Some(fd) = self.open_synthetic_cmdline(guest, pid, CmdlineOpen::Openat2(oa, how)).await? {
+                                return Ok(fd);
+                            }
+                        } else {
+                            note_cmdline_fallback();
+                        }
+                    }
+                    Ok(SelfLink::SharedCmdline(pid)) => {
+                        if !probe_first || self.openat2_guarded_probe(guest, oa).await? {
+                            if let Some(fd) = self.open_shared_cmdline(guest, pid, CmdlineOpen::Openat2(oa, how)).await? {
+                                return Ok(fd);
+                            }
+                        } else {
+                            note_cmdline_fallback();
+                        }
+                    }
+                    Ok(SelfLink::Walk) => {}
+                    Err(errno) => return self.openat2_arguments_first(guest, oa, errno.into()).await,
+                }
+                let host = if !follow {
+                    self.translate_for(guest, oa.dirfd(), &guest_path)
+                } else {
+                    self.translate_follow(guest, oa.dirfd(), &guest_path)
+                };
+                let staged = match host {
+                    Ok(host) => {
+                        self.with_guest_path(guest, &host, |ptr| {
+                            oa.with_path(PathPtr::from_ptr(ptr))
+                        })
+                        .await
+                    }
+                    Err(errno) => Err(errno.into()),
+                };
+                let (_g, rewritten) = match staged {
+                    Ok(staged) => staged,
+                    Err(error) => return self.openat2_arguments_first(guest, oa, error).await,
+                };
                 let ret = guest.inject(rewritten).await?;
                 if ret >= 0 {
                     let mut st = self.state.lock().unwrap();
@@ -2704,6 +3638,19 @@ impl Tool for RootfsTool {
                 Ok(ret)
             }
             Syscall::NameToHandleAt(nh) => {
+                // Any flag outside this set is EINVAL before the lookup
+                // (name_to_handle_at, fs/fhandle.c): AT_SYMLINK_FOLLOW,
+                // AT_EMPTY_PATH, AT_HANDLE_FID (0x200),
+                // AT_HANDLE_MNT_ID_UNIQUE (0x1), AT_HANDLE_CONNECTABLE (0x2).
+                let flags = nh.flags() as u32;
+                let valid =
+                    (libc::AT_SYMLINK_FOLLOW | libc::AT_EMPTY_PATH) as u32 | 0x200 | 0x1 | 0x2;
+                // AT_HANDLE_CONNECTABLE conflicts with AT_HANDLE_FID and
+                // AT_EMPTY_PATH, also before the lookup.
+                let conflict = 0x200 | libc::AT_EMPTY_PATH as u32;
+                if flags & !valid != 0 || (flags & 0x2 != 0 && flags & conflict != 0) {
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
                 let Some(pp) = nh.pathname() else {
                     return Ok(guest.inject(nh).await?);
                 };
@@ -2714,7 +3661,13 @@ impl Tool for RootfsTool {
                 if self.dirfd_passthrough(guest, nh.dirfd(), &g) {
                     return Ok(guest.inject(nh).await?);
                 }
-                let h = self.translate_for(guest, nh.dirfd(), &g);
+                // AT_SYMLINK_FOLLOW follows the final symlink: through the
+                // guest root.
+                let h = if flags & libc::AT_SYMLINK_FOLLOW as u32 != 0 {
+                    self.translate_follow(guest, nh.dirfd(), &g)?
+                } else {
+                    self.translate_for(guest, nh.dirfd(), &g)?
+                };
                 let (_g2, rewritten) = self
                     .with_guest_path(guest, &h, |ptr| {
                         nh.with_pathname(PathPtr::from_ptr(ptr))
@@ -2751,10 +3704,17 @@ impl Tool for RootfsTool {
                 // (SEIZE/INTERRUPT/PEEKUSER/DETACH) are
                 // kernel-served, as at base.
                 if guest.config().refuse_guest_ptrace {
+                    use reverie::syscalls::SyscallInfo as _;
+                    // The dispatch setter request, matched as the whole
+                    // request word (C5.7), takes the dispatch line.
+                    if crate::dead_base::is_ptrace_dispatch_setter(syscall.into_parts().1.arg0 as u64) {
+                        note_guest_refusal(GuestKind::SyscallUserDispatch);
+                    } else {
+                        note_guest_refusal(GuestKind::Ptrace);
+                    }
                     if pt.request() == libc::PTRACE_TRACEME as u32 {
                         self.state.lock().unwrap().swallow_next_self_stop = true;
                     }
-                    note_guest_refusal(GuestKind::Ptrace);
                     Err(reverie::syscalls::Errno::EPERM.into())
                 } else {
                     Ok(guest.inject(pt).await?)
@@ -2897,7 +3857,11 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(chdir).await?);
                 };
                 let guest_path = path_ptr.read(&guest.memory())?;
-                let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path);
+                // chdir follows a final symlink: resolve it through the
+                // guest root, or the kernel's cwd lands in the host's. The
+                // same walk names the directory reached in guest terms.
+                let (host, resolved) =
+                    self.translate_follow_guest(guest, libc::AT_FDCWD, &guest_path)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| {
                         chdir.with_path(PathPtr::from_ptr(ptr))
@@ -2911,8 +3875,16 @@ impl Tool for RootfsTool {
                         // kernel knows where this landed.
                         let cfg = self.config_locked(guest, &st);
                         st.cwd = self.live_cwd_guest_path(guest, &cfg, &st, None);
+                    } else if let Some(resolved) = resolved {
+                        // The kernel's cwd is the directory the walk reached,
+                        // every link and ".." resolved: relative calls are
+                        // translated from st.cwd without walking it again.
+                        st.cwd = resolved;
                     } else {
-                        st.cwd = self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path);
+                        // No guest name for what the walk reached: the
+                        // kernel's own cwd, translated back.
+                        let cfg = self.config_locked(guest, &st);
+                        st.cwd = self.live_cwd_guest_path(guest, &cfg, &st, None);
                     }
                 }
                 Ok(ret)
@@ -2988,11 +3960,13 @@ impl Tool for RootfsTool {
                     let ret = guest.inject(clone).await;
                     self.clear_exec_snapshot(guest);
                     self.end_child_files(guest, ret.is_ok());
+                    self.note_child_mount_ns(guest, flags, &ret);
                     Ok(ret?)
                 } else {
                     self.stage_child_files(guest, flags);
                     let ret = guest.inject(clone).await;
                     self.end_child_files(guest, ret.is_ok());
+                    self.note_child_mount_ns(guest, flags, &ret);
                     Ok(ret?)
                 }
             }
@@ -3007,11 +3981,13 @@ impl Tool for RootfsTool {
                     let ret = guest.inject(clone3).await;
                     self.clear_exec_snapshot(guest);
                     self.end_child_files(guest, ret.is_ok());
+                    self.note_child_mount_ns(guest, flags, &ret);
                     Ok(ret?)
                 } else {
                     self.stage_child_files(guest, flags);
                     let ret = guest.inject(clone3).await;
                     self.end_child_files(guest, ret.is_ok());
+                    self.note_child_mount_ns(guest, flags, &ret);
                     Ok(ret?)
                 }
             }
@@ -3024,6 +4000,7 @@ impl Tool for RootfsTool {
                 let ret = guest.inject(fork).await;
                 self.clear_exec_snapshot(guest);
                 self.end_child_files(guest, ret.is_ok());
+                self.note_child_mount_ns(guest, 0, &ret);
                 Ok(ret?)
             }
             #[cfg(not(target_arch = "aarch64"))]
@@ -3031,15 +4008,34 @@ impl Tool for RootfsTool {
                 if let Err(e) = self.stage_fork_snapshot(guest) {
                     return Err(e.into());
                 }
-                self.stage_child_files(guest, libc::SIGCHLD as u64);
+                // vfork is clone(CLONE_VM | CLONE_VFORK | SIGCHLD).
+                self.stage_child_files(
+                    guest,
+                    (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as u64,
+                );
                 let ret = guest.inject(vfork).await;
                 self.clear_exec_snapshot(guest);
                 self.end_child_files(guest, ret.is_ok());
+                self.note_child_mount_ns(guest, 0, &ret);
                 Ok(ret?)
+            }
+            Syscall::Setns(setns) => {
+                // Any successful setns may move the caller out of the
+                // tracer's mount namespace (nstype 0 names none): the ptrace
+                // cmdline route then falls back for it.
+                let ret = guest.inject(setns).await?;
+                if ret == 0 {
+                    note_mount_ns_moved(guest.pid().as_raw());
+                }
+                Ok(ret)
             }
             Syscall::Unshare(unshare) => {
                 let files_flag = unshare.flags().bits() & libc::CLONE_FILES != 0;
+                let mount_flag = unshare.flags().bits() & libc::CLONE_NEWNS != 0;
                 let ret = guest.inject(unshare).await?;
+                if ret == 0 && mount_flag {
+                    note_mount_ns_moved(guest.pid().as_raw());
+                }
                 if ret == 0 && files_flag {
                     // The kernel gave the caller a copy of its table.
                     let own = files_of(guest);
@@ -3104,160 +4100,204 @@ impl Tool for RootfsTool {
                     let e = guest.inject(execve).await.unwrap_err();
                     return Err(e.into());
                 };
-                let mut guest_path = path_ptr.read(&guest.memory())?;
-                // Remember as-exec'd argv for /proc/self/cmdline.
-                {
-                    use reverie::syscalls::ReadAddr as _;
-                    let mut argv: Vec<Vec<u8>> = Vec::new();
-                    if let Some(a) = execve.argv() {
-                        if let Ok(ptrs) = a.read(&guest.memory()) {
-                            for p in ptrs.iter().take(64) {
-                                if let Ok(cs) = p.read(&guest.memory()) {
-                                    argv.push(cs.into_bytes());
+                // The exe record (with its host flag) and the argv are
+                // written below, before the injection, for the successor's
+                // snapshot. A successful exec never returns here, so every
+                // return is a failed exec, which leaves the process's exe
+                // and argv as they were, as the kernel does.
+                let prior = self.exec_identity(guest);
+                let outcome: Result<i64, Error> = {
+                    let guest = &mut *guest;
+                    async move {
+                        let mut guest_path = path_ptr.read(&guest.memory())?;
+                        // Remember as-exec'd argv for /proc/self/cmdline.
+                        {
+                            use reverie::syscalls::ReadAddr as _;
+                            let mut argv: Vec<Vec<u8>> = Vec::new();
+                            if let Some(a) = execve.argv() {
+                                if let Ok(ptrs) = a.read(&guest.memory()) {
+                                    for p in ptrs.iter().take(64) {
+                                        if let Ok(cs) = p.read(&guest.memory()) {
+                                            argv.push(cs.into_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                            if argv.is_empty() {
+                                argv.push(guest_path.as_os_str().as_bytes().to_vec());
+                            }
+                            pid_argv_map()
+                                .lock()
+                                .unwrap()
+                                .insert(guest.pid().as_raw(), argv.clone());
+                            self.state.lock().unwrap().argv = argv;
+                        }
+                        // As for open, by the selected final entry.
+                        let mut own_exe_host = false;
+                        match self.self_link_route(guest, libc::AT_FDCWD, &guest_path, true)? {
+                            SelfLink::Exe => {
+                                guest_path = self.own_exe_route(guest, libc::AT_FDCWD);
+                                own_exe_host = self.state.lock().unwrap().exe_host;
+                            }
+                            SelfLink::RowExe(pid) => {
+                                if let Some(exe) = Self::row_exe_guest(pid) {
+                                    guest_path = exe;
+                                }
+                            }
+                            // A cmdline file is not an executable: the kernel's answer.
+                            SelfLink::Cmdline(_) | SelfLink::SharedCmdline(_) | SelfLink::Walk => {}
+                        }
+                        let (host, _, resolved, other) =
+                            self.translate_follow_uncached(guest, libc::AT_FDCWD, &guest_path)?;
+                        {
+                            // The record names the file this exec reaches, so a
+                            // later open or readlink of /proc/self/exe holds still
+                            // when the walk went through another process's
+                            // directory link and that process moves:
+                            // the
+                            // walk's canonical guest route; after a Raw hand-over,
+                            // the reached file's name ([`Self::reached_exe_name`]),
+                            // a host path when it has no guest name. Otherwise the
+                            // spelling, made absolute, as before: its basename is
+                            // the comm name the kernel gives the program.
+                            let abs = {
+                                let st = self.state.lock().unwrap();
+                                self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path)
+                            };
+                            let (exe, exe_host) = if own_exe_host {
+                                (guest_path.clone(), true)
+                            } else {
+                                match other {
+                                    OtherLink::Raw => {
+                                        let cfg = self.config(guest);
+                                        Self::reached_exe_name(&cfg, &host).unwrap_or((abs, false))
+                                    }
+                                    OtherLink::Spliced => (resolved.unwrap_or(abs), false),
+                                    OtherLink::None => (abs, false),
+                                }
+                            };
+                            // A file with no guest name has no entry: the
+                            // old exe's would be stale.
+                            if !exe_host {
+                                let canon = self.canonical_exe(guest, &exe);
+                                pid_exe_map()
+                                    .lock()
+                                    .unwrap()
+                                    .insert(guest.pid().as_raw(), canon);
+                            } else {
+                                pid_exe_map().lock().unwrap().remove(&guest.pid().as_raw());
+                            }
+                            let mut st = self.state.lock().unwrap();
+                            st.exe_guest = exe;
+                            st.exe_host = exe_host;
+                        }
+                        if std::env::var_os("LITEROOT_DEBUG").is_some() {
+                            eprintln!("literoot-tool: execve {guest_path:?} -> {host:?}");
+                        }
+                        // PT_INTERP rewrite (design §4.7): exec the rootfs
+                        // dynamic linker with the guest program as its
+                        // argument, reusing the original argv pointers
+                        // (only the pointer array + interp path are staged).
+                        // Shebang scripts: the kernel would open the
+                        // #! interpreter on the HOST (measured: apk
+                        // trigger scripts ran host /bin/sh). `exec_script`
+                        // builds its own exec of the guest interpreter
+                        // (through that interpreter's loader when it is a
+                        // dynamic ELF), with the script as its argument.
+                        let is_fd_path = {
+                            let c: Vec<String> = guest_path
+                                .components()
+                                .filter_map(|x| match x {
+                                    std::path::Component::Normal(v) => {
+                                        Some(v.to_string_lossy().into_owned())
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            c.len() >= 3 && c[0] == "proc" && c[2] == "fd"
+                        };
+                        // The image as the calling thread names it
+                        // (thread-self is its own task directory).
+                        let image =
+                            host_for_tool_read(&host, guest.pid().as_raw(), guest.tid().as_raw());
+                        // fd-path scripts: skip sniffing entirely —
+                        // reading the fd would drain pipe input.
+                        let shebang = if is_fd_path {
+                            None
+                        } else {
+                            std::fs::read(&image)
+                                .ok()
+                                .and_then(|img| parse_shebang(&img))
+                        };
+                        if let Some((script_interp, optarg)) = shebang {
+                            // A successful inject never returns; any return
+                            // is a failed exec, so drop the staged snapshot
+                            // (the next exec re-stages from live state).
+                            match self
+                                .exec_script(guest, execve, &guest_path, &script_interp, optarg.as_deref())
+                                .await
+                            {
+                                Ok(res) => {
+                                    self.invalidate_exec_snapshot(guest)?;
+                                    return res;
+                                }
+                                Err(e) => {
+                                    self.invalidate_exec_snapshot(guest)?;
+                                    return Err(e);
                                 }
                             }
                         }
-                    }
-                    if argv.is_empty() {
-                        argv.push(guest_path.as_os_str().as_bytes().to_vec());
-                    }
-                    pid_argv_map()
-                        .lock()
-                        .unwrap()
-                        .insert(guest.pid().as_raw(), argv.clone());
-                    self.state.lock().unwrap().argv = argv;
-                }
-                let mut guest_path = path_ptr.read(&guest.memory())?;
-                // Remember as-exec'd argv for /proc/self/cmdline.
-                {
-                    use reverie::syscalls::ReadAddr as _;
-                    let mut argv: Vec<Vec<u8>> = Vec::new();
-                    if let Some(a) = execve.argv() {
-                        if let Ok(ptrs) = a.read(&guest.memory()) {
-                            for p in ptrs.iter().take(64) {
-                                if let Ok(cs) = p.read(&guest.memory()) {
-                                    argv.push(cs.into_bytes());
+                        let interp = if is_fd_path {
+                            None
+                        } else {
+                            std::fs::read(&image)
+                                .ok()
+                                .and_then(|img| crate::translate::elf_interp(&img))
+                        };
+                        if let Some(interp_guest) = interp {
+                            match self
+                                .exec_via_interp(guest, execve, &guest_path, &interp_guest)
+                                .await
+                            {
+                                Ok(res) => {
+                                    self.invalidate_exec_snapshot(guest)?;
+                                    return res;
+                                }
+                                Err(e) => {
+                                    self.invalidate_exec_snapshot(guest)?;
+                                    return Err(e);
                                 }
                             }
                         }
+                        // Stage the path in the scratch page, not on
+                        // the guest stack (stack staging corrupts the
+                        // execve caller's frame in interp-route
+                        // processes; measured EFAULT on second execve).
+                        let mut path_bytes = host.as_os_str().as_bytes().to_vec();
+                        path_bytes.push(0);
+                        // The kernel's own limit on the name (getname,
+                        // PATH_MAX with the NUL), and the page's size: a
+                        // longer one would run into the next page, another
+                        // thread's.
+                        if path_bytes.len() > libc::PATH_MAX as usize {
+                            return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
+                        }
+                        let scratch = self.scratch_write(guest, &path_bytes).await?;
+                        let rewritten = execve.with_path(PathPtr::from_ptr(
+                            scratch as *const libc::c_char,
+                        ));
+                        if let Err(e) = self.stage_snapshot(guest) {
+                            return Err(e.into());
+                        }
+                        // Success does not return; mirror strace-tool shape.
+                        let e = guest.inject(rewritten).await.unwrap_err();
+                        self.invalidate_exec_snapshot(guest)?;
+                        Err::<i64, Error>(e.into())
                     }
-                    if argv.is_empty() {
-                        argv.push(guest_path.as_os_str().as_bytes().to_vec());
-                    }
-                    pid_argv_map()
-                        .lock()
-                        .unwrap()
-                        .insert(guest.pid().as_raw(), argv.clone());
-                    self.state.lock().unwrap().argv = argv;
-                }
-                if is_self_exe(&guest_path, guest.pid().as_raw()) {
-                    guest_path = self.exe_guest(guest);
-                }
-                {
-                    let abs = {
-                        let st = self.state.lock().unwrap();
-                        self.guest_abs(guest, &st, libc::AT_FDCWD, &guest_path)
-                    };
-                    let canon = self.canonical_exe(guest, &abs);
-                    pid_exe_map()
-                        .lock()
-                        .unwrap()
-                        .insert(guest.pid().as_raw(), canon);
-                    let mut st = self.state.lock().unwrap();
-                    st.exe_guest = abs;
-                }
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &guest_path);
-                if std::env::var_os("LITEROOT_DEBUG").is_some() {
-                    eprintln!("literoot-tool: execve {guest_path:?} -> {host:?}");
-                }
-                // PT_INTERP rewrite (design §4.7): exec the rootfs
-                // dynamic linker with the guest program as its
-                // argument, reusing the original argv pointers
-                // (only the pointer array + interp path are staged).
-                // Shebang scripts: the kernel would open the
-                // #! interpreter on the HOST (measured: apk
-                // trigger scripts ran host /bin/sh). `exec_script`
-                // builds its own exec of the guest interpreter
-                // (through that interpreter's loader when it is a
-                // dynamic ELF), with the script as its argument.
-                let is_fd_path = {
-                    let c: Vec<String> = guest_path
-                        .components()
-                        .filter_map(|x| match x {
-                            std::path::Component::Normal(v) => {
-                                Some(v.to_string_lossy().into_owned())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    c.len() >= 3 && c[0] == "proc" && c[2] == "fd"
+                    .await
                 };
-                // fd-path scripts: skip sniffing entirely —
-                // reading the fd would drain pipe input.
-                let shebang = if is_fd_path {
-                    None
-                } else {
-                    std::fs::read(&host_for_tool_read(&host, guest.pid().as_raw()))
-                        .ok()
-                        .and_then(|img| parse_shebang(&img))
-                };
-                if let Some((script_interp, optarg)) = shebang {
-                    // A successful inject never returns; any return
-                    // is a failed exec, so drop the staged snapshot
-                    // (the next exec re-stages from live state).
-                    match self
-                        .exec_script(guest, execve, &guest_path, &script_interp, optarg.as_deref())
-                        .await
-                    {
-                        Ok(res) => {
-                            self.invalidate_exec_snapshot(guest)?;
-                            return res;
-                        }
-                        Err(e) => {
-                            self.invalidate_exec_snapshot(guest)?;
-                            return Err(e);
-                        }
-                    }
-                }
-                let interp = if is_fd_path {
-                    None
-                } else {
-                    std::fs::read(&host_for_tool_read(&host, guest.pid().as_raw()))
-                        .ok()
-                        .and_then(|img| crate::translate::elf_interp(&img))
-                };
-                if let Some(interp_guest) = interp {
-                    match self
-                        .exec_via_interp(guest, execve, &guest_path, &interp_guest)
-                        .await
-                    {
-                        Ok(res) => {
-                            self.invalidate_exec_snapshot(guest)?;
-                            return res;
-                        }
-                        Err(e) => {
-                            self.invalidate_exec_snapshot(guest)?;
-                            return Err(e);
-                        }
-                    }
-                }
-                // Stage the path in the scratch page, not on
-                // the guest stack (stack staging corrupts the
-                // execve caller's frame in interp-route
-                // processes; measured EFAULT on second execve).
-                let mut path_bytes = host.as_os_str().as_bytes().to_vec();
-                path_bytes.push(0);
-                let scratch = self.scratch_write(guest, &path_bytes).await?;
-                let rewritten = execve.with_path(PathPtr::from_ptr(
-                    scratch as *const libc::c_char,
-                ));
-                if let Err(e) = self.stage_snapshot(guest) {
-                    return Err(e.into());
-                }
-                // Success does not return; mirror strace-tool shape.
-                let e = guest.inject(rewritten).await.unwrap_err();
-                self.invalidate_exec_snapshot(guest)?;
-                Err(e.into())
+                self.restore_exec_identity(guest, prior);
+                outcome
             }
             // ---- identity (fake-root / -i, design §4.4) ----
             Syscall::Getuid(_) if self.fake_ids(guest).is_some() => {
@@ -3457,7 +4497,7 @@ impl Tool for RootfsTool {
                     return self.identity_xattr_result(guest, ret);
                 };
                 let g = pp.read(&guest.memory())?;
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &g)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| x.with_path(PathPtr::from_ptr(ptr)))
                     .await?;
@@ -3473,7 +4513,7 @@ impl Tool for RootfsTool {
                     return self.identity_xattr_result(guest, ret);
                 };
                 let g = pp.read(&guest.memory())?;
-                let host = self.translate_for(guest, libc::AT_FDCWD, &g);
+                let host = self.translate_for(guest, libc::AT_FDCWD, &g)?;
                 let (_guard, rewritten) = self
                     .with_guest_path(guest, &host, |ptr| x.with_path(PathPtr::from_ptr(ptr)))
                     .await?;
@@ -3546,7 +4586,7 @@ impl Tool for RootfsTool {
                     return Ok(guest.inject(cr).await?);
                 };
                 let g = pp.read(&guest.memory())?;
-                let host = self.translate_follow(guest, libc::AT_FDCWD, &g);
+                let host = self.translate_follow(guest, libc::AT_FDCWD, &g)?;
                 // Only fake root may chroot: proot gives a non-root fake
                 // euid the kernel's answer, and identity-only does not
                 // trace chroot at all; either way on the translated path.
@@ -3570,7 +4610,10 @@ impl Tool for RootfsTool {
             }
             Syscall::Bind(b) => {
                 use reverie::syscalls::FromToRaw as _;
-                match self.stage_sockaddr(guest, b.umyaddr(), b.addrlen()).await? {
+                match self
+                    .stage_sockaddr(guest, b.umyaddr(), b.addrlen(), false)
+                    .await?
+                {
                     Some((_g, raw, len)) => {
                         let rewritten = b
                             .with_umyaddr(reverie::syscalls::AddrMut::from_ptr(
@@ -3584,7 +4627,10 @@ impl Tool for RootfsTool {
             }
             Syscall::Connect(c) => {
                 use reverie::syscalls::FromToRaw as _;
-                match self.stage_sockaddr(guest, c.uservaddr(), c.addrlen()).await? {
+                match self
+                    .stage_sockaddr(guest, c.uservaddr(), c.addrlen(), true)
+                    .await?
+                {
                     Some((_g, raw, len)) => {
                         let rewritten = c
                             .with_uservaddr(reverie::syscalls::AddrMut::from_ptr(
@@ -3640,10 +4686,10 @@ impl RootfsTool {
         register_guest_pid(guest.pid().as_raw());
     }
 
-    /// Stage bytes in the per-process guest scratch page
-    /// (injected anonymous mmap, allocated once). Returns the
-    /// guest address. Used for execve paths, where guest-stack
-    /// staging is unsafe (see ProcState::scratch).
+    /// Stage bytes at offset 0 of the calling thread's guest scratch page
+    /// ([`Self::scratch_write_at`]). Returns the guest address. Used for
+    /// execve paths, where guest-stack staging is unsafe (see
+    /// [`RootfsThreadState::scratch`]).
     async fn scratch_write<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -3652,6 +4698,11 @@ impl RootfsTool {
         self.scratch_write_at(guest, bytes, 0).await
     }
 
+    /// Stage `bytes` at `offset` in the calling thread's scratch page: its
+    /// own, else a free page of this image (a pooled one or an exited
+    /// thread's, zeroed first), else the first page of a new pool
+    /// ([`Self::map_scratch`]). A write that would end past the page is
+    /// ENAMETOOLONG. Returns the guest address.
     async fn scratch_write_at<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -3659,33 +4710,79 @@ impl RootfsTool {
         offset: usize,
     ) -> Result<usize, Error> {
         use reverie::syscalls::MemoryAccess as _;
-        let existing = self.state.lock().unwrap().scratch;
-        let base = match existing {
-            Some(b) => b,
-            None => {
-                let mmap = reverie::syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(4096)
-                    .with_prot(
-                        reverie::syscalls::ProtFlags::PROT_READ
-                            | reverie::syscalls::ProtFlags::PROT_WRITE,
-                    )
-                    .with_flags(
-                        reverie::syscalls::MapFlags::MAP_PRIVATE
-                            | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
-                    )
-                    .with_fd(-1)
-                    .with_offset(0);
-                let addr = guest.inject(mmap).await? as usize;
-                self.state.lock().unwrap().scratch = Some(addr);
-                addr
-            }
+        // Never past the thread's page (the next may be another thread's):
+        // every caller is bounded below this, and this makes it so.
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > SCRATCH_PAGE) {
+            return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
+        }
+        let base = match guest.thread_state().scratch {
+            Some(page) => page.addr,
+            None => match self.take_free_page(guest)? {
+                Some(addr) => addr,
+                None => self.map_scratch(guest).await?,
+            },
         };
         let mut mem = guest.memory();
         let addr: reverie::syscalls::AddrMut<u8> =
             unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(base + offset) };
-        mem.write(addr, bytes)?;
+        // All of it or an error, never a truncated argument.
+        mem.write_exact(addr, bytes)?;
         Ok(base + offset)
+    }
+
+    /// A free page of this image (a pooled one or an exited thread's) for
+    /// the calling thread, zeroed before the thread owns it, so nothing it
+    /// left is ever read. Ok(None) when none is free. A zeroing that fails
+    /// is the error, and that page is lost (never queued again).
+    fn take_free_page<T: Guest<Self>>(&self, guest: &mut T) -> Result<Option<usize>, Error> {
+        use reverie::syscalls::MemoryAccess as _;
+        let page = {
+            let mut st = self.state.lock().unwrap();
+            let image = st.scratch_image;
+            st.free_scratch.pop().map(|addr| ScratchPage { addr, image })
+        };
+        let Some(page) = page else {
+            return Ok(None);
+        };
+        let addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(page.addr) };
+        guest.memory().write_exact(addr, &[0u8; SCRATCH_PAGE])?;
+        guest.thread_state_mut().scratch = Some(page);
+        Ok(Some(page.addr))
+    }
+
+    /// Map a pool of [`SCRATCH_POOL`] scratch pages (one injected anonymous
+    /// mmap, zero-filled by the kernel): the calling thread takes the
+    /// first, tagged with the current image, and the rest go on the free
+    /// list for the next new threads. The image is read before the mmap: if
+    /// an exec started a new one meanwhile, the pool is of the old address
+    /// space and nothing is queued (on the pinned Reverie a thread an exec
+    /// kills never resumes its handler, so this is a guard, not a path).
+    async fn map_scratch<T: Guest<Self>>(&self, guest: &mut T) -> Result<usize, Error> {
+        let image = self.state.lock().unwrap().scratch_image;
+        let mmap = reverie::syscalls::Mmap::new()
+            .with_addr(None)
+            .with_len(SCRATCH_PAGE * SCRATCH_POOL)
+            .with_prot(
+                reverie::syscalls::ProtFlags::PROT_READ
+                    | reverie::syscalls::ProtFlags::PROT_WRITE,
+            )
+            .with_flags(
+                reverie::syscalls::MapFlags::MAP_PRIVATE
+                    | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
+            )
+            .with_fd(-1)
+            .with_offset(0);
+        let addr = guest.inject(mmap).await? as usize;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.scratch_image == image {
+                // Popped from the end: the lowest pages go first.
+                st.free_scratch.extend((1..SCRATCH_POOL).rev().map(|i| addr + i * SCRATCH_PAGE));
+            }
+        }
+        guest.thread_state_mut().scratch = Some(ScratchPage { addr, image });
+        Ok(addr)
     }
 
     /// Exec `guest_prog` through the rootfs interp `interp_guest`:
@@ -3709,7 +4806,9 @@ impl RootfsTool {
         use reverie::syscalls::FromToRaw as _;
 
         let cfg = self.config(guest);
-        let interp_host = cfg.translate(Path::new(interp_guest), Path::new("/"), None);
+        // The kernel's execve follows the loader's final symlink: resolve
+        // it here, through the guest root, not the host's.
+        let interp_host = follow_guest_path(&cfg, (guest.pid().as_raw(), guest.tid().as_raw()), Path::new(interp_guest))?;
         let orig_argv: Vec<usize> = match execve.argv() {
             Some(argv) => argv
                 .read(&guest.memory())?
@@ -3795,18 +4894,14 @@ impl RootfsTool {
         use reverie::syscalls::FromToRaw as _;
 
         let cfg = self.config(guest);
-        let interp_host = {
-            let h = cfg.translate(Path::new(script_interp), Path::new("/"), None);
-            resolve_symlink_chain(&cfg, Some(PathBuf::from(script_interp)), h)
-        };
+        let ids = (guest.pid().as_raw(), guest.tid().as_raw());
+        let interp_host = follow_guest_path(&cfg, ids, Path::new(script_interp))?;
         // The interpreter's own loader, if it is a dynamic ELF.
         let loader_host = std::fs::read(&interp_host)
             .ok()
             .and_then(|img| crate::translate::elf_interp(&img))
-            .map(|ld| {
-                let h = cfg.translate(Path::new(&ld), Path::new("/"), None);
-                resolve_symlink_chain(&cfg, Some(PathBuf::from(&ld)), h)
-            });
+            .map(|ld| follow_guest_path(&cfg, ids, Path::new(&ld)))
+            .transpose()?;
         let orig_argv: Vec<usize> = match execve.argv() {
             Some(argv) => argv
                 .read(&guest.memory())?
@@ -3927,9 +5022,10 @@ impl RootfsTool {
 
     fn canonical_exe<T: Guest<Self>>(&self, guest: &T, p: &Path) -> PathBuf {
         let cfg = self.config(guest);
-        let host = cfg.translate(p, Path::new("/"), None);
-        let resolved = resolve_symlink_chain(&cfg, Some(p.to_path_buf()), host);
-        cfg.reverse(&resolved).unwrap_or_else(|| p.to_path_buf())
+        follow_guest_path(&cfg, (guest.pid().as_raw(), guest.tid().as_raw()), p)
+            .ok()
+            .and_then(|resolved| cfg.reverse(&resolved))
+            .unwrap_or_else(|| p.to_path_buf())
     }
 
     fn exe_guest<T: Guest<Self>>(&self, guest: &T) -> PathBuf {
@@ -3963,6 +5059,47 @@ impl RootfsTool {
         }
     }
 
+    /// The path an open or execve of the caller's own exe walks, in place
+    /// of the spelled link: its recorded guest name; or, for an exe with
+    /// no guest name ([`ProcState::exe_host`]), that host path, with this
+    /// dispatch's translation of it (followed or not, from `dirfd`)
+    /// memoized to itself, so the arm opens the host file as is.
+    fn own_exe_route<T: Guest<Self>>(&self, guest: &T, dirfd: i32) -> PathBuf {
+        let exe = self.exe_guest(guest);
+        let mut st = self.state.lock().unwrap();
+        if st.exe_host {
+            let seq = st.dispatch_seq;
+            st.translate_memo
+                .retain(|((at, fd, path, _), _)| !(*at == seq && *fd == dirfd && *path == exe));
+            for follow in [false, true] {
+                st.translate_memo
+                    .push(((seq, dirfd, exe.clone(), follow), Ok((exe.clone(), 0, None, OtherLink::None))));
+            }
+        }
+        exe
+    }
+
+    /// The host file a walk with a Raw hand-over reached (`host` still
+    /// holds the other process's link), named without that link, and
+    /// whether that name is a host path: the guest name when one leads
+    /// back to the same file, else the host path. None when it cannot be
+    /// named from the Tool (another mount namespace, a deleted file, a file
+    /// the Tool cannot reach): the recorded exe then stays the spelling,
+    /// disclosed in docs/design.md.
+    fn reached_exe_name(cfg: &RootConfig, host: &Path) -> Option<(PathBuf, bool)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::metadata(host).ok()?;
+        let named = std::fs::canonicalize(host).ok()?;
+        let same = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.dev() == md.dev() && m.ino() == md.ino());
+        if named.starts_with("/proc") || !same(&named) {
+            return None;
+        }
+        match cfg.reverse(&named) {
+            Some(g) if same(&cfg.translate(&g, Path::new("/"), None)) => Some((g, false)),
+            _ => Some((named, true)),
+        }
+    }
+
     fn exe_guest_fallback<T: Guest<Self>>(&self, guest: &T) -> PathBuf {
         let st = self.state.lock().unwrap();
         if st.cwd == Path::new("/__literoot_unset__") {
@@ -3986,8 +5123,11 @@ impl RootfsTool {
         new_g: &Path,
     ) {
         let mut st = self.state.lock().unwrap();
-        let old_abs = self.guest_abs(guest, &st, old_dirfd, old_g);
-        let new_abs = self.guest_abs(guest, &st, new_dirfd, new_g);
+        // Both names as the kernel resolved them, links included: the
+        // recorded cwd is canonical, so only a canonical prefix matches it.
+        let cfg = self.config_locked(guest, &st);
+        let old_abs = canonical_dir(&cfg, &self.guest_abs(guest, &st, old_dirfd, old_g));
+        let new_abs = canonical_dir(&cfg, &self.guest_abs(guest, &st, new_dirfd, new_g));
         if let Ok(suffix) = st.cwd.clone().strip_prefix(&old_abs).map(|s| s.to_path_buf()) {
             let mut p = new_abs;
             if !suffix.as_os_str().is_empty() {
@@ -4018,8 +5158,9 @@ impl RootfsTool {
     /// kernel's cwd of the calling task (/proc/<pid>/task/<tid>/cwd), which
     /// is right even if the fd was replaced after the call: `candidate`
     /// (the spelling the call implies) when it names that directory, else
-    /// the link's target mapped into the guest, else UNNAMED_CWD for a
-    /// directory with no guest path (deleted, outside every tree). When
+    /// the link's target mapped into the guest when that name leads back to
+    /// it, else UNNAMED_CWD for a directory with no guest path (deleted,
+    /// outside every tree, shadowed by a deeper bind). When
     /// /proc cannot be read, `candidate` or the old cwd stands.
     fn live_cwd_guest_path<T: Guest<Self>>(
         &self,
@@ -4048,10 +5189,11 @@ impl RootfsTool {
                 return p;
             }
         }
-        std::fs::read_link(&link)
-            .ok()
-            .and_then(|t| cfg.reverse(&t))
-            .unwrap_or_else(|| PathBuf::from(UNNAMED_CWD))
+        // A name that leads back to this directory: a deeper bind can
+        // shadow the plain reverse.
+        GuestProcLinks::new(cfg, guest.pid().as_raw(), guest.tid().as_raw())
+            .verified_reverse(Path::new(&link), &live)
+            .unwrap_or_else(|_| PathBuf::from(UNNAMED_CWD))
     }
 
     /// The guest path of the file open as `fd`, or None when it has none.
@@ -4375,36 +5517,21 @@ impl RootfsTool {
         }
     }
 
-    /// /proc/self/cmdline (or own-pid) synthesis: the kernel
-    /// buffer names our loader argv; guests must see the
-    /// as-exec'd argv. Returns a host temp-file fd via injected
-    /// openat, or None to fall through.
+    /// /proc/<pid>/cmdline synthesis for process `target_pid`, chosen by
+    /// [`Self::self_link_route`]: the kernel buffer names our loader argv;
+    /// guests must see the as-exec'd argv. Returns a descriptor of a memfd
+    /// holding it ([`Self::open_argv_memfd`]), or Ok(None) for the kernel's
+    /// own file: no argv to synthesize, or no memfd.
     async fn open_synthetic_cmdline<T: Guest<Self>>(
         &self,
         guest: &mut T,
-        guest_path: &Path,
-    ) -> Option<i64> {
-        let comps: Vec<String> = guest_path
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(v) => Some(v.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        let target_pid: Option<i32> = if comps.len() == 3 && comps[0] == "proc" && comps[2] == "cmdline" {
-            if comps[1] == "self" || comps[1] == "thread-self" {
-                Some(guest.pid().as_raw())
-            } else {
-                comps[1].parse().ok()
-            }
-        } else {
-            None
-        };
-        let Some(target_pid) = target_pid else { return None };
+        target_pid: i32,
+        call: CmdlineOpen,
+    ) -> Result<Option<i64>, Error> {
         let argv: Vec<Vec<u8>> = if target_pid == guest.pid().as_raw() {
             let materialized = self.current_argv(guest.config());
             if materialized.is_empty() {
-                return None;
+                return Ok(None);
             }
             materialized
         } else {
@@ -4412,38 +5539,373 @@ impl RootfsTool {
                 Some(row) => row.argv,
                 None => match pid_argv_map().lock().unwrap().get(&target_pid) {
                     Some(a) => a.clone(),
-                    None => return None,
+                    None => return Ok(None),
                 },
             };
             if argv.is_empty() {
                 let init = guest.config().initial_argv.clone();
                 if init.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 init.into_iter().map(|s| s.into_bytes()).collect::<Vec<_>>()
             } else {
                 argv
             }
         };
+        self.open_argv_memfd(guest, &argv, call).await
+    }
+
+    /// A1: the cmdline of a process with a shared-record row, from the row
+    /// alone. A row gone since the entry was selected, or a row with no
+    /// argv, gets the kernel's own file (Ok(None)); the bare-pid argv cache
+    /// and the caller's initial argv never answer for it.
+    async fn open_shared_cmdline<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        pid: i32,
+        call: CmdlineOpen,
+    ) -> Result<Option<i64>, Error> {
+        match Self::shared_process_record(pid) {
+            Some(row) if !row.argv.is_empty() => self.open_argv_memfd(guest, &row.argv, call).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// A1: the guest path of a shared-record row's exe, which an open or
+    /// execve of that process's `exe` link reaches instead of the kernel's
+    /// link (on the in-guest backends, the loader). None, for the kernel's
+    /// own link, when the row is gone or has no exe.
+    fn row_exe_guest(pid: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStringExt as _;
+        let row = Self::shared_process_record(pid)?;
+        (!row.exe_guest.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(row.exe_guest)))
+    }
+
+    /// A cmdline literoot answers itself (§4.9.5): a memfd holding `argv`,
+    /// each argument NUL-terminated. On ptrace the tracer makes it and the
+    /// guest's own call reopens it ([`Self::open_cmdline_via_tracer`]).
+    /// In-guest an injected memfd_create makes it in the guest
+    /// (MFD_CLOEXEC exactly when the guest's open asked for O_CLOEXEC), and
+    /// the Tool fills it at offset 0
+    /// ([`write_guest_fd`]), so the guest's descriptor reads it from the
+    /// start. Ok(None), with the fallback line, when it cannot be made; the
+    /// kernel's own file then answers:
+    /// - the probe gate is closed (a guest filter installed or being
+    ///   installed, or the thread's dispatch ON or unreadable), so nothing
+    ///   is injected;
+    /// - memfd_create fails, or admission refuses it;
+    /// - the write fails, or the calling thread's descriptor is not the
+    ///   empty memfd just made; the memfd is closed first.
+    async fn open_argv_memfd<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        argv: &[Vec<u8>],
+        call: CmdlineOpen,
+    ) -> Result<Option<i64>, Error> {
         let mut content: Vec<u8> = Vec::new();
-        for a in &argv {
+        for a in argv {
             content.extend_from_slice(a);
             content.push(0);
         }
-        let tmp = format!("/tmp/.literoot-cmdline-{}", guest.pid().as_raw());
-        std::fs::write(&tmp, &content).ok()?;
-        let open_req = reverie::syscalls::Openat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_flags(reverie::syscalls::OFlag::O_RDONLY);
-        let (_g, rewritten) = self
-            .with_guest_path(guest, Path::new(&tmp), |ptr| {
-                open_req.with_path(PathPtr::from_ptr(ptr))
-            })
-            .await
-            .ok()?;
-        let r = guest.inject(rewritten).await.ok();
-        let _ = std::fs::remove_file(&tmp);
-        r
+        if !guest.config().tool_in_guest() { // cmdline: memfd route
+            return self.open_cmdline_via_tracer(guest, &content, call).await;
+        }
+        if self.injection_gate_closed(guest) {
+            note_cmdline_fallback();
+            return Ok(None);
+        }
+        let flags = if call.cloexec() { libc::MFD_CLOEXEC } else { 0 };
+        // A staging failure is the fallback too, not the open's error.
+        // The name has a scratch slot of its own:
+        // admission stages its status read in the path slots first.
+        let Ok(name) = self.scratch_write_at(guest, b"literoot-cmdline\0", SCRATCH_MEMFD_NAME).await else {
+            note_cmdline_fallback();
+            return Ok(None);
+        };
+        let create = reverie::syscalls::MemfdCreate::new()
+            .with_name(PathPtr::from_ptr(name as *const libc::c_char))
+            .with_flags(flags);
+        let fd = match self.admitted_inject(guest, Syscall::MemfdCreate(create)).await {
+            Some(Ok(fd)) => fd as i32,
+            _ => {
+                note_cmdline_fallback();
+                return Ok(None);
+            }
+        };
+        if !write_guest_fd(guest.tid().as_raw(), fd, &content) {
+            let _ = guest.inject(reverie::syscalls::Close::new().with_fd(fd)).await;
+            note_cmdline_fallback();
+            return Ok(None);
+        }
+        Ok(Some(fd as i64))
+    }
+
+    /// The ptrace answer for a cmdline literoot synthesizes.
+    /// The tracer makes the
+    /// memfd, fills it, makes it 0444 and seals it, and the guest's own call
+    /// is rewritten to reopen it through
+    /// `/proc/<tracer pid>/task/<tracer tid>/fd/<n>` (the tracer thread's own
+    /// table, which a thread of a tracer with unshared tables need not share
+    /// with its leader). The guest's call is the only syscall it injects,
+    /// and what it writes into the guest is that call's arguments, staged in
+    /// the thread's scratch page: the rewritten name and, for openat2, a
+    /// 24-byte open_how. A thread with no page yet takes one from the pool,
+    /// or, the pool used up, maps a new pool first (an injected mmap, which
+    /// the guest's filters see: [`Self::map_scratch`]). The staging is a
+    /// tracer write into the guest, which ptrace allows only over a guest
+    /// the tracer may attach to (a non-dumpable guest cannot be staged into
+    /// unless the tracer is privileged; true of every translated call). The
+    /// descriptor identity check below does not need it. In order:
+    /// 1. Preconditions, else the fallback: [`tracer_route_ready`], and the
+    ///    guest has not left the tracer's mount namespace
+    ///    ([`mount_ns_moved`]). The guest's real root is the tracer's
+    ///    (literoot emulates chroot and never injects one; pivot_root needs a
+    ///    new mount namespace), and the rewritten name is absolute with the
+    ///    re-rooting resolve bits cleared, so the guest resolves it in the
+    ///    procfs the tracer sees.
+    /// 2. The kernel's argument checks, run by the tracer on a copy of the
+    ///    guest's arguments against descriptor -1, which opens nothing:
+    ///    EBADF means valid; EINVAL, E2BIG and EAGAIN are the guest's answer,
+    ///    and so is EFAULT for an unreadable open_how (and openat2's size
+    ///    checks, fs/open.c, in the kernel's order). A success was made up
+    ///    by a filter: the fallback, closing nothing. So is a copy of
+    ///    open_how the tracer cannot lay out as the guest has it.
+    /// 3. The answers the flags alone decide, in the kernel's order (the
+    ///    final entry is an existing regular file): O_CREAT|O_EXCL is EEXIST,
+    ///    O_DIRECTORY (O_TMPFILE too) is ENOTDIR, and a write access mode or
+    ///    O_TRUNC is EACCES unless [`tracer_overrides_dac`]. Under O_PATH
+    ///    only the ENOTDIR case applies.
+    /// 4. The rewritten call, with O_NOFOLLOW cleared (the guest named a
+    ///    regular file; the rewritten final entry is a magic link), and for
+    ///    openat2 the [`RESOLVE_BENEATH`]-family bits cleared in a staged
+    ///    24-byte copy of open_how (step 2 proved any longer tail zero).
+    ///    EMFILE, ENFILE and ENOMEM are the guest's answer; any other error is
+    ///    the fallback. A descriptor the tracer can inspect must name the
+    ///    memfd (same device and inode), or it is closed and the fallback
+    ///    answers; one it cannot inspect (a non-dumpable guest) stands on
+    ///    step 1.
+    /// 5. The tracer's descriptor closes when the call has returned, or when
+    ///    the handler is dropped; a restart code (ERESTART*) keeps it, held
+    ///    for that thread until its next route call or its exit.
+    ///
+    /// The fallback is Ok(None) with the fallback line: the arm opens the
+    /// kernel's own file.
+    async fn open_cmdline_via_tracer<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        content: &[u8],
+        call: CmdlineOpen,
+    ) -> Result<Option<i64>, Error> {
+        use reverie::syscalls::Errno;
+        use reverie::syscalls::MemoryAccess as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::fs::FileExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let fallback = || {
+            note_cmdline_fallback();
+            Ok(None)
+        };
+        let tid = guest.tid().as_raw();
+        release_held_tracer_fd(tid);
+        // 1.
+        if !tracer_route_ready() || mount_ns_moved(guest.pid().as_raw()) {
+            return fallback();
+        }
+        // 2.
+        let raw = call.raw();
+        let x = c"x".as_ptr();
+        let last_errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let (probe, probe_errno, how) = match call {
+            CmdlineOpen::Openat(_) => {
+                // SAFETY: a plain syscall; "x" is a valid string, and
+                // descriptor -1 opens nothing.
+                let r = unsafe {
+                    libc::syscall(libc::SYS_openat, -1, x, raw.arg2 as libc::c_int, raw.arg3 as libc::c_uint)
+                };
+                (r, last_errno(), None)
+            }
+            #[cfg(target_arch = "x86_64")]
+            CmdlineOpen::Open(_) => {
+                // SAFETY: as above.
+                let r = unsafe {
+                    libc::syscall(libc::SYS_openat, -1, x, raw.arg1 as libc::c_int, raw.arg2 as libc::c_uint)
+                };
+                (r, last_errno(), None)
+            }
+            CmdlineOpen::Openat2(..) => {
+                let (at, size) = (raw.arg2, raw.arg3);
+                // openat2's own order (fs/open.c, SYSCALL_DEFINE4(openat2)):
+                // the size against OPEN_HOW_SIZE_VER0 and the page size;
+                // then copy_struct_from_user (include/linux/uaccess.h):
+                // access_ok over the range, the extension past the 24 bytes
+                // (check_zeroed_user: word by word, E2BIG at the first
+                // nonzero word, EFAULT at an unreadable one), and only then
+                // the 24 bytes. The tracer's openat2 runs those checks on a
+                // copy laid out as the guest has it.
+                open_how_size_check(size, page_size()).map_err(Error::from)?;
+                if !user_range_ok(at, size) {
+                    return Err(Errno::EFAULT.into());
+                }
+                let read = |addr: usize, buf: &mut [u8]| {
+                    reverie::syscalls::Addr::<u8>::from_raw(addr)
+                        .is_some_and(|from| guest.memory().read_exact(from, buf).is_ok())
+                };
+                let Some(copy) = LayoutCopy::new(at, size, page_size(), read) else {
+                    return fallback();
+                };
+                // SAFETY: as above; `copy` maps every page of the `size`
+                // bytes at `copy.ptr()`, unreadable where the guest's are.
+                let r = unsafe { libc::syscall(libc::SYS_openat2, -1, x, copy.ptr(), size) };
+                let e = last_errno();
+                let how = copy.readable_prefix(24).map(|bytes| {
+                    let word = |i: usize| u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                    reverie::syscalls::OpenHow {
+                        flags: word(0),
+                        mode: word(8),
+                        resolve: word(16),
+                    }
+                });
+                (r, e, how)
+            }
+        };
+        // A relative name at descriptor -1 opens nothing, so a success was
+        // made up (a filter's SECCOMP_RET_ERRNO | 0, or a user-notification
+        // answer) and names no descriptor this probe owns: nothing is
+        // closed.
+        if probe >= 0 {
+            return fallback();
+        }
+        match probe_errno {
+            libc::EBADF => {}
+            // EFAULT is openat2's copy of the guest's open_how (the probe's
+            // own name is the tracer's): the guest's answer too.
+            libc::EINVAL | libc::E2BIG | libc::EAGAIN | libc::EFAULT => {
+                return Err(Errno::new(probe_errno).into());
+            }
+            _ => return fallback(),
+        }
+        // 3.
+        let flags = call.flags();
+        let flag = |f: libc::c_int| flags & f as u64 != 0;
+        let o_path = flag(libc::O_PATH);
+        if !o_path && flag(libc::O_CREAT) && flag(libc::O_EXCL) {
+            return Err(Errno::EEXIST.into());
+        }
+        if flag(libc::O_DIRECTORY) {
+            return Err(Errno::ENOTDIR.into());
+        }
+        let writes = flags & libc::O_ACCMODE as u64 != libc::O_RDONLY as u64 || flag(libc::O_TRUNC);
+        if !o_path && writes && !tracer_overrides_dac() {
+            return Err(Errno::EACCES.into());
+        }
+        // 4. The memfd, in the tracer.
+        // SAFETY: a plain syscall with a valid string.
+        let made = unsafe {
+            libc::memfd_create(c"literoot-cmdline".as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if made < 0 {
+            return fallback();
+        }
+        // SAFETY: memfd_create returned this new descriptor; it is owned here.
+        let memfd = unsafe { std::fs::File::from_raw_fd(made) };
+        if memfd.write_all_at(content, 0).is_err()
+            || memfd.set_permissions(std::fs::Permissions::from_mode(0o444)).is_err()
+        {
+            return fallback();
+        }
+        // SAFETY: a plain fcntl on a descriptor owned here. Sealing is best
+        // effort: it keeps a guest that may write a 0444 file
+        // (CAP_DAC_OVERRIDE) from changing the answer.
+        unsafe {
+            libc::fcntl(
+                memfd.as_raw_fd(),
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+            )
+        };
+        let Ok(want) = memfd.metadata() else {
+            return fallback();
+        };
+        // The tracer thread's own table (`task/<tid>`): a thread that
+        // unshared its table is not the group leader's.
+        // SAFETY: a plain query.
+        let me = unsafe { libc::gettid() };
+        let path = format!("/proc/{}/task/{me}/fd/{}", std::process::id(), memfd.as_raw_fd());
+        let Ok((_g, name)) = self.with_guest_path(guest, Path::new(&path), |ptr| ptr as usize).await else {
+            return fallback();
+        };
+        let nofollow = libc::O_NOFOLLOW as usize;
+        let rewritten = match call {
+            CmdlineOpen::Openat(_) => Syscall::from_raw(
+                Sysno::openat,
+                SyscallArgs::new(libc::AT_FDCWD as isize as usize, name, raw.arg2 & !nofollow, raw.arg3, 0, 0),
+            ),
+            #[cfg(target_arch = "x86_64")]
+            CmdlineOpen::Open(_) => {
+                Syscall::from_raw(Sysno::open, SyscallArgs::new(name, raw.arg1 & !nofollow, raw.arg2, 0, 0, 0))
+            }
+            CmdlineOpen::Openat2(..) => {
+                // The probe's EBADF means the kernel copied the 24 bytes.
+                let Some(how) = how else {
+                    return fallback();
+                };
+                let cleared = RESOLVE_NO_XDEV
+                    | RESOLVE_NO_MAGICLINKS
+                    | RESOLVE_NO_SYMLINKS
+                    | RESOLVE_BENEATH
+                    | RESOLVE_IN_ROOT
+                    | RESOLVE_CACHED;
+                let mut staged = Vec::with_capacity(24);
+                staged.extend_from_slice(&(how.flags & !(nofollow as u64)).to_ne_bytes());
+                staged.extend_from_slice(&how.mode.to_ne_bytes());
+                staged.extend_from_slice(&(how.resolve & !cleared).to_ne_bytes());
+                let Ok(at) = self.scratch_write_at(guest, &staged, SCRATCH_OPEN_HOW).await else {
+                    return fallback();
+                };
+                Syscall::from_raw(
+                    Sysno::openat2,
+                    SyscallArgs::new(libc::AT_FDCWD as isize as usize, name, at, staged.len(), 0, 0),
+                )
+            }
+        };
+        match guest.inject(rewritten).await {
+            Ok(fd) => {
+                let seen = std::fs::metadata(format!("/proc/{tid}/fd/{fd}"));
+                #[cfg(test)]
+                let seen = if GUEST_FDS_UNREADABLE.with(|s| s.get()) {
+                    Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                } else {
+                    seen
+                };
+                if let Ok(md) = seen {
+                    if (md.dev(), md.ino()) != (want.dev(), want.ino()) {
+                        let _ = guest.inject(reverie::syscalls::Close::new().with_fd(fd as i32)).await;
+                        return fallback();
+                    }
+                }
+                Ok(Some(fd))
+            }
+            Err(e) => match e.into_raw() {
+                // ERESTARTSYS, ERESTARTNOINTR, ERESTARTNOHAND, ERESTART_RESTARTBLOCK
+                512 | 513 | 514 | 516 => {
+                    HELD_TRACER_FDS.lock().unwrap().insert(tid, memfd);
+                    Err(e.into())
+                }
+                libc::EMFILE | libc::ENFILE | libc::ENOMEM => Err(e.into()),
+                _ => fallback(),
+            },
+        }
+    }
+
+    /// Whether the probe gate is closed for an injection literoot makes on
+    /// its own account, without counting it as a probe: a guest filter
+    /// installed or being installed (trigger 3), or the thread's dispatch
+    /// mode ON or unreadable (trigger 6).
+    fn injection_gate_closed<T: Guest<Self>>(&self, guest: &T) -> bool {
+        let (dispatch, _, _) = self.dispatch_mode_unnoted(guest);
+        dispatch != Some(false) || self.state.lock().unwrap().admission(guest.pid().as_raw()).closed()
     }
 
     /// Open the nearest existing ancestor of a virtual bind
@@ -4771,20 +6233,181 @@ impl RootfsTool {
             }
             // /proc unreadable: the table entry stands, as before.
             (Some(_), Err(_)) => false,
-            _ => true,
+            // A named non-directory: the kernel's ENOTDIR at the fd.
+            (Some(_), Ok(_)) => true,
+            // No guest name: only where the kernel cannot leave the fd
+            // ([`unnamed_route`]); otherwise translation walks or refuses.
+            (None, _) => {
+                let base = format!("{}/fd/{}", task_dir(guest), dirfd);
+                unnamed_route(&cfg, &base, path) == UnnamedRoute::Raw
+            }
         }
     }
 
-    fn translate_for<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
+    /// [`FinalProc`] of the selected final host path `host`.
+    fn final_proc<T: Guest<Self>>(&self, guest: &T, host: &Path) -> FinalProc {
+        let cfg = self.config(guest);
+        let links = GuestProcLinks::new(&cfg, guest.pid().as_raw(), guest.tid().as_raw());
+        final_proc_entry(host, &links)
+    }
+
+    /// What an open or execve of `path` does with a self link,
+    /// decided by the selected FINAL entry for the whole spelled path:
+    /// synthesize for an owned process's procfs exe link or cmdline file,
+    /// answer a shared-record row's exe and cmdline from the row, and walk
+    /// anything else (another process's entries, a file or symlink bound
+    /// there, a planted rootfs entry, a dangling symlink), so the kernel
+    /// answers it. Plain `-r` keeps its synthesis only where the walk
+    /// positively found no `/proc` or `/proc/<x>` (ENOENT). Names that
+    /// cannot be a magic link or cmdline file skip the check.
+    ///
+    /// A call that follows a final symlink (`follow`: an open without
+    /// O_NOFOLLOW, an execve) is decided again on the entry the follow
+    /// resolves to in the guest's view, the host path it will inject: a
+    /// symlink (or a chain of them) to the caller's own cmdline or exe is
+    /// synthesized, and to a row's is answered from the row, exactly as if
+    /// spelled (P1-B). A follow that cannot be resolved is that walk's own
+    /// answer (a named refusal, or the guest's ELOOP). A call that does not
+    /// follow ([`open_follows`]) opens an exe link itself, the caller's own
+    /// or a row's, as the kernel does (ELOOP, or the link under O_PATH):
+    /// the synthesis and the row answer only a follow.
+    fn self_link_route<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+        follow: bool,
+    ) -> Result<SelfLink, reverie::syscalls::Errno> {
+        let spelled = self.spelled_self_link(guest, dirfd, path)?;
+        if !follow {
+            return match spelled {
+                SelfLink::RowExe(_) => Ok(SelfLink::Walk),
+                // The caller's own exe link is a link too:
+                // the kernel opens it itself, ELOOP or the link
+                // under O_PATH. Without /proc, where literoot presents the
+                // link as existing, the consistent answer is ELOOP (plan
+                // check note on Q4).
+                SelfLink::Exe => {
+                    if proc_parent_absent(&self.translate_for(guest, dirfd, path)?)? {
+                        Err(reverie::syscalls::Errno::ELOOP)
+                    } else {
+                        Ok(SelfLink::Walk)
+                    }
+                }
+                other => Ok(other),
+            };
+        }
+        if spelled != SelfLink::Walk {
+            return Ok(spelled);
+        }
+        let resolved = self.translate_follow(guest, dirfd, path)?;
+        Ok(self.final_self_link(guest, self.final_proc(guest, &resolved)).unwrap_or(SelfLink::Walk))
+    }
+
+    /// The answer an owned or shared-record [`FinalProc`] gets at an open
+    /// or execve; None for every other entry. The own exe test compares
+    /// thread groups ([`final_proc_entry`] normalizes the link's pid).
+    fn final_self_link<T: Guest<Self>>(&self, guest: &T, entry: FinalProc) -> Option<SelfLink> {
+        use crate::translate::MagicKind;
+        match entry {
+            FinalProc::OwnedLink(link) if link.kind == MagicKind::Exe && link.pid == guest.pid().as_raw() => {
+                Some(SelfLink::Exe)
+            }
+            // Another owned process's exe (a traced child on ptrace, whose
+            // kernel link names the loader under literoot's exec model)
+            // answers from its row, as a guest child's does
+            // (ruled: the row, never pid_exe_map). Without a row, the
+            // kernel's link.
+            FinalProc::OwnedLink(link) if link.kind == MagicKind::Exe && has_shared_row(link.pid) => {
+                Some(SelfLink::RowExe(link.pid))
+            }
+            FinalProc::OwnedCmdline(pid) => Some(SelfLink::Cmdline(pid)),
+            FinalProc::SharedCmdline(pid) => Some(SelfLink::SharedCmdline(pid)),
+            FinalProc::SharedExe(pid) => Some(SelfLink::RowExe(pid)),
+            FinalProc::OwnedLink(_) | FinalProc::SharedLink(_) | FinalProc::Ordinary => None,
+        }
+    }
+
+    /// [`Self::self_link_route`] on the spelled final entry, its final
+    /// symlink not followed.
+    fn spelled_self_link<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<SelfLink, reverie::syscalls::Errno> {
+        if !final_name_may_be_proc(path) {
+            return Ok(SelfLink::Walk);
+        }
+        let own = guest.pid().as_raw();
+        let host = self.translate_for(guest, dirfd, path)?;
+        let entry = self.final_proc(guest, &host);
+        if let Some(answer) = self.final_self_link(guest, entry) {
+            return Ok(answer);
+        }
+        Ok(if entry != FinalProc::Ordinary || !spells_proc_self_link(path) || !proc_parent_absent(&host)? {
+            SelfLink::Walk
+        } else if is_self_exe(path, own) {
+            SelfLink::Exe
+        } else {
+            match spelled_cmdline_pid(path, own) {
+                Some(pid) => SelfLink::Cmdline(pid),
+                None => SelfLink::Walk,
+            }
+        })
+    }
+
+    /// The host path of a guest path, its final symlink not followed.
+    /// More than 40 symlinks on the way is the guest's ELOOP.
+    fn translate_for<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<PathBuf, reverie::syscalls::Errno> {
+        self.translate_for_links(guest, dirfd, path)
+            .map(|(host, _)| host)
+    }
+
+    /// [`Self::translate_for`] with the symlinks the walk followed, so a
+    /// final-link resolution can continue the same 40-link budget.
+    fn translate_for_links<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<(PathBuf, u32), reverie::syscalls::Errno> {
+        self.translate_for_route(guest, dirfd, path)
+            .map(|(host, links, _, _)| (host, links))
+    }
+
+    /// [`Self::translate_for_links`], also returning the guest route the
+    /// walk came through: the canonical guest directory it walked from
+    /// (the one an unnamed base's ".." landed on included) joined with the
+    /// name. None when the name went to the kernel as is.
+    fn translate_for_route<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<Walked, reverie::syscalls::Errno> {
         if let Some(hit) = self.memoized_translate(dirfd, path, false) {
-            return hit;
+            return hit.map_err(walk_errno);
         }
-        let host = self.translate_for_uncached(guest, dirfd, path);
-        self.memoize_translate(dirfd, path, false, &host);
-        host
+        let hit = self.translate_for_uncached(guest, dirfd, path);
+        self.memoize_translate(dirfd, path, false, &hit);
+        hit.map_err(walk_errno)
     }
 
-    fn memoized_translate(&self, dirfd: i32, path: &Path, follow: bool) -> Option<PathBuf> {
+    /// The memoized translation of this dispatch, if any. A failed walk is
+    /// memoized too, so its refusal is noted once however many helpers
+    /// translate the same name.
+    fn memoized_translate(
+        &self,
+        dirfd: i32,
+        path: &Path,
+        follow: bool,
+    ) -> Option<Result<Walked, crate::translate::WalkError>> {
         let st = self.state.lock().unwrap();
         let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
         st.translate_memo
@@ -4793,13 +6416,27 @@ impl RootfsTool {
             .map(|(_, v)| v.clone())
     }
 
-    fn memoize_translate(&self, dirfd: i32, path: &Path, follow: bool, host: &Path) {
+    fn memoize_translate(
+        &self,
+        dirfd: i32,
+        path: &Path,
+        follow: bool,
+        hit: &Result<Walked, crate::translate::WalkError>,
+    ) {
+        if let Err(e) = hit {
+            note_walk_error(e);
+        }
         let mut st = self.state.lock().unwrap();
         let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
-        st.translate_memo.push((key, host.to_path_buf()));
+        st.translate_memo.push((key, hit.clone()));
     }
 
-    fn translate_for_uncached<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
+    fn translate_for_uncached<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<Walked, crate::translate::WalkError> {
         let cfg = self.config(guest);
         let st = self.state.lock().unwrap();
         let cwd = if st.cwd == Path::new("/__literoot_unset__") {
@@ -4814,35 +6451,61 @@ impl RootfsTool {
         } else {
             self.fd_guest_path(guest, &cfg, &st, dirfd)
         };
+        let searched = st.searched_bases.contains(&(st.dispatch_seq, dirfd));
         // An empty path with a real dirfd (AT_EMPTY_PATH, or a call that
         // must fail ENOENT without it) names the fd's own object, which
         // the kernel already holds: leave it empty, so each syscall's own
         // empty-path rule applies (readlinkat(fd, "") on an O_PATH symlink
         // reads that link; translating would follow it).
         if dirfd != libc::AT_FDCWD && path.as_os_str().is_empty() {
-            return PathBuf::new();
+            return Ok((PathBuf::new(), 0, None, OtherLink::None));
         }
         // A dirfd with no guest path (deleted, pipe, socket, outside every
-        // mapped tree, closed), or a cwd with none: the kernel resolves
-        // through the object itself (ENOENT in a deleted directory,
-        // ENOTDIR for a pipe) instead of the call landing relative to the
-        // old cwd. An empty path stays empty here too.
-        let unnamed_base = if path.is_absolute() {
-            None
-        } else if dirfd != libc::AT_FDCWD {
-            dirfd_guest
-                .is_none()
-                .then(|| format!("{}/fd/{}", task_dir(guest), dirfd))
-        } else {
-            (cwd == Path::new(UNNAMED_CWD)).then(|| format!("{}/cwd", task_dir(guest)))
-        };
-        if let Some(base) = unnamed_base {
-            if path.as_os_str().is_empty() {
-                return PathBuf::new();
+        // mapped tree, closed), or a cwd with none ([`unnamed_route`]):
+        // where the kernel can only fail at the object itself (ENOENT in a
+        // deleted directory, ENOTDIR for a pipe) the name goes through it;
+        // a ".." the kernel would take to a live directory continues from
+        // that directory's guest name; a live directory with no guest name
+        // is refused, since the kernel would walk the host's tree from it.
+        let mut cwd = cwd;
+        let mut dirfd_guest = dirfd_guest;
+        let walked: PathBuf;
+        let original = path;
+        let mut path = path;
+        if let Some(base) = unnamed_base(guest, dirfd, &cwd, dirfd_guest.as_deref(), path) {
+            match unnamed_route(&cfg, &base, path) {
+                UnnamedRoute::Raw if path.as_os_str().is_empty() => {
+                    return Ok((PathBuf::new(), 0, None, OtherLink::None));
+                }
+                UnnamedRoute::Raw => return Ok((Path::new(&base).join(path), 0, None, OtherLink::None)),
+                UnnamedRoute::Refused(kind) => {
+                    return Err(crate::translate::WalkError::Refused(kind));
+                }
+                // Only the dead-base answer at dispatch can give the kernel's
+                // argument checks and search check first; a translation that
+                // reaches one without it fails closed. Where the gate was
+                // closed at dispatch, this is that route's refusal: counted.
+                UnnamedRoute::DeadName => {
+                    drop(st);
+                    self.count_closed_gate(guest);
+                    return Err(crate::translate::WalkError::Refused(
+                        crate::translate::PathRefusal::ProbeUnsupported,
+                    ));
+                }
+                UnnamedRoute::Guest { climbed: true, .. } if !searched => {
+                    drop(st);
+                    self.count_closed_gate(guest);
+                    return Err(crate::translate::WalkError::Refused(
+                        crate::translate::PathRefusal::ProbeUnsupported,
+                    ));
+                }
+                UnnamedRoute::Guest { dir, rest, .. } => {
+                    cwd = dir;
+                    dirfd_guest = None;
+                    walked = guest_rest(rest);
+                    path = &walked;
+                }
             }
-            let mut host = PathBuf::from(base);
-            host.push(path);
-            return host;
         }
         // Unknown non-path dirfd: relative resolution against cwd
         // would fabricate ENOENT where the kernel says ENOTDIR.
@@ -4852,20 +6515,15 @@ impl RootfsTool {
         // behaviour — retained gap for pipe/socket dirfds is
         // fixed by the Openat arm's explicit check below.
         let _ = &dirfd_guest;
-        // /proc magic links (fd/exe/root/cwd/map_files) must not
-        // be lexically normalized: ".." after a magic component
-        // is an error in the kernel, not a parent traversal
-        // (test-proc-self-readlink-edge-cases).
-        if is_magic_proc_path(path) {
-            let mut host = cfg.translate_raw(path, &cwd);
-            use std::os::unix::ffi::OsStrExt as _;
-            let bytes = path.as_os_str().as_bytes();
-            if bytes.len() > 1 && bytes.ends_with(b"/") {
-                host.push("");
-            }
-            return host;
-        }
-        let mut host = cfg.translate(path, &cwd, dirfd_guest.as_deref());
+        let mut links = 0;
+        let policy = GuestProcLinks::new(&cfg, guest.pid().as_raw(), guest.tid().as_raw());
+        let mut host =
+            cfg.translate_walk(path, &cwd, dirfd_guest.as_deref(), &mut links, &policy)?;
+        let route = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            dirfd_guest.as_deref().unwrap_or(&cwd).join(path)
+        };
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
             eprintln!("literoot-tool: translate {path:?} cwd={cwd:?} -> {host:?}");
         }
@@ -4874,53 +6532,835 @@ impl RootfsTool {
         // lexical normalization would erase it.
         {
             use std::os::unix::ffi::OsStrExt as _;
-            let bytes = path.as_os_str().as_bytes();
+            let bytes = original.as_os_str().as_bytes();
             if bytes.len() > 1 && bytes.ends_with(b"/") {
                 host.push("");
             }
         }
-        host
+        Ok((host, links, Some(route), policy.other_link()))
     }
 
     /// translate_for + final-component symlink following, for
     /// syscalls that follow symlinks (open/stat/access). Lstat and
-    /// readlink must use plain translate_for.
-    fn translate_follow<T: Guest<Self>>(&self, guest: &T, dirfd: i32, path: &Path) -> PathBuf {
-        if let Some(hit) = self.memoized_translate(dirfd, path, true) {
-            return hit;
-        }
-        let cfg = self.config(guest);
-        let host = self.translate_for(guest, dirfd, path);
-        // The guest path the walk came through, if it has one: the final
-        // symlink is resolved from there, keeping that alias.
-        let guest_path = if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            let st = self.state.lock().unwrap();
-            let base = if dirfd != libc::AT_FDCWD {
-                self.fd_guest_path(guest, &cfg, &st, dirfd)
-            } else if st.cwd == Path::new("/__literoot_unset__") {
-                Some(self.seed_cwd(guest))
-            } else if st.cwd == Path::new(UNNAMED_CWD) {
-                None
-            } else {
-                Some(st.cwd.clone())
-            };
-            base.map(|b| b.join(path))
-        };
-        let resolved = resolve_symlink_chain(&cfg, guest_path, host);
-        self.memoize_translate(dirfd, path, true, &resolved);
-        resolved
+    /// readlink must use plain translate_for. The final links share
+    /// the walk's 40-link budget; more is the guest's ELOOP.
+    fn translate_follow<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<PathBuf, reverie::syscalls::Errno> {
+        self.translate_follow_uncached(guest, dirfd, path)
+            .map(|(host, _, _, _)| host)
     }
 
-    /// Stage a translated AF_UNIX sockaddr copy on the guest
-    /// stack. Some((guard, raw_ptr, new_addrlen)) or None to pass
-    /// through (non-Unix family, abstract socket, fault).
+    /// [`Self::translate_follow`], also returning the canonical guest path
+    /// of what it reached (every link, ".", ".." and trailing slash
+    /// resolved, the bind route kept), when the walk has a guest name. None
+    /// after a Raw hand-over of another process's directory link: what the
+    /// call reaches then is only known once it has run.
+    fn translate_follow_guest<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<(PathBuf, Option<PathBuf>), reverie::syscalls::Errno> {
+        self.translate_follow_uncached(guest, dirfd, path)
+            .map(|(host, _, resolved, other)| (host, if other == OtherLink::Raw { None } else { resolved }))
+    }
+
+    fn translate_follow_uncached<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<Walked, reverie::syscalls::Errno> {
+        if let Some(hit) = self.memoized_translate(dirfd, path, true) {
+            return hit.map_err(walk_errno);
+        }
+        let cfg = self.config(guest);
+        // The final symlink is resolved from the guest route the walk came
+        // through, keeping that alias; with none (the name went to the
+        // kernel as is), a relative target is refused, never joined on the
+        // host side.
+        let (host, mut links, guest_path, other) = self.translate_for_route(guest, dirfd, path)?;
+        let policy = GuestProcLinks::new(&cfg, guest.pid().as_raw(), guest.tid().as_raw());
+        // The walk's Raw hand-over carries on into the final chain: a
+        // relative target then resolves from the host parent, and its route
+        // is not a stable guest directory.
+        policy.carry(other);
+        let hit = resolve_symlink_chain_guest(&cfg, guest_path, host, &mut links, Some(&policy))
+            .map(|(resolved, resolved_guest)| {
+                (resolved, links, resolved_guest, policy.other_link())
+            });
+        self.memoize_translate(dirfd, path, true, &hit);
+        hit.map_err(walk_errno)
+    }
+
+    /// The dead-base answer at dispatch (fix 4: Ord, E1, P', C). For a call
+    /// with a relative name whose base is a deleted directory (a dead NAME,
+    /// or a ".." climb out of one), in the kernel's order:
+    /// 1. the call's own argument checks: the probe ([`crate::dead_base`]);
+    /// 2. the guest's own search check of every directory the walk
+    ///    searches (E1);
+    /// 3. the Tool's climb and decide;
+    /// 4. the base re-read: the base must still be the directory decided
+    ///    on (`base_moved` otherwise).
+    ///
+    /// Some(answer) ends the call here; None lets its arm translate it (a
+    /// live base, or a climb whose search check passed, recorded in
+    /// `searched_bases`).
+    async fn dead_base_gate<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Option<Result<i64, Error>> {
+        use crate::dead_base::Probe;
+        use reverie::syscalls::SyscallInfo as _;
+        let (nr, raw) = syscall.into_parts();
+        let entry = crate::dead_base::dead_base_probe(nr)?;
+        // A path call enters translation here (S.3's `translated`).
+        self.state
+            .lock()
+            .unwrap()
+            .admission(guest.pid().as_raw())
+            .note_translation();
+        if let Probe::Bind | Probe::Connect = entry.probe {
+            return self.dead_base_socket(guest, nr, raw, entry).await;
+        }
+        let args = [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5];
+        // Two UTIME_OMITs succeed before the path is looked at: the arm
+        // answers it (so would the probe, which is never trusted).
+        let times: Option<reverie::syscalls::Addr<[libc::timespec; 2]>> =
+            reverie::syscalls::FromToRaw::from_raw(args[2]);
+        if let (Sysno::utimensat, Some(times)) = (nr, times) {
+            if let Ok([a, m]) = guest.memory().read_value(times) {
+                if a.tv_nsec == libc::UTIME_OMIT && m.tv_nsec == libc::UTIME_OMIT {
+                    return None;
+                }
+            }
+        }
+        let cfg = self.config(guest);
+        let mut gated = Vec::new();
+        let mut gate_checked = false;
+        for slot in entry.slots {
+            let ptr: Option<PathPtr> =
+                reverie::syscalls::FromToRaw::from_raw(args[slot.path as usize]);
+            // An unreadable or absent name is the arm's (its own EFAULT).
+            let Some(path) = ptr.and_then(|p| p.read(&guest.memory()).ok()) else {
+                continue;
+            };
+            if path.as_os_str().is_empty() || path.is_absolute() {
+                continue;
+            }
+            let dirfd = slot
+                .dirfd
+                .map(|i| args[i as usize] as i32)
+                .unwrap_or(libc::AT_FDCWD);
+            let Some(base) = self.unnamed_base_of(guest, &cfg, dirfd, &path) else {
+                continue;
+            };
+            // S.3 placement: the gate is checked at the top of the
+            // dead-base route, before C.1's reads and gather_*, without
+            // counting. Closed, the call goes to its arm, which answers
+            // exactly as without fix 4 (EBADF, ENOTDIR, a translation) and
+            // refuses a dead-base name by name, counted there.
+            if !gate_checked {
+                gate_checked = true;
+                if self.gate_closed_quiet(guest) {
+                    return None;
+                }
+            }
+            let dead_name = match unnamed_route(&cfg, &base, &path) {
+                UnnamedRoute::DeadName => true,
+                UnnamedRoute::Guest { climbed: true, .. } => false,
+                _ => continue,
+            };
+            gated.push(GatedName {
+                dirfd,
+                identity: base_identity(&base),
+                base,
+                path,
+                dead_name,
+            });
+        }
+        if gated.is_empty() {
+            return None;
+        }
+        // A dead-base route reached the gate: counted here. It was open at
+        // the top; one that closed since is refused by name.
+        if self.admission_closed(guest) {
+            return Some(self.refuse_probe(crate::translate::PathRefusal::ProbeUnsupported));
+        }
+        // Step 1: the argument checks.
+        if let Probe::T1 { nr: probe_nr, args: probe_args } = entry.probe {
+            let names = match (
+                self.scratch_write_at(guest, b"x\0", SCRATCH_PROBE_X).await,
+                self.scratch_write_at(guest, b"y\0", SCRATCH_PROBE_Y).await,
+            ) {
+                (Ok(x), Ok(y)) => [x, y],
+                (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
+            };
+            let probe = crate::dead_base::build_t1(probe_nr, &probe_args, &raw, names);
+            let result = match self.admitted_inject(guest, probe).await {
+                Some(r) => r,
+                None => {
+                    return Some(
+                        self.refuse_probe(crate::translate::PathRefusal::ProbeUnsupported),
+                    );
+                }
+            };
+            match crate::dead_base::classify(entry.probe, entry.pre_lookup, result) {
+                crate::dead_base::ProbeOutcome::LookupReached => {}
+                crate::dead_base::ProbeOutcome::Answer(e) => return Some(Err(e.into())),
+                crate::dead_base::ProbeOutcome::Unsupported => {
+                    return Some(
+                        self.refuse_probe(crate::translate::PathRefusal::ProbeUnsupported),
+                    );
+                }
+            }
+        }
+        // Steps 2-4, then the local answer.
+        let open_flags = self.open_flags_of(guest, nr, &args);
+        self.search_and_decide(guest, &cfg, entry, gated, open_flags)
+            .await
+    }
+
+    /// Steps 2-4 of the dead-base answer for each gated name, in order: the
+    /// guest's search check, the base re-read, and the Tool's decide. A
+    /// dead NAME then gets EISDIR (an O_CREAT open of `x/`) or ENOENT, each
+    /// recorded as `answered path dead_base_name`; a climb that lands on a
+    /// live directory is left to the arm.
+    async fn search_and_decide<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        cfg: &RootConfig,
+        entry: crate::dead_base::Entry,
+        gated: Vec<GatedName>,
+        open_flags: Option<u64>,
+    ) -> Option<Result<i64, Error>> {
+        use crate::translate::PathRefusal;
+        use reverie::syscalls::Errno;
+        // setxattr and lsetxattr have no probe (D, P2-D1): where the answer
+        // would come from the dead-base path, the argument errors native
+        // gives first cannot be reproduced, so it is refused by name.
+        let unavailable = entry.probe == crate::dead_base::Probe::Unavailable;
+        for g in gated {
+            let name = crate::dead_base::search_name(&g.path);
+            let flags = crate::dead_base::search_flags(entry.ids, &name);
+            let mut staged = name.as_os_str().as_bytes().to_vec();
+            staged.push(0);
+            if staged.len() > SCRATCH_SEARCH_MAX {
+                return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+            }
+            let ptr = match self
+                .scratch_write_at(guest, &staged, SCRATCH_SEARCH)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            let check = Syscall::Other(
+                Sysno::faccessat2,
+                reverie::syscalls::SyscallArgs::new(
+                    g.dirfd as isize as usize,
+                    ptr,
+                    libc::X_OK as usize,
+                    flags as usize,
+                    0,
+                    0,
+                ),
+            );
+            let Some(result) = self.admitted_inject(guest, check).await else {
+                return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+            };
+            match result {
+                Ok(0) => {}
+                Err(e) if e == Errno::EACCES && !unavailable => {
+                    note_path_report(Refusal::Answered(PathAnswer::DeadBaseSearch));
+                    return Some(Err(Errno::EACCES.into()));
+                }
+                _ => return Some(self.refuse_probe(PathRefusal::ProbeUnsupported)),
+            }
+            // Step 4: the base is still the directory the gate decided on.
+            if g.identity.is_none() || base_identity(&g.base) != g.identity {
+                return Some(self.refuse_probe(PathRefusal::BaseMoved));
+            }
+            // Step 3: the Tool's climb and decide, after the search check.
+            match unnamed_route(cfg, &g.base, &g.path) {
+                UnnamedRoute::DeadName if g.dead_name => {
+                    if unavailable {
+                        return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+                    }
+                    let answer = if open_flags.is_some_and(|f| {
+                        crate::dead_base::create_with_trailing_slash(&g.path, f)
+                    }) {
+                        Errno::EISDIR
+                    } else {
+                        Errno::ENOENT
+                    };
+                    note_path_report(Refusal::Answered(PathAnswer::DeadBaseName));
+                    return Some(Err(answer.into()));
+                }
+                UnnamedRoute::Guest { climbed: true, .. } if !g.dead_name => {
+                    let mut st = self.state.lock().unwrap();
+                    let seq = st.dispatch_seq;
+                    st.searched_bases.push((seq, g.dirfd));
+                }
+                UnnamedRoute::Refused(kind) => return Some(self.refuse_probe(kind)),
+                // The base changed class between the decide and now.
+                _ => return Some(self.refuse_probe(PathRefusal::BaseMoved)),
+            }
+        }
+        None
+    }
+
+    /// The dead-base answer for bind and connect with a relative AF_UNIX
+    /// name in a deleted cwd (fix 4, section C): the socket kind from the
+    /// Tool's own /proc reads, then T3 (bind) or T4 (connect), the re-read
+    /// of the descriptor, and steps 2-4.
+    async fn dead_base_socket<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        nr: Sysno,
+        raw: reverie::syscalls::SyscallArgs,
+        entry: crate::dead_base::Entry,
+    ) -> Option<Result<i64, Error>> {
+        use crate::translate::PathRefusal;
+        let fd = raw.arg0 as i32;
+        let addrlen = raw.arg2 as i32;
+        if !(3..=110).contains(&addrlen) {
+            return None;
+        }
+        let addr: Option<reverie::syscalls::Addr<u8>> =
+            reverie::syscalls::FromToRaw::from_raw(raw.arg1);
+        let addr = addr?;
+        let mut buf = vec![0u8; addrlen as usize];
+        guest.memory().read(addr, &mut buf).ok()?;
+        // AF_UNIX, non-abstract, relative.
+        if u16::from_ne_bytes([buf[0], buf[1]]) != libc::AF_UNIX as u16
+            || buf[2] == 0
+            || buf[2] == b'/'
+        {
+            return None;
+        }
+        let end = buf[2..]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|p| p + 2)
+            .unwrap_or(buf.len());
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(buf[2..end].to_vec()));
+        let cfg = self.config(guest);
+        let base = self.unnamed_base_of(guest, &cfg, libc::AT_FDCWD, &path)?;
+        // S.3 placement: the gate first, before C.1's reads and gather_*,
+        // without counting; closed, the call goes to its arm (as above).
+        if self.gate_closed_quiet(guest) {
+            return None;
+        }
+        let dead_name = match unnamed_route(&cfg, &base, &path) {
+            UnnamedRoute::DeadName => true,
+            UnnamedRoute::Guest { climbed: true, .. } => false,
+            _ => return None,
+        };
+        let identity = base_identity(&base);
+        // A dead-base route reached the gate: counted here (as above).
+        if self.admission_closed(guest) {
+            return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+        }
+        // C step 1: the socket kind, from the Tool's own reads.
+        let kind = match socket_kind(&task_dir(guest), fd) {
+            Ok(kind) => kind,
+            Err(SocketRead::Answer(e)) => return Some(Err(e.into())),
+            Err(SocketRead::Unsupported) => {
+                return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+            }
+        };
+        // C step 2: not positively AF_UNIX in the task's network namespace.
+        if !kind.unix {
+            return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+        }
+        // C steps 3-4: T3 or T4 on the guest's own socket.
+        let mut staged = [0u8; 128];
+        staged[..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+        let len = if entry.probe == crate::dead_base::Probe::Bind {
+            staged[2] = b'/';
+            4
+        } else {
+            2
+        };
+        let ptr = match self.scratch_write_at(guest, &staged, SCRATCH_SOCKADDR).await {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let probe = Syscall::Other(
+            nr,
+            reverie::syscalls::SyscallArgs::new(fd as isize as usize, ptr, len, 0, 0, 0),
+        );
+        let result = self.admitted_inject(guest, probe).await;
+        // C step 5': the descriptor must still hold the socket identified
+        // in step 1, before the result is used for anything.
+        let Some(result) = result else {
+            return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+        };
+        if !socket_unchanged(&task_dir(guest), fd, &kind.link) {
+            return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+        }
+        match crate::dead_base::classify(entry.probe, entry.pre_lookup, result) {
+            crate::dead_base::ProbeOutcome::LookupReached => {}
+            crate::dead_base::ProbeOutcome::Answer(e) => return Some(Err(e.into())),
+            crate::dead_base::ProbeOutcome::Unsupported => {
+                return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
+            }
+        }
+        let gated = vec![GatedName {
+            dirfd: libc::AT_FDCWD,
+            identity,
+            base,
+            path,
+            dead_name,
+        }];
+        self.search_and_decide(guest, &cfg, entry, gated, None).await
+    }
+
+    /// The unnamed base a relative `path` resolves from (the calling task's
+    /// cwd or dirfd through /proc), or None when its base has a guest name.
+    fn unnamed_base_of<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        cfg: &RootConfig,
+        dirfd: i32,
+        path: &Path,
+    ) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        let cwd = if st.cwd == Path::new("/__literoot_unset__") {
+            self.seed_cwd(guest)
+        } else {
+            st.cwd.clone()
+        };
+        let dirfd_guest = if dirfd == libc::AT_FDCWD {
+            None
+        } else {
+            self.fd_guest_path(guest, cfg, &st, dirfd)
+        };
+        unnamed_base(guest, dirfd, &cwd, dirfd_guest.as_deref(), path)
+    }
+
+    /// The open flags of an open-family call, for the EISDIR check.
+    fn open_flags_of<T: Guest<Self>>(&self, guest: &T, nr: Sysno, args: &[usize; 6]) -> Option<u64> {
+        match nr {
+            #[cfg(target_arch = "x86_64")]
+            Sysno::open => Some(args[1] as u64),
+            Sysno::openat => Some(args[2] as u64),
+            // open_how's first field is the flags.
+            Sysno::openat2 => {
+                let how: Option<reverie::syscalls::Addr<u64>> =
+                    reverie::syscalls::FromToRaw::from_raw(args[2]);
+                guest.memory().read_value(how?).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// A guest prctl(PR_SET_SYSCALL_USER_DISPATCH, mode, ...). In-guest, a
+    /// mode other than OFF is refused (R1): EOPNOTSUPP and the dispatch line,
+    /// nothing injected and the tracked mode left as it was, so no ordinary
+    /// route reaches a BLOCK state. Otherwise the call is forwarded as the
+    /// exact pending call, with no injection before it in this handler (C2.3),
+    /// and the thread's tracked mode follows C2.2's rule. None for every other
+    /// call.
+    async fn dispatch_setter<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Option<Result<i64, Error>> {
+        use reverie::syscalls::SyscallInfo as _;
+        let (nr, raw) = syscall.into_parts();
+        let args = [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5].map(|a| a as u64);
+        let mode = crate::dead_base::dispatch_setter_mode(nr, args)?;
+        if crate::dead_base::refuses_dispatch_setter(guest.config().refuse_guest_dispatch, mode) {
+            note_guest_refusal(GuestKind::SyscallUserDispatch);
+            return Some(Err(reverie::syscalls::Errno::EOPNOTSUPP.into()));
+        }
+        // ON until the result is known: a cancelled call stays ON (C2.2).
+        let was_on = std::mem::replace(&mut guest.thread_state_mut().sud_on, true);
+        let result = guest.inject(syscall).await;
+        let value = match result {
+            Ok(r) => r,
+            Err(e) => -(e.into_raw() as i64),
+        };
+        guest.thread_state_mut().sud_on =
+            crate::dead_base::tracked_dispatch_after(was_on, mode, Some(value));
+        Some(result.map_err(Into::into))
+    }
+
+    /// The probing thread's dispatch mode for trigger 6 (C1.1): Some(on), or
+    /// None when it cannot be read (the probe fails closed), and whether it
+    /// came from prctl tracking (`sud_fallback`). On the ptrace backend the
+    /// kernel's own config is read from the tracer; EIO (before Linux 6.4),
+    /// EINVAL (another struct size) and ENOSYS (something between literoot
+    /// and the kernel) fall back to tracking, once-per-run noted; any other
+    /// error fails closed. In-guest tracking is the only source.
+    fn probe_dispatch_mode<T: Guest<Self>>(&self, guest: &T) -> (Option<bool>, bool) {
+        let (mode, fallback, note) = self.dispatch_mode_unnoted(guest);
+        if let Some(e) = note {
+            note_dispatch_fallback(e);
+        }
+        (mode, fallback)
+    }
+
+    /// [`Self::probe_dispatch_mode`] without its fallback note: the mode,
+    /// whether it came from tracking, and the config-read errno that made it.
+    fn dispatch_mode_unnoted<T: Guest<Self>>(&self, guest: &T) -> (Option<bool>, bool, Option<i32>) {
+        let tracked = guest.thread_state().sud_on;
+        if guest.config().tool_in_guest() { // trigger 6: in-guest mode from tracking
+            return (Some(tracked), true, None);
+        }
+        match read_dispatch_config(guest.tid().as_raw()) {
+            Ok(on) => (Some(on), false, None),
+            Err(e @ (libc::EIO | libc::EINVAL | libc::ENOSYS)) => (Some(tracked), true, Some(e)),
+            Err(_) => (None, false, None),
+        }
+    }
+
+    /// The first-callback filter count check (baseline delta (A)), in-guest:
+    /// at a record's first thread start, before any guest call is
+    /// translated, the count must equal the image's baseline plus the
+    /// record's addend; otherwise the record latches and every probe,
+    /// the first call's included, is refused. A flagged record skips the
+    /// read: no fix-4 injection runs under a guest filter, and its probes
+    /// are refused anyway.
+    async fn first_callback_check<T: Guest<Self>>(&self, guest: &mut T) {
+        if !guest.config().tool_in_guest() { // first-callback check: in-guest only
+            return;
+        }
+        let pid = guest.pid().as_raw();
+        {
+            let mut st = self.state.lock().unwrap();
+            let admission = st.admission(pid);
+            if admission.first_check_done {
+                return;
+            }
+            if admission.guest_filter {
+                admission.first_check_done = true;
+                return;
+            }
+        }
+        let observed = self.guest_filter_count(guest).await;
+        self.state
+            .lock()
+            .unwrap()
+            .admission(pid)
+            .first_callback_check(filter_baseline(), observed);
+    }
+
+    /// The calling thread's `Seccomp_filters` (C3.6), read untranslated
+    /// through Tool injections: open, read and close of the host's
+    /// /proc/self/status, staged in the scratch page's arm area, which no
+    /// probe uses. Not host-authentic: the read follows the process's root
+    /// and mount namespace (§4.9). None when unreadable or unparsable.
+    async fn guest_filter_count<T: Guest<Self>>(&self, guest: &mut T) -> Option<u32> {
+        use reverie::syscalls::MemoryAccess as _;
+        let open = reverie::syscalls::Openat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_flags(reverie::syscalls::OFlag::O_RDONLY | reverie::syscalls::OFlag::O_CLOEXEC);
+        let (_g, open) = self
+            .with_guest_path(guest, Path::new("/proc/self/status"), |ptr| {
+                open.with_path(PathPtr::from_ptr(ptr))
+            })
+            .await
+            .ok()?;
+        let fd = guest.inject(open).await.ok()? as i32;
+        let buf = self.scratch_write_at(guest, &[], SCRATCH_STATUS).await.ok();
+        let mut text = Vec::new();
+        let complete = match buf {
+            None => false,
+            Some(buf) => loop {
+                let addr: reverie::syscalls::AddrMut<u8> =
+                    unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(buf) };
+                let read = reverie::syscalls::Read::new()
+                    .with_fd(fd)
+                    .with_buf(Some(addr))
+                    .with_len(SCRATCH_STATUS_LEN);
+                match guest.inject(read).await {
+                    Ok(0) => break true,
+                    Ok(n) if n > 0 && (n as usize) <= SCRATCH_STATUS_LEN && text.len() < 65536 => {
+                        let mut chunk = vec![0u8; n as usize];
+                        let from: reverie::syscalls::Addr<u8> =
+                            unsafe { reverie::syscalls::Addr::from_raw_unchecked(buf) };
+                        if guest.memory().read_exact(from, &mut chunk).is_err() {
+                            break false;
+                        }
+                        text.extend_from_slice(&chunk);
+                    }
+                    _ => break false,
+                }
+            },
+        };
+        let _ = guest.inject(reverie::syscalls::Close::new().with_fd(fd)).await;
+        if !complete {
+            return None;
+        }
+        u32::try_from(crate::dead_base::status_field(&text, b"Seccomp_filters")?).ok()
+    }
+
+    /// The record's kernel_id, read once, on the ptrace backend only: the
+    /// tracer's own pidfd for the process, its pidfs inode (Linux 6.9+), else
+    /// 0. Kernel metadata, not authenticated, not the identity. In-guest it
+    /// is never collected (fix 4 makes no guest syscall for metadata) and
+    /// the summaries carry 0, "uncollected".
+    fn note_kernel_id<T: Guest<Self>>(&self, guest: &T) {
+        if guest.config().tool_in_guest() { // kernel_id: never collected in-guest
+            return;
+        }
+        let pid = guest.pid().as_raw();
+        let mut st = self.state.lock().unwrap();
+        let admission = st.admission(pid);
+        if admission.kernel_id.is_none() {
+            admission.kernel_id = Some(pidfs_inode(pid).unwrap_or(0));
+        }
+    }
+
+    /// A guest seccomp filter install (S.3), forwarded unchanged under the
+    /// thread group's admission: refused at once (EOPNOTSUPP and its line)
+    /// while any probe of the group is in flight, never waiting; otherwise
+    /// the attempt note is reported, the install injected, and its result
+    /// recorded. No lock is held across the injection, and a cancelled
+    /// installer gives the gate back ([`PendingInstall`]). None for every
+    /// other call.
+    async fn seccomp_install<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        syscall: Syscall,
+    ) -> Option<Result<i64, Error>> {
+        use reverie::syscalls::SyscallInfo as _;
+        let (nr, raw) = syscall.into_parts();
+        let args = [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5].map(|a| a as u64);
+        if !crate::dead_base::installs_seccomp_filter(nr, args) {
+            return None;
+        }
+        let pid = guest.pid().as_raw();
+        self.note_kernel_id(guest);
+        let begun = self.state.lock().unwrap().admission(pid).begin_install();
+        let ticket = match begun {
+            Ok(ticket) => ticket,
+            Err(in_flight) => {
+                note_path_report(Refusal::InstallRefused { in_flight });
+                return Some(Err(reverie::syscalls::Errno::EOPNOTSUPP.into()));
+            }
+        };
+        let mut install = PendingInstall {
+            state: &self.state,
+            pid,
+            ticket: Some(ticket),
+            injecting: false,
+        };
+        // Reported before the injection, while no filter exists yet: a
+        // filter that kills the process cannot lose it.
+        note_now(guest, Note::FilterInstallAttempted).await;
+        install.injecting = true;
+        let result = guest.inject(syscall).await;
+        install.finish(match result {
+            Ok(r) => r,
+            Err(e) => -(e.into_raw() as i64),
+        });
+        Some(result.map_err(Into::into))
+    }
+
+    /// Inject `probe` under the thread group's admission (S.3): None when
+    /// it is refused (a guest filter installed or pending). The count is
+    /// given back only when the result arrives.
+    async fn admitted_inject<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        probe: Syscall,
+    ) -> Option<Result<i64, reverie::syscalls::Errno>> {
+        let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());
+        let ticket = self.state.lock().unwrap().admission(pid).admit(tid)?;
+        // C3.6: in-guest, the filter count is checked after admission and
+        // before the probe's injection.
+        if guest.config().tool_in_guest() { // detector: in-guest filter count
+            let observed = self.guest_filter_count(guest).await;
+            let mut st = self.state.lock().unwrap();
+            let admission = st.admission(pid);
+            if !admission.filter_count_admits(filter_baseline(), observed) {
+                admission.release(ticket);
+                return None;
+            }
+        }
+        let result = guest.inject(probe).await;
+        self.state.lock().unwrap().admission(pid).release(ticket);
+        Some(result)
+    }
+
+    /// The probe gate at the top of the dead-base route (S.3), where
+    /// a route has reached it (counted in `probes`): true, and counted, when
+    /// a guest filter is installed or being installed (trigger 3, `refused`)
+    /// or the probing thread's syscall user dispatch is ON or unreadable
+    /// (trigger 6, `sud_refused`).
+    fn admission_closed<T: Guest<Self>>(&self, guest: &T) -> bool {
+        self.note_kernel_id(guest);
+        let (dispatch, fallback) = self.probe_dispatch_mode(guest);
+        self.state
+            .lock()
+            .unwrap()
+            .admission(guest.pid().as_raw())
+            .probe_gate(dispatch, fallback)
+    }
+
+    /// The gate at the top of the dead-base route, without counting (S.3,
+    /// P2-C1): closed when a guest filter is installed or being installed
+    /// (trigger 3) or the thread's dispatch mode is ON or unreadable
+    /// (trigger 6). Closed, the dispatch is remembered with its mode, so the
+    /// arm's dead-base refusal counts it once ([`Self::count_closed_gate`]).
+    fn gate_closed_quiet<T: Guest<Self>>(&self, guest: &T) -> bool {
+        let (dispatch, fallback, note) = self.dispatch_mode_unnoted(guest);
+        let mut st = self.state.lock().unwrap();
+        let closed = st.admission(guest.pid().as_raw()).closed() || dispatch != Some(false);
+        if closed {
+            let seq = st.dispatch_seq;
+            st.gate_closed_at = Some(GateClosed { seq, dispatch, fallback, note });
+        }
+        closed
+    }
+
+    /// Count a dead-base route's refusal whose gate was found closed at
+    /// this dispatch, once: `probes`, and `refused` or `sud_refused`, as the
+    /// open-gate path counts them.
+    fn count_closed_gate<T: Guest<Self>>(&self, guest: &T) {
+        let gate = {
+            let mut st = self.state.lock().unwrap();
+            match st.gate_closed_at {
+                Some(g) if g.seq == st.dispatch_seq => st.gate_closed_at.take(),
+                _ => None,
+            }
+        };
+        let Some(gate) = gate else { return };
+        self.note_kernel_id(guest);
+        if let Some(e) = gate.note {
+            note_dispatch_fallback(e);
+        }
+        self.state
+            .lock()
+            .unwrap()
+            .admission(guest.pid().as_raw())
+            .probe_gate(gate.dispatch, gate.fallback);
+    }
+
+    /// A probe refusal by name: EACCES and its line.
+    fn refuse_probe(&self, kind: crate::translate::PathRefusal) -> Result<i64, Error> {
+        note_path_report(Refusal::Path(kind));
+        Err(reverie::syscalls::Errno::EACCES.into())
+    }
+
+    /// openat2 answers some errors before it looks at the path, so a
+    /// translation failure must not replace them. Ask the kernel with the
+    /// same open_how and size and a lookup that cannot start: the name "x"
+    /// (staged in literoot's scratch mapping) against descriptor -1, so no
+    /// flag combination (O_CREAT, O_TMPFILE, RESOLVE_*) can create or open
+    /// anything. Only the errnos the kernel returns before lookup count;
+    /// anything else (EBADF, from the lookup's start) means the arguments
+    /// are valid and the translation error stands. In a v6.18.55-based
+    /// tree:
+    /// - EINVAL: usize < OPEN_HOW_SIZE_VER0 (fs/open.c:1480-1481); invalid
+    ///   flags, resolve, scoping, mode, O_DIRECTORY|O_CREAT, O_TMPFILE and
+    ///   O_PATH combinations in build_open_flags (fs/open.c:1259-1301),
+    ///   which do_sys_openat2 runs first (fs/open.c:1427-1429);
+    /// - E2BIG: usize > PAGE_SIZE (fs/open.c:1482-1483), or non-zero bytes
+    ///   past the known struct (copy_struct_from_user,
+    ///   include/linux/uaccess.h:403-405);
+    /// - EFAULT: open_how unreadable (include/linux/uaccess.h:405, :409);
+    ///   the probe's own name is always readable;
+    /// - EMFILE: no free descriptor (get_unused_fd_flags, fs/open.c:1435,
+    ///   fs/file.c:591), before do_filp_open.
+    ///
+    /// The probe is a call the guest did not make, so it runs as every
+    /// other probe does: only with the probe gate open (no guest filter
+    /// installed, pending or flagged, and the thread's dispatch mode OFF),
+    /// checked without counting, and under the thread group's admission
+    /// (S.3). With the gate closed the translation error stands, even where
+    /// the kernel would answer an argument error first (a known difference,
+    /// docs/design.md 4.9.3). A success, which only a filter can make on
+    /// descriptor -1, names no descriptor the probe owns: nothing is closed
+    /// (S.4).
+    async fn openat2_arguments_first<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        oa: reverie::syscalls::Openat2,
+        translation: Error,
+    ) -> Result<i64, Error> {
+        use reverie::syscalls::Errno;
+        if self.gate_closed_quiet(guest) {
+            return Err(translation);
+        }
+        // Its own scratch slot: admission stages its status read in the
+        // path slots before the probe runs.
+        let name = self
+            .scratch_write_at(guest, b"x\0", SCRATCH_PROBE_NAME)
+            .await?;
+        let probe = oa
+            .with_dirfd(-1)
+            .with_path(PathPtr::from_ptr(name as *const libc::c_char));
+        match self.admitted_inject(guest, Syscall::Openat2(probe)).await {
+            Some(Err(errno))
+                if [Errno::EINVAL, Errno::E2BIG, Errno::EFAULT, Errno::EMFILE].contains(&errno) =>
+            {
+                Err(errno.into())
+            }
+            _ => Err(translation),
+        }
+    }
+
+    /// openat2's arguments, checked before a synthesized cmdline answers.
+    /// The same probe as [`Self::openat2_arguments_first`] (the
+    /// guest's open_how and size against descriptor -1, which opens
+    /// nothing), behind the probe gate and under the thread group's
+    /// admission (S.3). Ok(true) only for EBADF, the lookup's start: the
+    /// arguments are valid and the synthesis answers. The pre-lookup errors
+    /// (EINVAL, E2BIG, EFAULT, EMFILE) are the guest's answer. Ok(false)
+    /// when the probe proves nothing (a closed gate, admission refused, or
+    /// any other outcome, a success included; nothing is closed, S.4): the
+    /// kernel's own file then answers, and checks the arguments itself.
+    async fn openat2_guarded_probe<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        oa: reverie::syscalls::Openat2,
+    ) -> Result<bool, Error> {
+        use reverie::syscalls::Errno;
+        if self.admission_closed(guest) {
+            return Ok(false);
+        }
+        // Its own scratch slot: admission stages its status read in the
+        // path slots before the probe runs.
+        let name = self.scratch_write_at(guest, b"x\0", SCRATCH_PROBE_NAME).await?;
+        let probe = oa.with_dirfd(-1).with_path(PathPtr::from_ptr(name as *const libc::c_char));
+        match self.admitted_inject(guest, Syscall::Openat2(probe)).await {
+            Some(Err(Errno::EBADF)) => Ok(true),
+            Some(Err(errno))
+                if [Errno::EINVAL, Errno::E2BIG, Errno::EFAULT, Errno::EMFILE].contains(&errno) =>
+            {
+                Err(errno.into())
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Stage a translated AF_UNIX sockaddr copy on the guest stack.
+    /// Some((guard, raw_ptr, new_addrlen)) or None to pass through
+    /// (non-Unix family, abstract socket, fault). Relative names are
+    /// translated too: the kernel would resolve them, and any symlink in
+    /// them, in the host's namespace. `follow` resolves a final symlink
+    /// (connect looks the socket up following one; bind creates it and
+    /// does not). A relative name the kernel resolves exactly as the guest
+    /// walk did ([`Self::kernel_resolves_as_guest`]) goes to the kernel as
+    /// the guest spelled it, at any length; any other name goes as its host
+    /// path, and one longer than sun_path holds is ENAMETOOLONG.
     async fn stage_sockaddr<T: Guest<Self>>(
         &self,
         guest: &mut T,
         addr: Option<reverie::syscalls::AddrMut<'_, libc::sockaddr>>,
         addrlen: i32,
+        follow: bool,
     ) -> Result<
         Option<(
             <<T as Guest<Self>>::Stack as reverie::Stack>::StackGuard,
@@ -4929,8 +7369,9 @@ impl RootfsTool {
         )>,
         Error,
     > {
-        use reverie::Stack as _;
         use reverie::syscalls::MemoryAccess as _;
+        use reverie::Stack as _;
+        use std::os::unix::ffi::OsStrExt as _;
         let Some(addr) = addr else { return Ok(None) };
         if !(3..=110).contains(&addrlen) {
             return Ok(None);
@@ -4944,8 +7385,8 @@ impl RootfsTool {
         if mem.read(base_r, &mut buf).is_err() {
             return Ok(None);
         }
-        // AF_UNIX=1, non-abstract (sun_path[0] != 0), absolute only.
-        if buf[0] != libc::AF_UNIX as u8 || buf.get(2) != Some(&b'/') {
+        // AF_UNIX=1, non-abstract (sun_path[0] != 0).
+        if buf[0] != libc::AF_UNIX as u8 || buf.get(2).is_none_or(|&c| c == 0) {
             return Ok(None);
         }
         let end = buf[2..]
@@ -4956,21 +7397,95 @@ impl RootfsTool {
         use std::os::unix::ffi::OsStringExt as _;
         let guest_path =
             PathBuf::from(std::ffi::OsString::from_vec(buf[2..end].to_vec()));
-        let host = self.translate_for(guest, libc::AT_FDCWD, &guest_path);
-        use std::os::unix::ffi::OsStrExt as _;
-        let hb = host.as_os_str().as_bytes();
-        if hb.len() + 3 > 110 {
+        let (host, links) = if follow {
+            let (host, links, _, _) =
+                self.translate_follow_uncached(guest, libc::AT_FDCWD, &guest_path)?;
+            (host, links)
+        } else {
+            self.translate_for_links(guest, libc::AT_FDCWD, &guest_path)?
+        };
+        // A relative name the kernel resolves exactly as the guest walk did
+        // goes as the guest spelled it, at any length, so getsockname
+        // answers what it answers natively. Otherwise the host path, which
+        // must fit sun_path with its terminating NUL.
+        const SUN_PATH_MAX: usize = 107;
+        let name = if self.kernel_resolves_as_guest(guest, &guest_path, &host, links) {
+            guest_path.as_os_str().as_bytes().to_vec()
+        } else if host.as_os_str().len() <= SUN_PATH_MAX {
+            host.as_os_str().as_bytes().to_vec()
+        } else {
             return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
-        }
+        };
         let mut out = [0u8; 128];
         out[0] = buf[0];
         out[1] = buf[1];
-        out[2..2 + hb.len()].copy_from_slice(hb);
+        out[2..2 + name.len()].copy_from_slice(&name);
         let mut stack = guest.stack().await;
         let a = stack.push(out);
         let guard = stack.commit()?;
         let raw = unsafe { a.as_ptr() } as usize;
-        Ok(Some((guard, raw, (2 + hb.len() + 1) as i32)))
+        // A name filling all 108 bytes of sun_path has no NUL; Linux takes
+        // it with addrlen 110, the size of sockaddr_un, and rejects a longer
+        // one (unix_validate_addr and unix_mkname_bsd, net/unix/af_unix.c).
+        let len = 2 + name.len() + usize::from(name.len() <= SUN_PATH_MAX);
+        Ok(Some((guard, raw, len as i32)))
+    }
+
+    /// Whether the kernel, given the guest's own relative spelling, resolves
+    /// it to `host` exactly as the guest walk did: the name is relative and
+    /// has no ".." component; the walk followed no link, the final
+    /// component included; it crosses no bind (the host path is the
+    /// translated cwd joined with the name, which a bind would change); and
+    /// the kernel's cwd is that translated cwd. Then no part of the name is
+    /// left for the kernel to resolve differently, apart from a concurrent
+    /// change to the tree or the cwd (the time-of-check race every
+    /// translation has).
+    fn kernel_resolves_as_guest<T: Guest<Self>>(
+        &self,
+        guest: &T,
+        guest_path: &Path,
+        host: &Path,
+        links: u32,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::Component;
+        if guest_path.is_absolute() || links != 0 {
+            return false;
+        }
+        let mut relative = PathBuf::new();
+        for component in guest_path.components() {
+            match component {
+                Component::Normal(name) => relative.push(name),
+                Component::CurDir => {}
+                _ => return false,
+            }
+        }
+        // A final link the call itself would not follow (bind).
+        if std::fs::symlink_metadata(host).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+        // Before the first chdir the cwd is the launch directory, as in
+        // every translation (translate_for_uncached).
+        let cwd = self.state.lock().unwrap().cwd.clone();
+        let cwd = if cwd == Path::new("/__literoot_unset__") {
+            self.seed_cwd(guest)
+        } else {
+            cwd
+        };
+        if cwd == Path::new(UNNAMED_CWD) {
+            return false;
+        }
+        let cwd_host = self.config(guest).translate(&cwd, Path::new("/"), None);
+        if cwd_host.join(&relative) != host {
+            return false;
+        }
+        let kernel_cwd = std::fs::metadata(format!("{}/cwd", task_dir(guest)));
+        match (kernel_cwd, std::fs::metadata(&cwd_host)) {
+            (Ok(kernel), Ok(translated)) => {
+                kernel.dev() == translated.dev() && kernel.ino() == translated.ino()
+            }
+            _ => false,
+        }
     }
 
     fn detranslate_sockaddr<T: Guest<Self>>(
@@ -5030,11 +7545,46 @@ impl RootfsTool {
     /// target in the guest buffer (design §4.5). On any memory
     /// fault the original result stands (never corrupt a
     /// successful readlink).
+    /// A1: readlink of a shared-row process's exe, answered without
+    /// injecting anything: the row's exe, written as the kernel writes a
+    /// link (truncated to `buf_len`, no NUL counted). None for every other
+    /// entry, and for a row gone since the entry was selected or with no
+    /// exe: the kernel's answer.
+    fn shared_row_readlink<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        final_entry: FinalProc,
+        buf: Option<reverie::syscalls::AddrMut<libc::c_char>>,
+        buf_len: usize,
+    ) -> Option<Result<i64, Error>> {
+        use reverie::syscalls::MemoryAccess as _;
+        let FinalProc::SharedExe(pid) = final_entry else {
+            return None;
+        };
+        let row = Self::shared_process_record(pid).filter(|row| !row.exe_guest.is_empty())?;
+        // The kernel takes bufsiz as an int and refuses one <= 0
+        // (do_readlinkat, fs/stat.c), so only the low 32 bits count.
+        let bufsiz = buf_len as i32;
+        if bufsiz <= 0 {
+            return Some(Err(reverie::syscalls::Errno::EINVAL.into()));
+        }
+        let Some(buf) = buf else {
+            return Some(Err(reverie::syscalls::Errno::EFAULT.into()));
+        };
+        let n = row.exe_guest.len().min(bufsiz as usize);
+        let addr: reverie::syscalls::AddrMut<u8> = unsafe { std::mem::transmute_copy(&buf) };
+        if guest.memory().write(addr, &row.exe_guest[..n]).is_err() {
+            return Some(Err(reverie::syscalls::Errno::EFAULT.into()));
+        }
+        Some(Ok(n as i64))
+    }
+
     fn detranslate_into<T: Guest<Self>>(
         &self,
         guest: &mut T,
         link_host: &Path,
         link_guest: &Path,
+        final_entry: FinalProc,
         buf: Option<reverie::syscalls::AddrMut<libc::c_char>>,
         buf_len: usize,
         ret: i64,
@@ -5062,46 +7612,73 @@ impl RootfsTool {
         // target; the write below truncates to buf_len exactly
         // as the kernel does, preserving the fill-signals-
         // growth protocol in guest-visible terms. On any
-        // re-read failure the kernel-written bytes stand.
+        // re-read failure the kernel-written bytes stand. The
+        // re-read names the calling thread's entry, as the
+        // kernel's read did: thread-self is its own task.
         if ret as usize >= buf_len {
             use std::os::unix::ffi::OsStrExt as _;
-            if let Ok(full) =
-                std::fs::read_link(host_for_tool_read(link_host, guest.pid().as_raw()))
-            {
+            let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());
+            if let Ok(full) = std::fs::read_link(host_for_tool_read(link_host, pid, tid)) {
                 stored = full.as_os_str().as_bytes().to_vec();
             }
         }
         let cfg = self.config(guest);
-        // /proc/self/exe and /proc/self/root are synthesized from
-        // replicated state, not de-translated: the kernel values
-        // name the loader / host root under our exec model.
-        let norm_guest = cfg.translate(link_guest, Path::new("/"), None);
-        let _ = norm_guest;
-        let guest_bytes = if link_guest == Path::new("/proc/self/root")
-            || link_guest == Path::new("/proc/thread-self/root")
-        {
-            use std::os::unix::ffi::OsStrExt as _;
-            cfg.rootfs.as_os_str().as_bytes().to_vec()
-        } else if is_self_exe(link_guest, guest.pid().as_raw()) {
-            use std::os::unix::ffi::OsStrExt as _;
-            let raw = self.exe_guest(guest);
-            self.canonical_exe(guest, &raw)
-                .as_os_str()
-                .as_bytes()
-                .to_vec()
-        } else if let Some(other) = proc_pid_exe(link_guest) {
-            use std::os::unix::ffi::OsStrExt as _;
-            match Self::shared_process_record(other) {
+        // An owned process's exe and the guest's own root are synthesized
+        // from replicated state, not de-translated: the kernel values name
+        // the loader / host root under our exec model. Which link it is
+        // comes from the selected final entry, never the spelling.
+        //
+        // A guest process's link (its own or a row's) is answered by its
+        // owner, whatever the naming: a numeric pid answers as /proc/self
+        // does.
+        use crate::translate::MagicKind;
+        use std::os::unix::ffi::OsStrExt as _;
+        let own = guest.pid().as_raw();
+        let link_of = match final_entry {
+            FinalProc::OwnedLink(l) | FinalProc::SharedLink(l) => Some((l.kind, l.pid)),
+            _ => None,
+        };
+        let guest_bytes = match link_of {
+            // The guest root, "/", for every guest process (once the
+            // caller's own answered the host rootfs path, and a row's the
+            // kernel's "/").
+            Some((MagicKind::Root, _)) => b"/".to_vec(),
+            Some((MagicKind::Exe, pid)) if pid == own => {
+                let raw = self.exe_guest(guest);
+                if self.state.lock().unwrap().exe_host {
+                    // No guest name: the host file the exec reached.
+                    raw.as_os_str().as_bytes().to_vec()
+                } else {
+                    self.canonical_exe(guest, &raw).as_os_str().as_bytes().to_vec()
+                }
+            }
+            // Disclosed residual: without a row, an
+            // owned child's exe falls back to pid_exe_map, keyed by bare
+            // pid, so a reused pid or a fork child can read a stale value.
+            // A row with no exe (an exec that reached a file with no guest
+            // name) is the kernel's link, as for a shared row,
+            // never an empty answer or that cache.
+            Some((MagicKind::Exe, other)) => match Self::shared_process_record(other) {
+                Some(row) if row.exe_guest.is_empty() => {
+                    cfg.detranslate_readlink(link_host, link_guest, &stored)
+                }
                 Some(row) => row.exe_guest,
                 None => match pid_exe_map().lock().unwrap().get(&other) {
                     Some(p) => p.as_os_str().as_bytes().to_vec(),
-                    None => {
-                        cfg.detranslate_readlink(link_host, link_guest, &stored)
-                    }
+                    None => cfg.detranslate_readlink(link_host, link_guest, &stored),
                 },
-            }
-        } else {
-            cfg.detranslate_readlink(link_host, link_guest, &stored)
+            },
+            // cwd, fd/<n> and map_files/<r>: kernel-generated host paths,
+            // reversed globally (deepest host binding), as the /proc/self
+            // spellings are.
+            Some(_) => match Path::new(std::ffi::OsStr::from_bytes(&stored)) {
+                t if t.is_absolute() => match cfg.reverse(t) {
+                    Some(g) => g.as_os_str().as_bytes().to_vec(),
+                    None => stored.clone(),
+                },
+                _ => stored.clone(),
+            },
+            None => cfg.detranslate_readlink(link_host, link_guest, &stored),
         };
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
             eprintln!(
@@ -5189,25 +7766,32 @@ impl RootfsTool {
 /// Intermediate-component symlinks remain a documented gap.
 /// Rewrite a host path containing /proc/self (or thread-self)
 /// for Tool-side reading: the Tool's own /proc/self is the
-/// wrong task; the guest's pid names the right one.
-fn host_for_tool_read(host: &Path, guest_pid: i32) -> PathBuf {
+/// wrong task; the guest's pid names the right one, and thread-self the
+/// calling thread's own task directory.
+fn host_for_tool_read(host: &Path, guest_pid: i32, guest_tid: i32) -> PathBuf {
     let s = host.to_string_lossy();
-    for needle in ["/proc/self/", "/proc/thread-self/"] {
+    // A thread with a descriptor table (unshare(CLONE_FILES)) or a cwd
+    // (CLONE_FS) of its own has other entries there than the leader.
+    let thread = format!("/proc/{guest_pid}/task/{guest_tid}");
+    let process = format!("/proc/{guest_pid}");
+    for (needle, with) in [("/proc/self/", &process), ("/proc/thread-self/", &thread)] {
         if let Some(idx) = s.find(needle) {
-            let mut out = String::with_capacity(s.len() + 8);
+            let mut out = String::with_capacity(s.len() + with.len());
             out.push_str(&s[..idx]);
-            out.push_str(&format!("/proc/{guest_pid}/"));
+            out.push_str(with);
+            out.push('/');
             out.push_str(&s[idx + needle.len()..]);
             return PathBuf::from(out);
         }
     }
-    if s.ends_with("/proc/self") || s.ends_with("/proc/thread-self") {
-        let base = s.trim_end_matches("/proc/self").trim_end_matches("/proc/thread-self");
-        return PathBuf::from(format!("{base}/proc/{guest_pid}"));
+    if let Some(base) = s.strip_suffix("/proc/self") {
+        return PathBuf::from(format!("{base}{process}"));
+    }
+    if let Some(base) = s.strip_suffix("/proc/thread-self") {
+        return PathBuf::from(format!("{base}{thread}"));
     }
     host.to_path_buf()
 }
-
 
 fn init_fake(ids: Option<(u32, u32)>) -> [u32; 6] {
     let (u, g) = ids.unwrap_or((0, 0));
@@ -5228,6 +7812,373 @@ fn task_dir<T: Guest<RootfsTool>>(guest: &T) -> String {
         guest.pid().as_raw(),
         guest.tid().as_raw()
     )
+}
+
+/// How a relative name resolves from a base with no guest name: the
+/// calling task's cwd or dirfd, spelled `base` (/proc/<pid>/task/<tid>/cwd
+/// or .../fd/<n>).
+#[derive(Debug, PartialEq)]
+enum UnnamedRoute {
+    /// The kernel can only fail without leaving the base: a closed fd (its
+    /// EBADF), a base that is not a directory (ENOTDIR before the first
+    /// component: path_init, fs/namei.c:2621, for the dirfd itself;
+    /// link_path_walk, :2529-2535, through /proc), or the deleted
+    /// directory itself (an empty name or only "."). The name goes to the
+    /// kernel through `base`.
+    Raw,
+    /// The kernel reaches a live directory that has this guest name, and
+    /// the rest of the name continues from there, walked like any guest
+    /// path. `climbed` when that took a ".." out of a deleted directory:
+    /// then the guest's own search check must have passed first (E1).
+    Guest {
+        dir: PathBuf,
+        rest: PathBuf,
+        climbed: bool,
+    },
+    /// A name looked up in a deleted directory: the dead-base answer
+    /// (the kernel's argument checks first, then its search check, then
+    /// ENOENT), which only the syscall's own dispatch can give.
+    DeadName,
+    /// Refused by name, EACCES.
+    Refused(crate::translate::PathRefusal),
+}
+
+/// What the Tool's stats of a base and its ".." climb found (G step 1).
+#[derive(Debug)]
+enum Climb {
+    /// The fd link is positively absent while the fd directory reads: the
+    /// kernel's EBADF.
+    Closed,
+    /// The base is not a directory.
+    NonDir,
+    /// A stat the Tool could not make, of the base or of a ".." the climb
+    /// needed.
+    Uninspectable,
+    /// A deleted directory reached with nothing left but "." (the held
+    /// object), or with a NAME next. `ups` ".." were climbed to get there.
+    Dead {
+        md: std::fs::Metadata,
+        ups: usize,
+        name_next: bool,
+    },
+    /// A live directory, `ups` ".." above the base, and the rest of the
+    /// name after them.
+    Live {
+        md: std::fs::Metadata,
+        ups: usize,
+        rest: PathBuf,
+    },
+}
+
+/// G step 1: the stats of `base` and of its ".." climb along `path`. A ".."
+/// out of a deleted directory is the kernel's own (follow_dotdot,
+/// fs/namei.c:2064, to the directory's old parent), read by stat-ing
+/// `<base>/..`, until a live directory.
+fn gather_climb(base: &str, path: &Path) -> Climb {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
+    let md = match std::fs::metadata(base) {
+        Ok(md) => md,
+        Err(_) => {
+            let absent = matches!(
+                std::fs::symlink_metadata(base),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            let dir_reads = Path::new(base)
+                .parent()
+                .is_some_and(|d| std::fs::metadata(d).is_ok());
+            return if absent && dir_reads {
+                Climb::Closed
+            } else {
+                Climb::Uninspectable
+            };
+        }
+    };
+    if !md.is_dir() {
+        return Climb::NonDir;
+    }
+    let mut rest = path.components().peekable();
+    let mut cur = PathBuf::from(base);
+    let mut md = md;
+    let mut ups = 0;
+    loop {
+        if md.nlink() > 0 {
+            return Climb::Live {
+                md,
+                ups,
+                rest: rest.collect(),
+            };
+        }
+        while rest.peek() == Some(&Component::CurDir) {
+            rest.next();
+        }
+        match rest.peek() {
+            Some(Component::ParentDir) => {}
+            next => {
+                let name_next = next.is_some();
+                return Climb::Dead { md, ups, name_next };
+            }
+        }
+        rest.next();
+        cur.push("..");
+        ups += 1;
+        md = match std::fs::metadata(&cur) {
+            Ok(md) => md,
+            Err(_) => return Climb::Uninspectable,
+        };
+    }
+}
+
+/// G step 2: the base's /proc text.
+fn gather_text(base: &str) -> std::io::Result<PathBuf> {
+    std::fs::read_link(base)
+}
+
+/// G step 3: the base's text popped `ups` times, and its stat. None when
+/// the text is not absolute or too short to pop.
+fn gather_text_stat(
+    text: &Path,
+    ups: usize,
+) -> Option<(PathBuf, std::io::Result<std::fs::Metadata>)> {
+    if !text.is_absolute() {
+        return None;
+    }
+    let mut host = text.to_path_buf();
+    for _ in 0..ups {
+        if !host.pop() {
+            return None;
+        }
+    }
+    let md = std::fs::metadata(&host);
+    Some((host, md))
+}
+
+/// G step 4, pure: the route from the gathered facts. A guest name is used
+/// only when the text still reaches the very directory the climb found
+/// (device and inode); a directory replaced at the same name is not.
+fn decide(
+    climb: Climb,
+    path: &Path,
+    text: std::io::Result<PathBuf>,
+    text_stat: impl FnOnce(&Path, usize) -> Option<(PathBuf, std::io::Result<std::fs::Metadata>)>,
+    cfg: &RootConfig,
+) -> UnnamedRoute {
+    use crate::translate::PathRefusal;
+    use std::os::unix::fs::MetadataExt as _;
+    if path.as_os_str().is_empty() {
+        return UnnamedRoute::Raw;
+    }
+    let (md, ups, rest, dead) = match climb {
+        Climb::Closed | Climb::NonDir => return UnnamedRoute::Raw,
+        Climb::Uninspectable => return UnnamedRoute::Refused(PathRefusal::BaseUninspectable),
+        Climb::Dead { md, ups, name_next } => (md, ups, None, Some(name_next)),
+        Climb::Live { md, ups, rest } => (md, ups, Some(rest), None),
+    };
+    let Ok(text) = text else {
+        return UnnamedRoute::Refused(PathRefusal::BaseUninspectable);
+    };
+    let Some((host, host_md)) = text_stat(&text, ups) else {
+        return UnnamedRoute::Refused(PathRefusal::BaseUninspectable);
+    };
+    let reaches = host_md.is_ok_and(|h| (h.dev(), h.ino()) == (md.dev(), md.ino()));
+    if reaches {
+        return match cfg.reverse(&host) {
+            Some(dir) => UnnamedRoute::Guest {
+                dir,
+                rest: rest.unwrap_or_else(|| path.to_path_buf()),
+                climbed: ups > 0,
+            },
+            None => UnnamedRoute::Refused(PathRefusal::BaseOutsideRoot),
+        };
+    }
+    match dead {
+        // A live directory the text does not lead back to.
+        None => UnnamedRoute::Refused(PathRefusal::BaseMoved),
+        Some(true) => UnnamedRoute::DeadName,
+        // The deleted directory itself (reached through ".." or not): the
+        // kernel holds it and can only fail there.
+        Some(false) => UnnamedRoute::Raw,
+    }
+}
+
+/// [`UnnamedRoute`] for `path` from `base`: G's three gather steps, in
+/// production order, then [`decide`].
+fn unnamed_route(cfg: &RootConfig, base: &str, path: &Path) -> UnnamedRoute {
+    if path.as_os_str().is_empty() {
+        return UnnamedRoute::Raw;
+    }
+    let climb = gather_climb(base, path);
+    if matches!(climb, Climb::Closed | Climb::NonDir | Climb::Uninspectable) {
+        return decide(climb, path, Ok(PathBuf::new()), |_, _| None, cfg);
+    }
+    let text = gather_text(base);
+    decide(climb, path, text, gather_text_stat, cfg)
+}
+
+/// The base a relative `path` resolves from when it has no guest name:
+/// the calling task's dirfd or cwd through /proc, or None when the path is
+/// absolute or its base is named.
+fn unnamed_base<T: Guest<RootfsTool>>(
+    guest: &T,
+    dirfd: i32,
+    cwd: &Path,
+    dirfd_guest: Option<&Path>,
+    path: &Path,
+) -> Option<String> {
+    if path.is_absolute() {
+        None
+    } else if dirfd != libc::AT_FDCWD {
+        dirfd_guest
+            .is_none()
+            .then(|| format!("{}/fd/{}", task_dir(guest), dirfd))
+    } else {
+        (cwd == Path::new(UNNAMED_CWD)).then(|| format!("{}/cwd", task_dir(guest)))
+    }
+}
+
+/// The rest of a name after [`UnnamedRoute::Guest`]'s directory: "." when
+/// nothing is left.
+fn guest_rest(rest: PathBuf) -> PathBuf {
+    if rest.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        rest
+    }
+}
+
+/// The size of a thread's scratch page.
+const SCRATCH_PAGE: usize = 4096;
+
+/// Scratch pages mapped at once, by one injected mmap: at post-exec (the
+/// exec'ing thread takes the first, the rest wait for new threads), and
+/// when a new thread finds none free. A new thread maps nothing until the
+/// pool is used up.
+const SCRATCH_POOL: usize = 16;
+
+/// A new scratch image number, never handed out before in this process.
+fn next_scratch_image() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The filter-count read's buffer (C3.6): the arms' second path slot,
+/// which no probe uses; the read runs at a thread's start or inside a
+/// probe's admission, never while an arm has staged a path.
+const SCRATCH_STATUS: usize = 1024;
+const SCRATCH_STATUS_LEN: usize = 1024;
+
+/// Scratch offsets for the dead-base probes, clear of the path staging
+/// at 0..2048 that the arms use after the gate.
+const SCRATCH_PROBE_X: usize = 2048;
+const SCRATCH_PROBE_Y: usize = 2056;
+/// Scratch offset of the open_how the ptrace cmdline route stages for the
+/// guest's rewritten openat2 (24 bytes), clear of the path at 0.
+const SCRATCH_OPEN_HOW: usize = 2304;
+/// Scratch offset of the in-guest memfd's name, clear of the path slots the
+/// admission's status read stages into before the memfd_create runs (tree
+/// 6: staged in a path slot, the name became `/proc/self/status`).
+const SCRATCH_MEMFD_NAME: usize = 2336;
+/// Scratch offset of the guarded openat2 probe's name ("x"), for the same
+/// reason (in a path slot it would become `/proc/self/status`, which the
+/// probe would then open, so every in-guest openat2 cmdline would fall back).
+const SCRATCH_PROBE_NAME: usize = 2368;
+const SCRATCH_SOCKADDR: usize = 2560;
+const SCRATCH_SEARCH: usize = 3072;
+const SCRATCH_SEARCH_MAX: usize = 1024;
+
+/// A dead-base gate found closed at the top of the route, before any read
+/// (S.3): the dispatch, the probing thread's dispatch mode, whether that
+/// mode came from tracking, and the config-read errno to note when the
+/// refusal is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateClosed {
+    seq: u64,
+    dispatch: Option<bool>,
+    fallback: bool,
+    note: Option<i32>,
+}
+
+/// A relative name the dead-base gate answers: its dirfd (AT_FDCWD for the
+/// cwd), its base through /proc and that base's identity when decided, the
+/// name, and whether it is a dead NAME (else a ".." climb).
+struct GatedName {
+    dirfd: i32,
+    identity: Option<(u64, u64)>,
+    base: String,
+    path: PathBuf,
+    dead_name: bool,
+}
+
+/// The device and inode of the directory a /proc base names now.
+fn base_identity(base: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(base).ok().map(|md| (md.dev(), md.ino()))
+}
+
+/// What the Tool's own reads say a descriptor holds (C step 1).
+struct SocketKind {
+    /// The `socket:[I]` text of /proc/<tid>/fd/<fd>.
+    link: PathBuf,
+    /// Inode I is listed in /proc/<tid>/net/unix: AF_UNIX in the task's
+    /// current network namespace.
+    unix: bool,
+}
+
+/// Why the socket reads give no kind.
+enum SocketRead {
+    /// The kernel's own answer before the lookup: EBADF or ENOTSOCK.
+    Answer(reverie::syscalls::Errno),
+    /// A read failed for another reason (on an in-guest backend a pre-run
+    /// filter can fail it): no trustworthy answer.
+    Unsupported,
+}
+
+/// C step 1, in the kernel's order: an O_PATH descriptor is no descriptor
+/// to bind or connect (EBADF: fdget masks FMODE_PATH); a closed one is
+/// EBADF; anything but a socket is ENOTSOCK. No guest syscall is made, and
+/// no guest getsockopt, which a cgroup program could rewrite.
+fn socket_kind(task: &str, fd: i32) -> Result<SocketKind, SocketRead> {
+    use reverie::syscalls::Errno;
+    let absent = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let info = match std::fs::read_to_string(format!("{task}/fdinfo/{fd}")) {
+        Ok(info) => info,
+        Err(e) if absent(&e) || fd < 0 => return Err(SocketRead::Answer(Errno::EBADF)),
+        Err(_) => return Err(SocketRead::Unsupported),
+    };
+    let flags = info
+        .lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 8).ok())
+        .ok_or(SocketRead::Unsupported)?;
+    if flags & libc::O_PATH as u64 != 0 {
+        return Err(SocketRead::Answer(Errno::EBADF));
+    }
+    let link = match std::fs::read_link(format!("{task}/fd/{fd}")) {
+        Ok(link) => link,
+        Err(e) if absent(&e) => return Err(SocketRead::Answer(Errno::EBADF)),
+        Err(_) => return Err(SocketRead::Unsupported),
+    };
+    let text = link.as_os_str().as_bytes();
+    let Some(inode) = text
+        .strip_prefix(b"socket:[")
+        .and_then(|t| t.strip_suffix(b"]"))
+        .and_then(|t| std::str::from_utf8(t).ok())
+    else {
+        return Err(SocketRead::Answer(Errno::ENOTSOCK));
+    };
+    let unix = std::fs::read_to_string(format!("{task}/net/unix"))
+        .map_err(|_| SocketRead::Unsupported)?
+        .lines()
+        .skip(1)
+        .any(|l| l.split_whitespace().nth(6) == Some(inode));
+    Ok(SocketKind { link, unix })
+}
+
+/// C step 5': the descriptor still names exactly the socket step 1 read.
+fn socket_unchanged(task: &str, fd: i32, link: &Path) -> bool {
+    #[cfg(test)]
+    crate::dead_base::trace("reread");
+    std::fs::read_link(format!("{task}/fd/{fd}")).is_ok_and(|now| now == link)
 }
 
 /// True when `path` is the same file (device and inode) as `live`.
@@ -5348,10 +8299,250 @@ fn is_magic_proc_path(path: &Path) -> bool {
     magic.contains(&comps[2].as_str())
 }
 
-/// Parse /proc/<pid>/exe (any pid) after lexical normalization.
-fn proc_pid_exe(link_guest: &Path) -> Option<i32> {
+/// What the selected FINAL entry of a path is, judged from its
+/// host path after binds and the tool view, never from the spelling.
+/// Another process's entries are not decided here: they are the kernel's,
+/// as under proot (literoot assumes non-hostile programs, §4.9.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalProc {
+    /// Anything but an owned procfs magic link, an owned cmdline file, or a
+    /// shared-record row's exe or cmdline: an ordinary path, the kernel's.
+    Ordinary,
+    /// A procfs magic link of a process the guest owns (its pid the
+    /// thread group's).
+    OwnedLink(crate::translate::MagicLink),
+    /// The procfs cmdline file of a process the guest owns (its tgid).
+    OwnedCmdline(i32),
+    /// The `exe` link of a process the guest does not own that has a
+    /// shared-record row (a guest child on the in-guest backends): readlink
+    /// and open answer the row's exe.
+    SharedExe(i32),
+    /// The cmdline file of such a process: open answers the row's argv.
+    SharedCmdline(i32),
+    /// Any other magic link of such a process (root, cwd, fd/<n>,
+    /// map_files/<r>), its pid the thread group's: readlink answers it as a
+    /// guest process's.
+    SharedLink(crate::translate::MagicLink),
+}
+
+/// Whether an open with `flags` follows a final symlink: not with
+/// O_NOFOLLOW, and not with O_CREAT|O_EXCL, which the kernel turns into
+/// O_NOFOLLOW (build_open_flags, fs/open.c).
+fn open_follows(flags: u64) -> bool {
+    let creat_excl = (libc::O_CREAT | libc::O_EXCL) as u64;
+    flags & libc::O_NOFOLLOW as u64 == 0 && flags & creat_excl != creat_excl
+}
+
+/// Whether the final name of `host` can be a procfs entry literoot decides
+/// at all: a magic link (exe, root, cwd, an entry of fd/ or map_files/) or
+/// a cmdline file. Every other path skips the procfs checks (no statfs per
+/// call).
+fn final_name_may_be_proc(host: &Path) -> bool {
+    fn name(p: Option<&Path>) -> Option<&str> {
+        p.and_then(Path::file_name).and_then(|n| n.to_str())
+    }
+    matches!(name(Some(host)), Some("exe" | "root" | "cwd" | "cmdline"))
+        || matches!(name(host.parent()), Some("fd" | "map_files"))
+}
+
+/// The pid of the cmdline file at tool-view host path `tv`:
+/// `<procfs>/<N>/cmdline` or a thread's `<procfs>/<N>/task/<T>/cmdline`
+/// (`/proc/thread-self/cmdline` in the tool view), N and T all digits; the
+/// pid is N. The caller's lstat proves the file
+/// exists.
+fn proc_cmdline_pid(tv: &Path) -> Option<i32> {
+    fn digits(dir: &Path) -> Option<&str> {
+        let n = dir.file_name()?.to_str()?;
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(n)
+    }
+    if tv.file_name()? != "cmdline" {
+        return None;
+    }
+    let root = crate::translate::procfs_root_of(tv)?;
+    let mut dir = tv.parent()?;
+    digits(dir)?;
+    // A thread's cmdline: <N>/task/<T>, decided as <N>'s.
+    if let Some(task) = dir.parent().filter(|t| t.file_name() == Some("task".as_ref())) {
+        if task.parent().and_then(Path::parent) == Some(root.as_path()) {
+            dir = task.parent()?;
+        }
+    }
+    if dir.parent()? != root {
+        return None;
+    }
+    digits(dir)?.parse().ok()
+}
+
+
+/// [`FinalProc`] of the selected final host path `host` (its final link not
+/// followed), for the guest whose procfs answers `links` gives: F (the
+/// parent is on procfs), the entry's own lstat (a symlink for a magic link,
+/// a regular file for cmdline), and ownership of the pid, normalized to its
+/// thread group first.
+fn final_proc_entry(host: &Path, links: &GuestProcLinks<'_>) -> FinalProc {
+    use crate::translate::ProcEntry;
+    if !final_name_may_be_proc(host) {
+        return FinalProc::Ordinary;
+    }
+    let (entry, tv) = crate::translate::proc_entry(host, links);
+    match entry {
+        ProcEntry::Magic(mut link) => {
+            match std::fs::symlink_metadata(&tv) {
+                Ok(md) if md.file_type().is_symlink() => {}
+                _ => return FinalProc::Ordinary,
+            }
+            let (tgid, owned) = links.tgid_and_owned(link.pid);
+            link.pid = tgid;
+            if owned {
+                FinalProc::OwnedLink(link)
+            } else if has_shared_row(link.pid) {
+                match link.kind {
+                    crate::translate::MagicKind::Exe => FinalProc::SharedExe(link.pid),
+                    _ => FinalProc::SharedLink(link),
+                }
+            } else {
+                FinalProc::Ordinary
+            }
+        }
+        ProcEntry::Inside => {
+            let Some(pid) = proc_cmdline_pid(&tv) else {
+                return FinalProc::Ordinary;
+            };
+            match std::fs::symlink_metadata(&tv) {
+                Ok(md) if md.file_type().is_file() => {}
+                _ => return FinalProc::Ordinary,
+            }
+            let (pid, owned) = links.tgid_and_owned(pid);
+            if owned {
+                FinalProc::OwnedCmdline(pid)
+            } else if has_shared_row(pid) {
+                FinalProc::SharedCmdline(pid)
+            } else {
+                FinalProc::Ordinary
+            }
+        }
+        ProcEntry::NotProc | ProcEntry::Prefix(_) => FinalProc::Ordinary,
+    }
+}
+
+/// Whether process `pid` has a shared-record row: a guest process that
+/// published its exe and argv (A1). Its exe and cmdline are answered from
+/// the row while the row has them.
+fn has_shared_row(pid: i32) -> bool {
+    RootfsTool::shared_process_record(pid).is_some()
+}
+
+/// The fallback of a cmdline literoot would answer itself but cannot (no
+/// memfd, a closed probe gate, or a failed write): its line, `answered path
+/// synthetic_file_unavailable`. The kernel's own file then answers.
+fn note_cmdline_fallback() {
+    note_path_report(Refusal::Path(crate::translate::PathRefusal::SyntheticFileUnavailable));
+}
+
+/// Write `content` at offset 0 of descriptor `fd` of guest thread `tid`,
+/// from the Tool's side, without moving the guest's file offset (pwrite
+/// never moves it). On ptrace the Tool is the tracer; in-guest it runs in
+/// the guest process itself. The descriptor is `tid`'s, in that thread's
+/// own table, which differs from its thread group leader's after
+/// unshare(CLONE_FILES) or close_range(CLOSE_RANGE_UNSHARE).
+/// First pidfd_open(tid, PIDFD_THREAD) and pidfd_getfd: a
+/// thread pidfd names that thread, and pidfd_getfd reads its table
+/// (pidfd_getfd, kernel/pid.c; fget_task, fs/file.c). If either call fails
+/// (a kernel before PIDFD_THREAD, or a filter on the in-guest Tool's own
+/// calls), a fresh open of /proc/<tid>/fd/<fd> for writing, which also
+/// goes through that thread's table. Before any write, the file must be
+/// the one /proc/<tid>/fd/<fd> names (same device and inode), a regular
+/// file, and empty: the memfd just made. Otherwise nothing is written.
+/// Then its mode is set to 0444, the kernel cmdline file's. True when
+/// every byte is written and the mode set.
+fn write_guest_fd(tid: i32, fd: i32, content: &[u8]) -> bool {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::fs::FileExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    // include/uapi/linux/pidfd.h: PIDFD_THREAD is O_EXCL.
+    const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
+    #[cfg(test)]
+    if MEMFD_WRITE_FAILS.with(|s| s.get()) {
+        return false;
+    }
+    let target = format!("/proc/{tid}/fd/{fd}");
+    // The file the guest's descriptor names, through the magic link.
+    let Ok(want) = std::fs::metadata(&target) else {
+        return false;
+    };
+    let fresh = |file: &std::fs::File| {
+        file.metadata().is_ok_and(|md| {
+            md.file_type().is_file() && md.len() == 0 && (md.dev(), md.ino()) == (want.dev(), want.ino())
+        })
+    };
+    // The bytes, then the kernel cmdline file's mode, 0444, as the ptrace
+    // route's memfd has.
+    let fill = |file: &std::fs::File| {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.write_all_at(content, 0).is_ok()
+            && file.set_permissions(std::fs::Permissions::from_mode(0o444)).is_ok()
+    };
+    #[cfg(test)]
+    let pidfd_route = !MEMFD_PIDFD_OFF.with(|s| s.get());
+    #[cfg(not(test))]
+    let pidfd_route = true;
+    if pidfd_route {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: a plain syscall with integer arguments.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, tid, PIDFD_THREAD) };
+        if pidfd >= 0 {
+            // SAFETY: pidfd_open returned this new descriptor; it is owned here.
+            let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd as i32) };
+            // SAFETY: a plain syscall with integer arguments.
+            let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+            if dup >= 0 {
+                // SAFETY: pidfd_getfd returned this new descriptor; it is owned here.
+                let file = unsafe { std::fs::File::from_raw_fd(dup as i32) };
+                if !fresh(&file) {
+                    return false;
+                }
+                #[cfg(test)]
+                MEMFD_ROUTE.with(|r| r.set(Some(MemfdRoute::Pidfd)));
+                return fill(&file);
+            }
+        }
+    }
+    match std::fs::OpenOptions::new().write(true).open(&target) {
+        Ok(file) => {
+            if !fresh(&file) {
+                return false;
+            }
+            #[cfg(test)]
+            MEMFD_ROUTE.with(|r| r.set(Some(MemfdRoute::Procfs)));
+            fill(&file)
+        }
+        Err(_) => false,
+    }
+}
+
+/// O'' synthesize-if-absent (plain `-r` with no guest /proc): the walk
+/// positively found no `/proc` or `/proc/<x>` in the guest view, that is,
+/// the selected final entry's parent does not exist (ENOENT). Any other
+/// inspection error is the walk's own answer, never synthesis.
+fn proc_parent_absent(host: &Path) -> Result<bool, reverie::syscalls::Errno> {
+    let Some(parent) = host.parent() else {
+        return Ok(false);
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(true),
+        Err(e) => Err(reverie::syscalls::Errno::new(
+            e.raw_os_error().unwrap_or(libc::EACCES),
+        )),
+    }
+}
+
+/// Whether `path` spells one of the self links plain `-r` synthesizes when
+/// the guest has no /proc: `/proc/<x>/{exe,root,cmdline}`, after lexical
+/// `..` normalization (the handlers then apply their own spelled rules).
+fn spells_proc_self_link(path: &Path) -> bool {
     let mut comps: Vec<std::ffi::OsString> = Vec::new();
-    for c in link_guest.components() {
+    for c in path.components() {
         match c {
             std::path::Component::ParentDir => {
                 comps.pop();
@@ -5360,10 +8551,328 @@ fn proc_pid_exe(link_guest: &Path) -> Option<i32> {
             _ => {}
         }
     }
-    if comps.len() == 3 && comps[0] == "proc" && comps[2] == "exe" {
-        comps[1].to_string_lossy().parse().ok()
+    matches!(comps.as_slice(), [p, _, l] if p == "proc" && (l == "exe" || l == "root" || l == "cmdline"))
+}
+
+/// [`RootfsTool::self_link_route`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfLink {
+    /// Synthesize the process's own executable (its guest path).
+    Exe,
+    /// Synthesize process `pid`'s as-exec'd argv.
+    Cmdline(i32),
+    /// A1: process `pid`'s argv from its shared-record row; a row gone or
+    /// empty by then gets the kernel's file.
+    SharedCmdline(i32),
+    /// A1: process `pid`'s exe from its shared-record row (its guest path);
+    /// a row gone or empty by then gets the kernel's link.
+    RowExe(i32),
+    /// The ordinary path: no synthesis.
+    Walk,
+}
+
+/// The guest's own open of a cmdline literoot answers itself (§4.9.5): the
+/// call the ptrace route rewrites to reopen the tracer's memfd
+/// ([`RootfsTool::open_cmdline_via_tracer`]), and whose O_CLOEXEC the
+/// in-guest memfd follows. openat2 carries the open_how its arm read.
+#[derive(Debug, Clone, Copy)]
+enum CmdlineOpen {
+    Openat(reverie::syscalls::Openat),
+    #[cfg(target_arch = "x86_64")]
+    Open(reverie::syscalls::Open),
+    Openat2(reverie::syscalls::Openat2, reverie::syscalls::OpenHow),
+}
+
+impl CmdlineOpen {
+    /// The call's raw arguments.
+    fn raw(self) -> SyscallArgs {
+        use reverie::syscalls::SyscallInfo as _;
+        match self {
+            CmdlineOpen::Openat(o) => Syscall::Openat(o).into_parts().1,
+            #[cfg(target_arch = "x86_64")]
+            CmdlineOpen::Open(o) => Syscall::Open(o).into_parts().1,
+            CmdlineOpen::Openat2(o, _) => Syscall::Openat2(o).into_parts().1,
+        }
+    }
+
+    /// The guest's O_* flags.
+    fn flags(self) -> u64 {
+        match self {
+            CmdlineOpen::Openat(_) => self.raw().arg2 as u64,
+            #[cfg(target_arch = "x86_64")]
+            CmdlineOpen::Open(_) => self.raw().arg1 as u64,
+            CmdlineOpen::Openat2(_, how) => how.flags,
+        }
+    }
+
+    fn cloexec(self) -> bool {
+        self.flags() & libc::O_CLOEXEC as u64 != 0
+    }
+}
+
+/// include/uapi/linux/openat2.h: the resolve bits that act on the jump
+/// through a magic link or re-root an absolute name. The ptrace cmdline
+/// route clears them for its rewritten openat2 (the guest named a regular
+/// file; the rewritten final entry is the tracer's magic link).
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+
+/// openat2's size checks (fs/open.c): EINVAL below OPEN_HOW_SIZE_VER0 (24
+/// bytes), E2BIG above the page size.
+fn open_how_size_check(size: usize, page: usize) -> Result<(), reverie::syscalls::Errno> {
+    if size < std::mem::size_of::<reverie::syscalls::OpenHow>() {
+        Err(reverie::syscalls::Errno::EINVAL)
+    } else if size > page {
+        Err(reverie::syscalls::Errno::E2BIG)
     } else {
-        None
+        Ok(())
+    }
+}
+
+/// The kernel's PAGE_SIZE.
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: a plain sysconf query.
+    *PAGE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize)
+}
+
+/// access_ok for `len` bytes at `addr`: the range ends at or below the top
+/// of the user address space (x86_64: TASK_SIZE_MAX, arch/x86/include/asm/
+/// uaccess_64.h; arm64: 1 << VA_BITS, arch/arm64/include/asm/uaccess.h).
+/// The top is the 5-level (x86_64) or 52-bit (arm64) one when a mapping
+/// above the smaller one succeeds. arm64's tagged-address ABI is not
+/// modelled: a tagged pointer is out of range here.
+fn user_range_ok(addr: usize, len: usize) -> bool {
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let top = *TOP.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        let (low, high) = ((1usize << 47) - 4096, (1usize << 56) - 4096);
+        #[cfg(target_arch = "aarch64")]
+        let (low, high) = (1usize << 48, 1usize << 52);
+        let hint = 1usize << 50;
+        // SAFETY: a fresh anonymous mapping at a hint, unmapped at once.
+        let p = unsafe {
+            libc::mmap(
+                hint as *mut libc::c_void,
+                page_size(),
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return low;
+        }
+        // SAFETY: the mapping just made.
+        unsafe { libc::munmap(p, page_size()) };
+        if p as usize >= low { high } else { low }
+    });
+    addr.checked_add(len).is_some_and(|end| end <= top)
+}
+
+/// A tracer copy of the guest's `len` bytes at `addr`, at the same offset
+/// in a page, with every page the guest cannot read mapped PROT_NONE: a
+/// kernel copy from it reads and faults where one from the guest's memory
+/// would. `len` is at most a page, so at most two
+/// pages.
+struct LayoutCopy {
+    base: *mut libc::c_void,
+    map_len: usize,
+    offset: usize,
+    readable: Vec<bool>,
+    page: usize,
+}
+
+impl LayoutCopy {
+    /// `read(addr, buf)` reads the guest's bytes at `addr` into `buf`, false
+    /// when it cannot. None when the tracer cannot map the copy, or cannot
+    /// make a page the guest cannot read inaccessible in it.
+    fn new(addr: usize, len: usize, page: usize, mut read: impl FnMut(usize, &mut [u8]) -> bool) -> Option<Self> {
+        let first = addr & !(page - 1);
+        let end = addr.checked_add(len)?;
+        let map_len = end.checked_add(page - 1)? & !(page - 1);
+        let map_len = map_len - first;
+        // SAFETY: a fresh anonymous mapping, owned by the copy.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        #[cfg(test)]
+        LAYOUT_COPY_LIVE.with(|n| n.set(n.get() + 1));
+        let mut copy = LayoutCopy { base, map_len, offset: addr - first, readable: Vec::new(), page };
+        for i in 0..map_len / page {
+            let start = first + i * page;
+            let (lo, hi) = (addr.max(start), end.min(start + page));
+            // SAFETY: [lo, hi) lies in page i of the mapping.
+            let buf = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>().add(lo - first), hi - lo) };
+            let ok = read(lo, buf);
+            // A page left readable would let the kernel read zeros where
+            // the guest's call faults: when it cannot
+            // be made inaccessible there is no copy (`copy` is unmapped on
+            // return), and the guest's own call answers.
+            if !ok && !protect_none(base.cast::<u8>().wrapping_add(i * page).cast(), page) {
+                return None;
+            }
+            copy.readable.push(ok);
+        }
+        Some(copy)
+    }
+
+    /// The copy's first byte, the guest's `addr`.
+    fn ptr(&self) -> *const u8 {
+        // SAFETY: inside the mapping.
+        unsafe { self.base.cast::<u8>().add(self.offset) }
+    }
+
+    /// The first `n` bytes, when every page under them was readable.
+    fn readable_prefix(&self, n: usize) -> Option<Vec<u8>> {
+        let last = (self.offset + n - 1) / self.page;
+        if !self.readable.get(..=last)?.iter().all(|ok| *ok) {
+            return None;
+        }
+        // SAFETY: readable pages of the mapping.
+        Some(unsafe { std::slice::from_raw_parts(self.ptr(), n) }.to_vec())
+    }
+}
+
+/// mprotect(PROT_NONE) over `len` bytes of a [`LayoutCopy`]'s mapping at
+/// `at`; false when it fails.
+fn protect_none(at: *mut libc::c_void, len: usize) -> bool {
+    #[cfg(test)]
+    if LAYOUT_COPY_PROTECT_FAILS.with(|s| s.get()) {
+        return false;
+    }
+    // SAFETY: a page of the copy's own mapping.
+    unsafe { libc::mprotect(at, len, libc::PROT_NONE) == 0 }
+}
+
+impl Drop for LayoutCopy {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `new` made.
+        let unmapped = unsafe { libc::munmap(self.base, self.map_len) } == 0;
+        #[cfg(test)]
+        if unmapped {
+            LAYOUT_COPY_LIVE.with(|n| n.set(n.get() - 1));
+        }
+        let _ = unmapped;
+    }
+}
+
+/// Whether the ptrace cmdline route can be used at all, checked once: the
+/// tracer is dumpable (a guest reopens its descriptor through
+/// proc_fd_access_allowed, fs/proc/base.c, which needs ptrace read access
+/// to the tracer), and its /proc names itself (the procfs a guest sharing
+/// its mount namespace resolves). Logged once when it cannot.
+fn tracer_route_ready() -> bool {
+    #[cfg(test)]
+    if TRACER_ROUTE_OFF.with(|s| s.get()) {
+        return false;
+    }
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| {
+        // SAFETY: a plain prctl query.
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) } == 1;
+        let own_proc = std::fs::read_link("/proc/self")
+            .ok()
+            .and_then(|p| p.to_str()?.parse::<u32>().ok())
+            == Some(std::process::id());
+        if !(dumpable && own_proc) {
+            eprintln!(
+                "literoot: tracer cmdline route off (dumpable {dumpable}, /proc names the tracer {own_proc}): \
+                 cmdline falls back to the kernel's file"
+            );
+        }
+        dumpable && own_proc
+    })
+}
+
+/// Whether the tracer has CAP_DAC_OVERRIDE-like credentials (effective uid
+/// 0), under which a write open of a read-only file is not EACCES. The
+/// tracer's credentials are the guest's: literoot changes none.
+fn tracer_overrides_dac() -> bool {
+    // SAFETY: a plain query.
+    let euid = unsafe { libc::geteuid() };
+    euid == 0
+}
+
+/// Guest processes that left the tracer's mount namespace:
+/// their own unshare(CLONE_NEWNS) or any setns, a clone
+/// with CLONE_NEWNS, or a parent that had left it when it created them.
+/// Keyed by start-time-qualified identity, so a reused pid is a new
+/// process. On ptrace every Tool lives in the tracer, which sees all of
+/// those calls; the in-guest route never asks.
+static MOVED_MOUNT_NS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<ProcessId>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn note_mount_ns_moved(pid: i32) {
+    if let Some(id) = RootfsTool::guest_process_id(pid) {
+        MOVED_MOUNT_NS.lock().unwrap().insert(id);
+    }
+}
+
+/// Whether process `pid` may not share the tracer's mount namespace: it is
+/// recorded as having left it, or its identity cannot be read.
+fn mount_ns_moved(pid: i32) -> bool {
+    match RootfsTool::guest_process_id(pid) {
+        Some(id) => MOVED_MOUNT_NS.lock().unwrap().contains(&id),
+        None => true,
+    }
+}
+
+#[cfg(test)]
+fn forget_mount_ns_moved(pid: i32) {
+    if let Some(id) = RootfsTool::guest_process_id(pid) {
+        MOVED_MOUNT_NS.lock().unwrap().remove(&id);
+    }
+}
+
+/// Tracer memfds kept past a rewritten call that returned a restart code
+/// (ERESTART*), by guest thread: the restarted call reopens the same
+/// descriptor number, so it must stay open. Released at that thread's next
+/// route call or its exit.
+static HELD_TRACER_FDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i32, std::fs::File>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn release_held_tracer_fd(tid: i32) {
+    HELD_TRACER_FDS.lock().unwrap().remove(&tid);
+}
+
+/// The pid a spelled `/proc/<x>/cmdline` names (`self` and `thread-self`
+/// are `own`), after lexical `..` normalization.
+fn spelled_cmdline_pid(path: &Path, own: i32) -> Option<i32> {
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                comps.pop();
+            }
+            std::path::Component::Normal(s) => comps.push(s.to_os_string()),
+            _ => {}
+        }
+    }
+    match comps.as_slice() {
+        [p, x, l] if p == "proc" && l == "cmdline" => {
+            if x == "self" || x == "thread-self" {
+                Some(own)
+            } else {
+                x.to_str()?.parse().ok()
+            }
+        }
+        _ => None,
     }
 }
 
@@ -5390,6 +8899,76 @@ fn is_self_exe(link_guest: &Path, pid: i32) -> bool {
 }
 
 
+/// The canonical guest path of the directory an absolute guest path names,
+/// every link (the final one included) resolved through the guest root:
+/// what a recorded cwd must be. The path itself when the walk has no guest
+/// name or passes 40 links.
+fn canonical_dir(cfg: &RootConfig, path: &Path) -> PathBuf {
+    let mut links = 0;
+    cfg.translate_counted(path, Path::new("/"), None, &mut links)
+        .map_err(crate::translate::WalkError::from)
+        .and_then(|host| {
+            resolve_symlink_chain_guest(cfg, Some(path.to_path_buf()), host, &mut links, None)
+        })
+        .ok()
+        .and_then(|(_, guest)| guest)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The launch directory `-w` names as the kernel will hold it: the host
+/// directory with every link resolved through the guest root, and its
+/// canonical guest path. None when that is not a directory (or the walk
+/// passes 40 links).
+#[allow(dead_code)] // The launcher's (tool.rs); the preload build has no launcher.
+pub(crate) fn launch_dir(cfg: &RootConfig, cwd_guest: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut links = 0;
+    let host = cfg
+        .translate_counted(cwd_guest, Path::new("/"), None, &mut links)
+        .ok()?;
+    let (host, guest) =
+        resolve_symlink_chain_guest(cfg, Some(cwd_guest.to_path_buf()), host, &mut links, None)
+            .ok()?;
+    host.is_dir()
+        .then(|| (host, guest.unwrap_or_else(|| cwd_guest.to_path_buf())))
+}
+
+/// The host path of an absolute guest path with its final symlink
+/// followed, as one walk on the guest `pid`'s behalf: more than 40 links
+/// is the guest's ELOOP, a refused /proc magic link its EACCES.
+fn follow_guest_path(
+    cfg: &RootConfig,
+    (pid, tid): (i32, i32),
+    path: &Path,
+) -> Result<PathBuf, reverie::syscalls::Errno> {
+    follow_guest_path_from(cfg, &GuestProcLinks::new(cfg, pid, tid), Path::new("/"), path)
+        .map_err(|e| {
+            note_walk_error(&e);
+            walk_errno(e)
+        })
+}
+
+/// [`follow_guest_path`] for a guest path that may be relative to the
+/// guest directory `cwd`: the launcher's walk for the program, its
+/// interpreter and its loader. Intermediate and final links share one
+/// budget; past 40 the answer is ELOOP, never a host path that still holds
+/// a link for the host kernel to follow. `proc` answers at /proc magic
+/// links.
+pub(crate) fn follow_guest_path_from(
+    cfg: &RootConfig,
+    proc: &dyn crate::translate::ProcLinks,
+    cwd: &Path,
+    path: &Path,
+) -> Result<PathBuf, crate::translate::WalkError> {
+    let mut links = 0;
+    let route = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    cfg.translate_walk(path, cwd, None, &mut links, proc)
+        .and_then(|host| resolve_symlink_chain(cfg, Some(route), host, &mut links, Some(proc)))
+}
+
 /// Follows a final-component symlink chain from `host`, the translation of
 /// the guest path `guest` when the caller knows it. A relative target is
 /// resolved from the link's GUEST directory and translated again, so the
@@ -5397,67 +8976,464 @@ fn is_self_exe(link_guest: &Path, pid: i32) -> bool {
 /// decides where it lands, as proot's path/canon.c:330-341 does. Without a
 /// guest path (a dirfd or cwd with no guest name) the target is joined on
 /// the host side.
-fn resolve_symlink_chain(cfg: &RootConfig, guest: Option<PathBuf>, host: PathBuf) -> PathBuf {
-    // Never follow /proc magic links Tool-side: readlink from
-    // the Tool process names the wrong task's objects
-    // (measured: guest fd/0 resolved to the tracer's pipe).
-    {
-        let comps: Vec<String> = host
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(v) => Some(v.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect();
-        if comps.len() >= 3
-            && comps[comps.len() - 3] == "proc"
-            && ["fd", "exe", "root", "cwd", "map_files"]
-                .contains(&comps[comps.len() - 1].as_str())
-        {
-            return host;
-        }
-        if comps.len() >= 2 && comps[0] == "proc" {
-            // Any /proc/<x>/fd|exe|... final magic component.
-            let last2 = &comps[comps.len() - 2..];
-            if last2[0] == "fd" || comps[1] == "self" || comps[1] == "thread-self" {
-                return host;
-            }
-        }
-    }
+fn resolve_symlink_chain(
+    cfg: &RootConfig,
+    guest: Option<PathBuf>,
+    host: PathBuf,
+    links: &mut u32,
+    proc: Option<&dyn crate::translate::ProcLinks>,
+) -> Result<PathBuf, crate::translate::WalkError> {
+    resolve_symlink_chain_guest(cfg, guest, host, links, proc).map(|(host, _)| host)
+}
+
+/// [`resolve_symlink_chain`], also returning the canonical guest path of
+/// what the chain reached, when the walk has one: every link resolved,
+/// the bind route it came through kept. None for /proc magic links and
+/// walks with no guest name.
+fn resolve_symlink_chain_guest(
+    cfg: &RootConfig,
+    guest: Option<PathBuf>,
+    host: PathBuf,
+    links: &mut u32,
+    proc: Option<&dyn crate::translate::ProcLinks>,
+) -> Result<(PathBuf, Option<PathBuf>), crate::translate::WalkError> {
+    use crate::translate::MagicAction;
+    use crate::translate::ProcEntry;
+    // Keep the guest path canonical (no intermediate link, no ".."): its
+    // parent is where a relative target resolves, and the route returned
+    // with the host path is what a cwd record keeps. A walk on a guest's
+    // behalf canonicalizes under its /proc policy too.
+    let canonical = |path: &Path, base: &Path| match proc {
+        Some(policy) => cfg.canonical_guest_walk(path, base, policy),
+        None => Ok(cfg.canonical_guest(path, base)),
+    };
+    let translate = |path: &Path, base: &Path, links: &mut u32| match proc {
+        Some(policy) => cfg.translate_walk(path, base, None, links, policy),
+        None => Ok(cfg.translate_counted(path, base, None, links)?),
+    };
+    let mut guest = match guest {
+        Some(g) => Some(canonical(&g, Path::new("/"))?),
+        None => None,
+    };
     let mut cur = host;
-    // Keep the guest path canonical: canonicalize_inner reads only the
-    // Normal components of its base, so a raw ".." in a parent would be
-    // dropped without popping the directory before it.
-    let mut guest = guest.map(|g| cfg.canonical_guest(&g, Path::new("/")));
-    for _ in 0..40 {
-        match std::fs::read_link(&cur) {
+    let mut first = true;
+    // Every link followed here, and every link inside its target,
+    // counts against the walk's budget: past 40 the guest gets ELOOP, and
+    // no path still holding a link reaches the kernel.
+    loop {
+        // The final entry in the real procfs, judged from its host path
+        // (selected through binds): the policy decides what following a
+        // magic link means, and procfs's own self/thread-self is followed
+        // to the calling task's directory, never read Tool-side (that would
+        // name the Tool). Without a policy, a magic link is never followed
+        // Tool-side: readlink from the Tool process names the wrong task's
+        // objects (measured: guest fd/0 resolved to the tracer's pipe).
+        let mut read_at = None;
+        if let Some(policy) = proc {
+            let (entry, tv) = crate::translate::proc_entry(&cur, policy);
+            match entry {
+                ProcEntry::Magic(link) => match policy.follow(&link, &tv) {
+                    MagicAction::Walk => {}
+                    MagicAction::Reroot(dir) => {
+                        crate::translate::take_link(links)?;
+                        cur = translate(&dir, Path::new("/"), links)?;
+                        guest = Some(dir);
+                        continue;
+                    }
+                    MagicAction::Raw => {
+                        // The kernel follows it: one more link.
+                        crate::translate::take_link(links)?;
+                        return Ok((cur, None));
+                    }
+                    MagicAction::Refuse(kind) => {
+                        return Err(crate::translate::WalkError::Refused(kind));
+                    }
+                },
+                ProcEntry::Prefix(target) => {
+                    crate::translate::take_link(links)?;
+                    let mut next = cur
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("/"));
+                    let mut route = guest
+                        .as_ref()
+                        .and_then(|g| g.parent().map(Path::to_path_buf));
+                    for c in &target {
+                        next.push(c);
+                        if let Some(r) = route.as_mut() {
+                            r.push(c);
+                        }
+                    }
+                    cur = next;
+                    guest = route;
+                    continue;
+                }
+                ProcEntry::Inside => read_at = Some(tv),
+                ProcEntry::NotProc => {}
+            }
+        } else if std::mem::take(&mut first) && host_is_proc_magic(&cur) {
+            return Ok((cur, None));
+        }
+        match std::fs::read_link(read_at.as_ref().unwrap_or(&cur)) {
             Ok(target) if target.is_absolute() => {
-                cur = cfg.translate(&target, Path::new("/"), None);
-                guest = Some(cfg.canonical_guest(&target, Path::new("/")));
+                crate::translate::take_link(links)?;
+                cur = translate(&target, Path::new("/"), links)?;
+                guest = Some(canonical(&target, Path::new("/"))?);
+            }
+            Ok(target) if proc.is_some_and(|p| p.raw_crossed()) => {
+                // After a Raw hand-over the parent is the kernel's literal
+                // route, whose links the walk already counted: walking it
+                // again would charge the magic link and its tail twice.
+                // The target resolves from the
+                // host parent instead, counting only the links in its own
+                // intermediate components, with the same conservative
+                // counter.
+                crate::translate::take_link(links)?;
+                let parent = cur
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("/"));
+                let tail: Vec<std::ffi::OsString> =
+                    target.iter().map(|c| c.to_os_string()).collect();
+                crate::translate::count_raw_tail(&parent, &tail, links)?;
+                cur = parent.join(&target);
+                guest = None;
             }
             Ok(target) => {
+                crate::translate::take_link(links)?;
                 let parent = guest
                     .as_ref()
                     .and_then(|g| g.parent().map(Path::to_path_buf));
                 match parent {
                     Some(parent) => {
-                        cur = cfg.translate(&target, &parent, None);
-                        guest = Some(cfg.canonical_guest(&target, &parent));
+                        cur = translate(&target, &parent, links)?;
+                        guest = Some(canonical(&target, &parent)?);
                     }
+                    // No guest directory to resolve it from: joining it on
+                    // the host side would walk the host's tree.
                     None => {
-                        let mut next = cur
-                            .parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| PathBuf::from("/"));
-                        next.push(target);
-                        cur = next;
+                        return Err(crate::translate::WalkError::Refused(
+                            crate::translate::PathRefusal::NoGuestRoute,
+                        ));
                     }
                 }
             }
             Err(_) => break,
         }
     }
-    cur
+    Ok((cur, guest))
+}
+
+/// The guest's errno for a failed walk.
+fn walk_errno(e: crate::translate::WalkError) -> reverie::syscalls::Errno {
+    match e {
+        crate::translate::WalkError::TooManyLinks => reverie::syscalls::Errno::ELOOP,
+        crate::translate::WalkError::Refused(_) => reverie::syscalls::Errno::EACCES,
+        crate::translate::WalkError::Kernel(e) => reverie::syscalls::Errno::new(e),
+    }
+}
+
+/// The `Tgid:` and `TracerPid:` of host process `pid`.
+fn proc_status_ids(pid: i32) -> Option<(i32, i32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse::<i32>().ok())
+    };
+    Some((field("Tgid:")?, field("TracerPid:")?))
+}
+
+/// The /proc magic-link policy for walks on behalf of guest thread `tid` of
+/// process `pid` (or of the launcher, for its own launch walk). Literoot
+/// does not chroot: through the real procfs, `/proc/<x>/root` is the host's
+/// `/`, and `cwd`, `fd/<n>`, `exe` and `map_files/<r>` are process x's
+/// objects wherever they are on the host.
+///
+/// The walk hands it the link's HOST entry (selected through binds, then
+/// [`Self::tool_view`]), so the owner is the pid in that path, never a
+/// spelling: a bind that puts another process's directory at guest
+/// `/proc/self` names that process.
+///
+/// - A guest process: one of the guest's own (itself, its threads, or on
+///   the ptrace backend any task literoot's tracer traces), or a process
+///   with a shared-record row (a guest child on the in-guest backends),
+/// judged by its thread group:
+///   - `root` continues from the guest root;
+///   - `cwd`, and `fd/<n>` holding a directory, continue from the
+///     directory's guest path, when it has one that leads back to the same
+///     directory ([`Self::verified_reverse`]); refused,
+///     `proc_link_outside_root`, when it has none: deleted, outside every
+///     mapped tree, shadowed by a deeper bind, or moved between the
+///     readlink and the check;
+///   - `fd/<n>` holding anything else (a pipe, socket, anonymous inode or
+///     regular file), `exe` and `map_files/<r>` pass to the kernel, which
+///     can only answer ENOTDIR at that inode, as natively;
+///   - an entry that does not exist is the kernel's ENOENT;
+///   - following the link itself passes, except `root`, which is the guest
+///     root.
+/// - Any other process (a host process): literoot assumes non-hostile
+///   programs (owner directive 2026-11-14), so its links are not refused.
+///   - `root`, `cwd`, and `fd/<n>` holding a directory, continued past or
+///     followed, continue from the directory's guest path when it has a
+///     verified one, as for a guest process:
+///     the walk, its link budget and any record of where the call landed
+///     use the directory the link named when the Tool read it. The window:
+///     if the process moves between that read and the call, the call runs
+///     as if a moment earlier.
+///   - Otherwise (outside the view, deleted, unreadable to the Tool, or a
+///     failed check), the link and the rest of the path are the kernel's
+///     (`MagicAction::Raw`), with the links in that rest counted against
+///     the walk's budget ([`crate::translate::count_raw_tail`]); the walk
+///     then reports [`crate::translate::ProcLinks::raw_crossed`], so no
+///     caller records its route as a guest directory.
+///   - `exe`, `map_files/<r>` and non-directory fds pass to the kernel.
+///
+/// Every process is judged under the caller's RootConfig: a guest child
+/// that emulates a chroot of its own (`root_override`) is not represented
+/// (disclosed in docs/design.md). A process that
+/// exits and whose pid is reused between this check and the call is the
+/// time-of-check race every translation has.
+pub(crate) struct GuestProcLinks<'a> {
+    cfg: &'a RootConfig,
+    pid: i32,
+    tid: i32,
+    /// Set when a walk asked this policy handed another process's directory
+    /// link to the kernel.
+    raw: std::cell::Cell<bool>,
+    /// Set when a walk asked this policy continued from another process's
+    /// directory link's verified guest path.
+    spliced: std::cell::Cell<bool>,
+}
+
+impl<'a> GuestProcLinks<'a> {
+    pub(crate) fn new(cfg: &'a RootConfig, pid: i32, tid: i32) -> Self {
+        Self {
+            cfg,
+            pid,
+            tid,
+            raw: std::cell::Cell::new(false),
+            spliced: std::cell::Cell::new(false),
+        }
+    }
+
+    /// How the walks asked this policy went through another process's
+    /// directory link.
+    pub(crate) fn other_link(&self) -> OtherLink {
+        if self.raw.get() {
+            OtherLink::Raw
+        } else if self.spliced.get() {
+            OtherLink::Spliced
+        } else {
+            OtherLink::None
+        }
+    }
+
+    /// Carry an earlier walk's [`Self::other_link`] into this policy's (the
+    /// final chain after the walk to it).
+    pub(crate) fn carry(&self, other: OtherLink) {
+        self.raw.set(self.raw.get() || other == OtherLink::Raw);
+        self.spliced.set(self.spliced.get() || other == OtherLink::Spliced);
+    }
+
+    /// The thread group of host task `pid`, and whether it is a process of
+    /// the guest's own, from one read of its status.
+    /// procfs answers `/proc/<tid>/` for any thread id (hidden from
+    /// readdir), so a pid in a procfs path may name a thread: its status
+    /// `Tgid:` line. An unreadable status (the process is gone, and the
+    /// kernel's answer stands) is `(pid, false)`, unless `pid` is the
+    /// guest's own.
+    fn tgid_and_owned(&self, pid: i32) -> (i32, bool) {
+        if pid == self.pid {
+            return (pid, true);
+        }
+        let Some((tgid, tracer)) = proc_status_ids(pid) else {
+            return (pid, false);
+        };
+        let owned = tgid == self.pid
+            || (tracer != 0
+                && proc_status_ids(tracer)
+                    .is_some_and(|(tracer_tgid, _)| tracer_tgid == std::process::id() as i32));
+        (tgid, owned)
+    }
+
+    /// Whether `pid` is a guest process: its own, or one with a
+    /// shared-record row, looked up by its thread group (a thread's own
+    /// start time would miss the row).
+    fn guest_process(&self, pid: i32) -> bool {
+        let (tgid, owned) = self.tgid_and_owned(pid);
+        owned || has_shared_row(tgid)
+    }
+
+    /// The link and everything after it go to the kernel; the walk records
+    /// that it crossed another process's directory.
+    fn raw_hand_over(&self) -> crate::translate::MagicAction {
+        self.raw.set(true);
+        crate::translate::MagicAction::Raw
+    }
+
+    /// A directory link (`root`, `cwd`, a directory `fd/<n>`) at host path
+    /// `host`, continued past or followed: from its verified guest path,
+    /// else refused for a guest process and the kernel's for any other.
+    fn link_dir(&self, host: &Path, guest: bool) -> crate::translate::MagicAction {
+        use crate::translate::MagicAction;
+        use crate::translate::PathRefusal;
+        // The object itself (the kernel follows the magic link): the kernel
+        // cannot leave a non-directory, so the next component, "..", or a
+        // trailing slash is its ENOTDIR.
+        let md = match std::fs::metadata(host) {
+            Ok(md) if !md.is_dir() => return MagicAction::Raw,
+            Ok(md) => md,
+            Err(_) if guest => return MagicAction::Refuse(PathRefusal::BaseUninspectable),
+            Err(_) => return self.raw_hand_over(),
+        };
+        #[cfg(test)]
+        if LINK_IDENTITY_FAILS.with(|f| f.get()) {
+            return match guest {
+                true => MagicAction::Refuse(PathRefusal::ProcLinkOutsideRoot),
+                false => self.raw_hand_over(),
+            };
+        }
+        match self.verified_reverse(host, &md) {
+            Ok(dir) => {
+                if !guest {
+                    self.spliced.set(true);
+                }
+                MagicAction::Reroot(dir)
+            }
+            Err(kind) if guest => MagicAction::Refuse(kind),
+            Err(_) => self.raw_hand_over(),
+        }
+    }
+
+    /// The guest path of the directory `md` that the magic link at host
+    /// path `host` names, when it has one leading back to it:
+    /// 1. readlink gives an absolute target with no " (deleted)" suffix;
+    /// 2. the target has the link's device and inode (the identity check:
+    ///    the process did not move between the readlink and here; own
+    ///    links have it too);
+    /// 3. [`RootConfig::reverse`] names it;
+    /// 4. that guest name, translated again, reaches the same device and
+    ///    inode (the round trip: a deeper bind can shadow the name).
+    ///
+    /// Otherwise `proc_link_outside_root`, or `base_uninspectable` when
+    /// the link cannot be read.
+    pub(crate) fn verified_reverse(
+        &self,
+        host: &Path,
+        md: &std::fs::Metadata,
+    ) -> Result<PathBuf, crate::translate::PathRefusal> {
+        use crate::translate::PathRefusal;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let target = std::fs::read_link(host);
+        #[cfg(test)]
+        let target = match LINK_TARGET_OVERRIDE.with(|o| o.borrow().clone()) {
+            Some(t) => Ok(t),
+            None => target,
+        };
+        let target = match target {
+            Ok(t) if t.is_absolute() => t,
+            _ => return Err(PathRefusal::BaseUninspectable),
+        };
+        if target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+            return Err(PathRefusal::ProcLinkOutsideRoot);
+        }
+        let same = |p: &Path| {
+            std::fs::metadata(p).is_ok_and(|m| m.dev() == md.dev() && m.ino() == md.ino())
+        };
+        if !same(&target) {
+            return Err(PathRefusal::ProcLinkOutsideRoot);
+        }
+        let dir = self
+            .cfg
+            .reverse(&target)
+            .ok_or(PathRefusal::ProcLinkOutsideRoot)?;
+        if !same(&self.cfg.translate(&dir, Path::new("/"), None)) {
+            return Err(PathRefusal::ProcLinkOutsideRoot);
+        }
+        Ok(dir)
+    }
+}
+
+impl crate::translate::ProcLinks for GuestProcLinks<'_> {
+    fn tool_view(&self, rel: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+        crate::translate::tool_view_for(rel, self.pid, self.tid)
+    }
+
+    fn traverse(
+        &self,
+        link: &crate::translate::MagicLink,
+        host: &Path,
+    ) -> crate::translate::MagicAction {
+        use crate::translate::MagicAction;
+        use crate::translate::MagicKind;
+        let guest = self.guest_process(link.pid);
+        // A missing entry is an ordinary one: the walk's procfs probe
+        // answers the kernel's ENOENT.
+        if std::fs::symlink_metadata(host).is_err() {
+            return MagicAction::Walk;
+        }
+        match link.kind {
+            MagicKind::Root if guest => MagicAction::Reroot(PathBuf::from("/")),
+            MagicKind::Root | MagicKind::Cwd | MagicKind::Fd => self.link_dir(host, guest),
+            MagicKind::Exe | MagicKind::MapFiles => MagicAction::Raw,
+        }
+    }
+
+    fn follow(
+        &self,
+        link: &crate::translate::MagicLink,
+        host: &Path,
+    ) -> crate::translate::MagicAction {
+        use crate::translate::MagicAction;
+        use crate::translate::MagicKind;
+        let guest = self.guest_process(link.pid);
+        match link.kind {
+            MagicKind::Root if guest => MagicAction::Reroot(PathBuf::from("/")),
+            // Another process's directory, followed as the final
+            // component (chdir, open of a directory): its verified guest
+            // path, so a record of where the call landed holds still.
+            MagicKind::Root | MagicKind::Cwd if !guest => self.link_dir(host, false),
+            MagicKind::Fd if !guest && std::fs::metadata(host).is_ok_and(|m| m.is_dir()) => {
+                self.link_dir(host, false)
+            }
+            _ => MagicAction::Raw,
+        }
+    }
+
+    fn raw_crossed(&self) -> bool {
+        self.raw.get()
+    }
+}
+
+/// A host path whose final component is a /proc magic link (or anything
+/// under /proc/self), which a chain with no /proc policy never reads
+/// Tool-side. A chain with one decides from the real procfs instead
+/// ([`crate::translate::proc_entry`]).
+fn host_is_proc_magic(host: &Path) -> bool {
+    let comps: Vec<String> = host
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(v) => Some(v.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if comps.len() >= 3
+        && comps[comps.len() - 3] == "proc"
+        && ["fd", "exe", "root", "cwd", "map_files"].contains(&comps[comps.len() - 1].as_str())
+    {
+        return true;
+    }
+    if comps.len() >= 2 && comps[0] == "proc" {
+        // Any /proc/<x>/fd|exe|... final magic component.
+        let last2 = &comps[comps.len() - 2..];
+        if last2[0] == "fd" || comps[1] == "self" || comps[1] == "thread-self" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Process-global config stash for the ptrace (in-process Tool)
@@ -5630,6 +9606,16 @@ pub fn exec_watch_for_selector(selector: &str) -> Result<bool, String> {
 }
 static UTS_DOMAIN: Mutex<Option<String>> = Mutex::new(None);
 
+/// A process's exec identity before an execve handler writes the
+/// successor's ([`RootfsTool::exec_identity`]).
+struct ExecIdentity {
+    exe_guest: PathBuf,
+    exe_host: bool,
+    argv: Vec<Vec<u8>>,
+    pid_exe: Option<PathBuf>,
+    pid_argv: Option<Vec<Vec<u8>>>,
+}
+
 /// pid -> guest exe path, for /proc/<pid>/exe de-translation of
 /// *other* guest processes (e.g. sh reading /proc/$$/exe from a
 /// child). Populated on every guest execve; ptrace backend hosts
@@ -5656,9 +9642,115 @@ pub fn set_config(cfg: LiterootConfig) {
 }
 
 #[cfg(test)]
+#[path = "rootfs_tool_seams.rs"]
+mod seams;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exec_state::ExecState;
+
+    /// The launcher and the preload compile these wire types from the same
+    /// files: no `#[cfg` inside any of them may give the two builds
+    /// different layouts behind one pasted wire digest (C5d, review).
+    #[test]
+    fn wire_types_have_no_cfg_inside() {
+        let files = [
+            (include_str!("rootfs_tool.rs"), &[
+                "pub struct LiterootConfig {",
+                "pub enum Refusal {",
+                "pub enum Note {",
+                "pub enum Summary {",
+                "pub enum PathAnswer {",
+                "pub enum ForkKind {",
+                "pub enum UnsupportedKind {",
+                "pub enum GuestKind {",
+            ][..]),
+            (include_str!("dead_base.rs"), &["pub enum FlagState {"][..]),
+            (include_str!("translate.rs"), &["pub enum PathRefusal {"][..]),
+        ];
+        for (source, types) in files {
+            for ty in types {
+                let at = source.find(ty).unwrap_or_else(|| panic!("{ty} not found"));
+                let body = &source[at..];
+                let end = body.find("\n}\n").unwrap_or_else(|| panic!("{ty} not closed"));
+                assert!(!body[..end].contains("#[cfg"), "{ty} has a cfg inside");
+            }
+        }
+        assert!(include_str!("rootfs_tool.rs").contains("pub struct Refused(pub Vec<Refusal>);"));
+    }
+
+    /// A successor keeps the S.3 record exec carries (a state test: the
+    /// successor route is not wired).
+    #[test]
+    fn from_exec_state_keeps_the_record() {
+        let cfg = RootConfig::new(PathBuf::from("/"), Vec::new());
+        let state = ExecState {
+            cwd: b"/work".to_vec(),
+            exe_guest: b"/bin/sh".to_vec(),
+            record: crate::exec_state::LifetimeRecord {
+                installs: 2,
+                probes: 5,
+                unseen_best_effort: 1,
+                summary_emitted: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tool = RootfsTool::from_exec_state(state, &cfg).unwrap();
+        let st = tool.state.lock().unwrap();
+        assert_eq!(
+            (st.admission.installs, st.admission.probes, st.admission.unseen_best_effort),
+            (2, 5, 1)
+        );
+        assert!(st.admission.summary_emitted);
+        drop(st);
+        // An emitted record does not emit again in the successor.
+        assert!(tool.take_exit_summaries(1).is_empty());
+    }
+
+    /// A new group's first thread replaces the record whatever its pid,
+    /// even the copied owner's (pid 1 of a new pid namespace).
+    #[test]
+    fn new_group_with_the_same_visible_pid_resets() {
+        let tool = RootfsTool::default();
+        let mut st = tool.state.lock().unwrap();
+        let a = st.admission(1);
+        let _probe = a.admit(1).unwrap();
+        a.probes = 4;
+        a.kernel_id = Some(9);
+        assert!(a.begin_emission());
+        st.start_new_group(1, crate::dead_base::NewGroup { flag: true, filter_addend: 1 });
+        let a = st.admission(1);
+        assert!(a.guest_filter && a.flag == crate::dead_base::FlagState::Inherited);
+        assert_eq!((a.probes, a.probes_in_flight(), a.kernel_id), (0, 0, None));
+        assert!(!a.summary_emitted && !a.first_check_done);
+        assert_eq!(a.filter_addend, 1, "the child's expected count is its parent's");
+    }
+
+    /// The in-guest reporter takes the exit summaries before the inner
+    /// on_exit_process runs, in one report; the inner one writes them only
+    /// where the side log is open (never in a guest process).
+    #[test]
+    fn one_emitter_and_one_message_per_process() {
+        let reporting = include_str!("../preload/src/reporting.rs");
+        let exit = reporting
+            .split("async fn on_exit_process")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("reporter on_exit_process");
+        assert_eq!(exit.matches("report(").count(), 1, "{exit}");
+        let take = exit.find("take_exit_summaries").expect("takes the summaries");
+        assert!(take < exit.find("report(").unwrap() && take < exit.find(".on_exit_process(").unwrap());
+        let source = include_str!("rootfs_tool.rs");
+        let inner = source
+            .split("    async fn on_exit_process<G: GlobalRPC<LiterootGlobal>>(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("inner on_exit_process");
+        let gate = inner.find("if crate::refusal_log::is_open() {").expect("log gate");
+        assert!(gate < inner.find("take_exit_summaries").unwrap());
+    }
 
     /// B4-1 wiring witness without any successor transport: a Tool
     /// rebuilt from a snapshot observes the predecessor's cwd, fd
@@ -5685,7 +9777,8 @@ mod tests {
         assert_eq!(st.fake, Some([1000, 0, 0, 100, 0, 100]));
         assert_eq!(st.exe_guest, PathBuf::from("/bin/sh"));
         assert!(st.bootstrapped);
-        assert_eq!(st.scratch, None);
+        assert!(st.free_scratch.is_empty());
+        assert_ne!(st.scratch_image, 0, "a number drawn from the counter");
     }
 
     #[test]
@@ -5722,6 +9815,84 @@ mod tests {
         assert_eq!(child.pending, None);
         let root = tool.init_thread_state(reverie::Tid::from_raw(4242), None);
         assert_eq!(root.pending, None);
+    }
+
+    /// A new thread group's first thread takes the S.3 flag its parent's
+    /// clone staged; a thread of the same group takes none.
+    #[test]
+    fn init_thread_state_carries_the_new_group_flag() {
+        let tool = RootfsTool::default();
+        for flag in [false, true] {
+            let group = crate::dead_base::NewGroup { flag, filter_addend: 2 };
+            let parent = RootfsThreadState {
+                child_group: Some(group),
+                ..Default::default()
+            };
+            let child = tool.init_thread_state(
+                reverie::Tid::from_raw(4243),
+                Some((reverie::Tid::from_raw(4242), &parent)),
+            );
+            assert_eq!((child.new_group, child.child_group), (Some(group), None));
+        }
+        let child = tool.init_thread_state(
+            reverie::Tid::from_raw(4243),
+            Some((reverie::Tid::from_raw(4242), &RootfsThreadState::default())),
+        );
+        assert_eq!(child.new_group, None);
+    }
+
+    /// Only an in-guest process child that shares the address space trips
+    /// the shared-record check.
+    #[test]
+    fn shares_record_in_guest_only_for_vm_sharing_process_children() {
+        let vm = libc::CLONE_VM as u64;
+        let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as u64;
+        let vfork = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as u64;
+        assert!(shares_record_in_guest(true, vm));
+        assert!(shares_record_in_guest(true, vfork));
+        assert!(!shares_record_in_guest(true, libc::SIGCHLD as u64));
+        assert!(!shares_record_in_guest(true, thread));
+        assert!(!shares_record_in_guest(false, vfork));
+    }
+
+    /// The exit summaries: none when nothing is due, the due kinds once,
+    /// then nothing (exactly one emission per process).
+    #[test]
+    fn exit_summaries_are_emitted_once_and_only_when_due() {
+        let tool = RootfsTool::default();
+        assert!(tool.take_exit_summaries(77).is_empty());
+        {
+            let mut st = tool.state.lock().unwrap();
+            let a = st.admission(77);
+            let t = a.begin_install().unwrap();
+            a.finish_install(t, Some(0));
+            a.probes = 3;
+            a.refused = 1;
+        }
+        let first = tool.take_exit_summaries(77);
+        assert_eq!(
+            first,
+            vec![
+                Refusal::Summary(Summary::Seccomp {
+                    pid: 77,
+                    kernel_id: 0,
+                    flag: crate::dead_base::FlagState::Installed,
+                    installs: 1,
+                    installs_refused: 0,
+                    translated: 0,
+                    refused: 1,
+                    unseen_best_effort: 0,
+                }),
+                Refusal::Summary(Summary::Probe {
+                    pid: 77,
+                    kernel_id: 0,
+                    probes: 3,
+                    sud_refused: 0,
+                    sud_fallback: 0,
+                }),
+            ]
+        );
+        assert!(tool.take_exit_summaries(77).is_empty());
     }
 
     /// A new task takes the fd table its parent's clone handler staged, and
@@ -6042,6 +10213,207 @@ mod tests {
         // the staged snapshot on return, so staging is safe.
         assert!(clone_is_process(0));
     }
+
+    /// A relative final link with no guest route is refused by name
+    /// (no_guest_route), counted as one link and never joined on the host
+    /// side, where its ".." would leave the guest root; with a guest route
+    /// it resolves from the route's parent, and an absolute target needs no
+    /// route.
+    #[test]
+    fn chain_with_no_guest_route_refuses_a_relative_target() {
+        use crate::translate::PathRefusal;
+        use crate::translate::WalkError;
+        let p = std::env::temp_dir().join(format!("literoot-no-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        let root = p.join("root");
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::create_dir_all(p.join("outside")).unwrap();
+        std::fs::write(root.join("outside/file"), b"GUEST").unwrap();
+        std::fs::write(p.join("outside/file"), b"HOST-SIDE-MARKER").unwrap();
+        std::os::unix::fs::symlink("../outside/file", root.join("rl")).unwrap();
+        std::os::unix::fs::symlink("/outside/file", root.join("al")).unwrap();
+        let cfg = RootConfig::new(root.clone(), Vec::new());
+        let inside = Ok((
+            root.join("outside/file"),
+            Some(PathBuf::from("/outside/file")),
+        ));
+        let mut links = 0;
+        let r = resolve_symlink_chain_guest(&cfg, None, root.join("rl"), &mut links, None);
+        assert_eq!(
+            r,
+            Err(WalkError::Refused(PathRefusal::NoGuestRoute)),
+            "no route: refused"
+        );
+        assert_eq!(links, 1, "the refused link counts");
+        let mut links = 0;
+        let route = Some(PathBuf::from("/rl"));
+        let r = resolve_symlink_chain_guest(&cfg, route, root.join("rl"), &mut links, None);
+        assert_eq!(r, inside, "from the route's parent");
+        let mut links = 0;
+        let r = resolve_symlink_chain_guest(&cfg, None, root.join("al"), &mut links, None);
+        assert_eq!(r, inside, "an absolute target needs no route");
+        std::fs::remove_dir_all(&p).unwrap();
+    }
+
+    /// The decide step never hands a base it could not inspect to the
+    /// kernel: a stat error other than "absent", a readlink error and
+    /// non-absolute /proc text are base_uninspectable; a text that does not
+    /// lead back to the base is base_moved; a deleted base (nlink 0) is used
+    /// only through a guest name that reaches it, else base_outside_root.
+    /// None of them is Raw.
+    #[test]
+    fn decide_refuses_every_uninspectable_base() {
+        use crate::translate::PathRefusal;
+        let p = std::env::temp_dir().join(format!("literoot-decide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        let dir = p.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(p.join("file"), b"f").unwrap();
+        let cfg = RootConfig::new(p.clone(), Vec::new());
+        let elsewhere = RootConfig::new(p.join("elsewhere"), Vec::new());
+        let uninspectable = UnnamedRoute::Refused(PathRefusal::BaseUninspectable);
+        // ENOTDIR below a regular file: not "absent", for root as for others.
+        let base = p.join("file/x");
+        let base = base.to_str().unwrap();
+        let climb = gather_climb(base, Path::new("../y"));
+        assert!(matches!(climb, Climb::Uninspectable), "gather: {climb:?}");
+        assert_eq!(
+            unnamed_route(&cfg, base, Path::new("../y")),
+            uninspectable,
+            "the route"
+        );
+        let r = decide(
+            Climb::Uninspectable,
+            Path::new("../y"),
+            Ok(PathBuf::new()),
+            |_, _| None,
+            &cfg,
+        );
+        assert_eq!(r, uninspectable, "decide");
+        let md = || std::fs::metadata(&dir).unwrap();
+        let live = || Climb::Live {
+            md: md(),
+            ups: 0,
+            rest: PathBuf::from("y"),
+        };
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        let r = decide(live(), Path::new("y"), Err(eacces), gather_text_stat, &cfg);
+        assert_eq!(r, uninspectable, "a readlink error");
+        let relative = Ok(PathBuf::from("dir"));
+        let r = decide(live(), Path::new("y"), relative, gather_text_stat, &cfg);
+        assert_eq!(r, uninspectable, "non-absolute text");
+        let r = decide(
+            live(),
+            Path::new("y"),
+            Ok(dir.clone()),
+            |t, _| {
+                Some((
+                    t.to_path_buf(),
+                    Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                ))
+            },
+            &cfg,
+        );
+        assert_eq!(
+            r,
+            UnnamedRoute::Refused(PathRefusal::BaseMoved),
+            "a stat error of the text"
+        );
+        let dead = || Climb::Dead {
+            md: md(),
+            ups: 0,
+            name_next: true,
+        };
+        let r = decide(
+            dead(),
+            Path::new("x"),
+            Ok(dir.clone()),
+            gather_text_stat,
+            &cfg,
+        );
+        let guest = UnnamedRoute::Guest {
+            dir: PathBuf::from("/dir"),
+            rest: PathBuf::from("x"),
+            climbed: false,
+        };
+        assert_eq!(
+            r, guest,
+            "a deleted base through a guest name that reaches it"
+        );
+        let r = decide(
+            dead(),
+            Path::new("x"),
+            Ok(dir.clone()),
+            gather_text_stat,
+            &elsewhere,
+        );
+        assert_eq!(
+            r,
+            UnnamedRoute::Refused(PathRefusal::BaseOutsideRoot),
+            "no guest name"
+        );
+        std::fs::remove_dir_all(&p).unwrap();
+    }
+
+    /// The Tool's own reads of a /proc path name the calling thread's entry:
+    /// /proc/thread-self is the caller's task directory and /proc/self its
+    /// process. Every caller passes the guest's own tid: the readlink
+    /// re-read (readlinkat, and readlink on x86_64) and both execve image
+    /// reads (the shebang check and the PT_INTERP check). A textual guard
+    /// beside the behavioural twins (the readlink unit, and
+    /// seams::own_views::execve_through_thread_self_reads_the_callers_image
+    /// for the execve reads): the callers are pinned in their source.
+    #[test]
+    fn tool_reads_name_the_calling_thread() {
+        for (host, want) in [
+            ("/proc/thread-self/fd/3", "/proc/10/task/11/fd/3"),
+            ("/proc/self/cwd/x", "/proc/10/cwd/x"),
+            ("/proc/thread-self", "/proc/10/task/11"),
+            ("/proc/self", "/proc/10"),
+            ("/r/x", "/r/x"),
+        ] {
+            assert_eq!(
+                host_for_tool_read(Path::new(host), 10, 11),
+                PathBuf::from(want),
+                "{host}"
+            );
+        }
+        let code = crate::test_source::without_test_items(include_str!("rootfs_tool.rs"));
+        let open = "host_for_tool_read(";
+        let calls: Vec<String> = code
+            .match_indices(open)
+            .map(|(i, _)| {
+                let rest = &code[i + open.len()..];
+                let mut depth = 1;
+                let end = rest
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        depth += match c {
+                            '(' => 1,
+                            ')' => -1,
+                            _ => 0,
+                        };
+                        depth == 0
+                    })
+                    .map(|(j, _)| j)
+                    .unwrap();
+                rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "&host, guest.pid().as_raw(), guest.tid().as_raw()",
+                "link_host, pid, tid",
+                "host: &Path, guest_pid: i32, guest_tid: i32",
+            ],
+            "every caller passes the guest's own tid"
+        );
+        let ids = "let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());";
+        assert!(code.contains(ids), "the readlink caller's ids");
+        let reads = code.matches("std::fs::read(&image)").count();
+        assert_eq!(reads, 2, "both execve image reads use the thread's path");
+    }
 }
 
 #[cfg(test)]
@@ -6100,3 +10472,250 @@ mod exec_watch_gate_tests {
     }
 }
 
+
+/// The selected final entry is judged from its host path.
+#[cfg(test)]
+mod final_proc_tests {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    use super::FinalProc;
+    use super::GuestProcLinks;
+    use super::final_proc_entry;
+    use crate::translate::MagicKind;
+    use crate::translate::RootConfig;
+
+    fn me() -> (i32, i32) {
+        let pid = std::process::id() as i32;
+        (pid, unsafe { libc::gettid() })
+    }
+
+    fn entry(host: &str) -> FinalProc {
+        let cfg = RootConfig::new(PathBuf::from("/"), Vec::new());
+        let (pid, tid) = me();
+        final_proc_entry(Path::new(host), &GuestProcLinks::new(&cfg, pid, tid))
+    }
+
+    /// A scratch directory of this test process, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("literoot-final-proc-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_magic_links_and_cmdline_are_owned() {
+        let (pid, tid) = me();
+        for (host, kind) in [
+            (format!("/proc/{pid}/exe"), MagicKind::Exe),
+            (format!("/proc/{pid}/root"), MagicKind::Root),
+            (format!("/proc/{pid}/cwd"), MagicKind::Cwd),
+            (format!("/proc/{pid}/task/{tid}/cwd"), MagicKind::Cwd),
+            ("/proc/self/exe".to_owned(), MagicKind::Exe),
+            ("/proc/thread-self/root".to_owned(), MagicKind::Root),
+            (format!("/proc/{pid}/fd/0"), MagicKind::Fd),
+        ] {
+            match entry(&host) {
+                FinalProc::OwnedLink(link) => {
+                    assert_eq!((link.pid, link.kind), (pid, kind), "{host}");
+                }
+                other => panic!("{host}: {other:?}"),
+            }
+        }
+        assert_eq!(entry(&format!("/proc/{pid}/cmdline")), FinalProc::OwnedCmdline(pid));
+        assert_eq!(entry("/proc/self/cmdline"), FinalProc::OwnedCmdline(pid));
+        // A thread's cmdline is its process's.
+        assert_eq!(entry(&format!("/proc/{pid}/task/{tid}/cmdline")), FinalProc::OwnedCmdline(pid));
+        assert_eq!(entry("/proc/thread-self/cmdline"), FinalProc::OwnedCmdline(pid));
+        assert_eq!(entry(&format!("/proc/self/task/{tid}/cmdline")), FinalProc::OwnedCmdline(pid));
+        // A thread id names its thread group: the
+        // test thread is not the process's leader.
+        assert_ne!(tid, pid, "the unit needs a non-leader thread");
+        assert_eq!(entry(&format!("/proc/{tid}/cmdline")), FinalProc::OwnedCmdline(pid));
+        assert_eq!(entry(&format!("/proc/{tid}/task/{tid}/cmdline")), FinalProc::OwnedCmdline(pid));
+        for host in [format!("/proc/{tid}/exe"), format!("/proc/{tid}/task/{tid}/exe")] {
+            match entry(&host) {
+                FinalProc::OwnedLink(link) => assert_eq!((link.pid, link.kind), (pid, MagicKind::Exe), "{host}"),
+                other => panic!("{host}: {other:?}"),
+            }
+        }
+        // Every other per-process file of the caller's is the kernel's.
+        for file in ["environ", "maps", "smaps", "numa_maps", "mem"] {
+            for host in [
+                format!("/proc/{pid}/{file}"),
+                format!("/proc/{pid}/task/{tid}/{file}"),
+                format!("/proc/self/{file}"),
+                format!("/proc/thread-self/{file}"),
+            ] {
+                assert_eq!(entry(&host), FinalProc::Ordinary, "{host}");
+            }
+        }
+    }
+
+    /// Another process's links and files (pid 1 is never this test's, and
+    /// has no shared-record row): the kernel's, whatever the spelling, task
+    /// paths included (owner directive 2026-11-14).
+    #[test]
+    fn another_process_is_the_kernels() {
+        for host in [
+            "/proc/1/exe",
+            "/proc/1/root",
+            "/proc/1/cwd",
+            "/proc/1/cmdline",
+            "/proc/1/task/1/cwd",
+            "/proc/1/task/1/exe",
+            "/proc/1/task/1/root",
+            "/proc/1/task/1/cmdline",
+            "/proc/1/environ",
+            "/proc/1/maps",
+            "/proc/1/smaps",
+            "/proc/1/task/1/environ",
+            "/proc/1/numa_maps",
+            "/proc/1/mem",
+        ] {
+            assert_eq!(entry(host), FinalProc::Ordinary, "{host}");
+        }
+    }
+
+    /// Anything else is ordinary: other procfs files, and a file or a
+    /// dangling symlink that only carries a magic link's name.
+    #[test]
+    fn ordinary_entries_and_lookalikes_are_ordinary() {
+        let (pid, _) = me();
+        assert_eq!(entry(&format!("/proc/{pid}/status")), FinalProc::Ordinary);
+        assert_eq!(entry("/proc/1/status"), FinalProc::Ordinary);
+        let dir = scratch("lookalike");
+        let file = dir.join("exe");
+        std::fs::write(&file, b"x").unwrap();
+        let dangling = dir.join("root");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(dir.join("missing"), &dangling).unwrap();
+        let cmdline = dir.join("cmdline");
+        std::fs::write(&cmdline, b"x").unwrap();
+        for p in [&file, &dangling, &cmdline] {
+            assert_eq!(entry(p.to_str().unwrap()), FinalProc::Ordinary, "{p:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthesize-if-absent needs a positive ENOENT for the parent; any
+    /// other inspection error is the walk's own answer.
+    #[test]
+    fn synthesis_needs_a_missing_proc_directory() {
+        let dir = scratch("absent");
+        assert_eq!(super::proc_parent_absent(&dir.join("proc/self/exe")), Ok(true));
+        std::fs::create_dir_all(dir.join("proc/self")).unwrap();
+        assert_eq!(super::proc_parent_absent(&dir.join("proc/self/exe")), Ok(false));
+        assert_eq!(super::proc_parent_absent(&dir.join("proc/1/cmdline")), Ok(true));
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt as _;
+            let locked = dir.join("proc");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(
+                super::proc_parent_absent(&dir.join("proc/self/exe")),
+                Err(reverie::syscalls::Errno::EACCES)
+            );
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spelled_self_links() {
+        assert!(super::spells_proc_self_link(Path::new("/proc/self/exe")));
+        assert!(super::spells_proc_self_link(Path::new("/proc/1/../self/root")));
+        assert!(super::spells_proc_self_link(Path::new("/proc/7/cmdline")));
+        assert!(!super::spells_proc_self_link(Path::new("/proc/self/cwd")));
+        assert!(!super::spells_proc_self_link(Path::new("/proc/self/exe/x")));
+        assert_eq!(super::spelled_cmdline_pid(Path::new("/proc/self/cmdline"), 42), Some(42));
+        assert_eq!(super::spelled_cmdline_pid(Path::new("/proc/7/cmdline"), 42), Some(7));
+        assert_eq!(super::spelled_cmdline_pid(Path::new("/proc/x/cmdline"), 42), None);
+        assert!(super::final_name_may_be_proc(Path::new("/a/fd/3")));
+        assert!(super::final_name_may_be_proc(Path::new("/a/map_files/1-2")));
+        assert!(!super::final_name_may_be_proc(Path::new("/a/status")));
+        assert!(!super::final_name_may_be_proc(Path::new("/a/stat")));
+        for name in ["environ", "maps", "smaps", "numa_maps", "mem"] {
+            assert!(!super::final_name_may_be_proc(&Path::new("/a").join(name)), "{name}");
+        }
+    }
+
+    /// The readlink arms decide by the final entry BEFORE the injection
+    /// (E2: a shared row's exe answers from the row), and every open arm (openat, openat2, legacy open) and execve
+    /// go through the final-entry route (O'').
+    #[test]
+    fn handlers_decide_by_the_final_entry_first() {
+        let source = include_str!("rootfs_tool.rs");
+        // Each arm's body ends at its rustfmt closing line (the arm's indent).
+        let arm_body = |arm: &str| {
+            let at = source.find(arm).expect(arm);
+            let body = &source[at..];
+            &body[..body.find("\n            }\n").expect("the arm's end")]
+        };
+        for arm in ["Syscall::Readlinkat(link) => {", "Syscall::Readlink(link) => {"] {
+            let body = arm_body(arm);
+            let gate = body.find("self.final_proc(guest,").expect("the gate");
+            let inject = body.find("guest.inject(rewritten)").expect("the injection");
+            assert!(gate < inject, "{arm}: the gate runs before the injection");
+        }
+        let mut routed = vec![
+            "Syscall::Openat(openat) => {",
+            "Syscall::Openat2(oa) => {",
+            "Syscall::Execve(execve) => {",
+        ];
+        if cfg!(target_arch = "x86_64") {
+            routed.push("Syscall::Open(open) => {");
+        }
+        for arm in routed {
+            let body = arm_body(arm);
+            let route = body.find("self.self_link_route(guest,").expect("the route");
+            let inject = body.find("guest.inject(rewritten)").expect("the injection");
+            assert!(route < inject, "{arm}: the route runs before the translated injection");
+        }
+        assert!(!source.contains(&["fn proc_pid", "_exe("].concat()), "spelled-pid synthesis is gone");
+    }
+
+    /// S.3 placement: in both dead-base
+    /// routes a non-counting gate runs once the base is known to be unnamed
+    /// and before C.1's reads and gather_* (`unnamed_route`); the counting
+    /// gate runs only after the gather has shown a dead-base route.
+    #[test]
+    fn dead_base_gate_comes_first() {
+        let source = include_str!("rootfs_tool.rs");
+        for f in ["async fn dead_base_gate<", "async fn dead_base_socket<"] {
+            let at = source.find(f).expect(f);
+            let rest = &source[at + f.len()..];
+            let end = ["\n    async fn ", "\n    fn "]
+                .iter()
+                .filter_map(|next| rest.find(next))
+                .min()
+                .expect("the next fn");
+            let body = &rest[..end];
+            let base = body.find("self.unnamed_base_of(").expect("the base");
+            let gate = body.find("self.gate_closed_quiet(guest)").expect("the quiet gate");
+            let gather = body.find("unnamed_route(&cfg").expect("the gather");
+            let counted = body.find("if self.admission_closed(guest) {").expect("the counted gate");
+            assert!(base < gate && gate < gather, "{f}: base, then the quiet gate, then gather");
+            assert!(gather < counted, "{f}: probes are counted only once a dead-base route is known");
+            assert_eq!(body.matches("self.gate_closed_quiet(guest)").count(), 1, "{f}");
+            assert_eq!(body.matches("self.admission_closed(guest)").count(), 1, "{f}");
+        }
+    }
+
+    /// In the socket route the descriptor re-read
+    /// comes after the probe and before `classify`, once, with no other
+    /// use of the result between them.
+    #[test]
+    fn socket_reread_precedes_classify() {
+        let source = include_str!("rootfs_tool.rs");
+        let f = "async fn dead_base_socket<";
+        let at = source.find(f).expect(f);
+        let rest = &source[at + f.len()..];
+        let body = &rest[..rest.find("\n    fn ").expect("the next fn")];
+        let probe = body.find("self.admitted_inject(guest, probe).await").expect("the probe");
+        let reread = body.find("socket_unchanged(").expect("the re-read");
+        let classify = body.find("crate::dead_base::classify(").expect("the classification");
+        assert!(probe < reread && reread < classify, "probe, re-read, classify");
+        assert_eq!(body.matches("socket_unchanged(").count(), 1);
+        assert_eq!(body.matches("crate::dead_base::classify(").count(), 1);
+    }
+}

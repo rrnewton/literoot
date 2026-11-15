@@ -53,15 +53,18 @@ pub const MAX_FILE: u64 = 64 * 1024 * 1024;
 pub const LAYOUT: &[u8] = b"LAYOUT_V1";
 /// The fixed file set, the same on both sides regardless of features,
 /// relative to the package root.
-pub const STAMP_FILES: [&str; 9] = [
+pub const STAMP_FILES: [&str; 12] = [
     "src/arch.rs",
+    "src/dead_base.rs",
     "src/exec_state.rs",
     "src/fake_creds.rs",
     "src/initial_packet.rs",
     "src/refusal_log.rs",
     "src/rootfs_tool.rs",
     "src/shared_record.rs",
+    "src/test_source.rs",
     "src/translate.rs",
+    "src/wire_id.rs",
     "preload/src/lib.rs",
 ];
 /// The Reverie crates whose pinned revision enters the stamp.

@@ -5,8 +5,8 @@ Linux root filesystem without privileges, user namespaces, or setuid helpers.
 
 classic proot uses `ptrace` and pays a tracer stop for every path-taking
 syscall. literoot instead runs its path-translation logic *inside* the guest
-(Reverie + liteinst in-guest interception with a seccomp/Syscall User Dispatch
-safety net for unpatched call sites), so non-path syscalls run natively and
+(Reverie + liteinst in-guest interception with a seccomp RET_TRAP safety net
+for unpatched call sites), so non-path syscalls run natively and
 path syscalls cost a local rewrite instead of two context switches.
 
 **Status: early development (0.0.1). Not yet usable.** This release reserves
@@ -14,10 +14,22 @@ the name and tracks the design. Milestones: M1 x86-64 Linux correctness with a
 differential oracle against real proot; M2 aarch64 Linux; M3 aarch64 Android
 app sandbox (seccomp-constrained, no user namespaces).
 
-Known issue: in non-fake-root mode the rootfs is not an isolation boundary.
-Some path system calls can reach host files that the invoking user can already
-access. Do not rely on literoot to confine untrusted programs. A fix is in
-progress.
+literoot is not a security boundary; it assumes non-hostile programs.
+In-guest backends refuse syscall user dispatch; use the ptrace backend for
+programs that need it.
+A process's own /proc command line and executable (and, on the in-guest
+backends, those of a guest child literoot records) show the guest's values,
+except that on the in-guest backends a process with a seccomp filter (and
+every descendant of it) or a thread with syscall user dispatch on sees the
+argv literoot exec'd (the rootfs interpreter first) as its command line.
+Guest children are guest processes: their /proc root, cwd and directory
+descriptors read and continue as the guest's. Every other /proc entry is the
+kernel's, so a process's own environ and maps show host values; another
+(host) process's entries are the kernel's, except that a name continued past
+its root, cwd or directory descriptor continues from that directory's guest
+path when it has one.
+Every named refusal and known difference from Linux is listed in
+[docs/design.md §4.9](docs/design.md#49-named-path-refusals-and-known-differences-from-linux).
 
 Install with `cargo install --path <checkout>` or `cargo install --git <repo>`.
 The build also builds literoot's in-guest preload and embeds it in the

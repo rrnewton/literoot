@@ -301,6 +301,467 @@ explicit `--backend ptrace` mode's job, §3.1).
   handler (**Verified-current**), and literoot inherits that refusal
   by name.
 
+### 4.9 Named path refusals and known differences from Linux
+
+literoot answers a path call natively whenever it can. When it cannot give the native answer with confidence, it
+refuses the call by name. It returns an errno and writes one side-log line, so a refused call is never silent. This
+section lists every such refusal and every known difference from Linux. A process's side log lists what it hit.
+
+#### 4.9.1 Path refusal kinds
+
+Each `refused path` refusal returns EACCES and writes `literoot: refused path <kind>`. One kind of the same wire
+family, `synthetic_file_unavailable`, is not a refusal: the call is answered by the kernel's own file, and its line is
+`literoot: answered path synthetic_file_unavailable` (the line text is not part of the wire identity, §4.9.6).
+
+| Kind | Trigger | literoot | Native | Why |
+| --- | --- | --- | --- | --- |
+| `base_uninspectable` | literoot could not inspect the base: a stat or readlink error, or non-absolute /proc text (the decide unit `tests::decide_refuses_every_uninspectable_base`), or the Tool's climb in cred-ns-dotdot (a real binary) | EACCES | depends on the input. For cred-ns-dotdot, ENOENT. | without the base's identity no guest name can be checked. cred-ns-dotdot fails closed by ruling 4, a known difference. |
+| `base_outside_root` | a live base directory with no guest name | EACCES | the lookup's answer | the base is outside every guest route |
+| `proc_link_outside_root` | the guest's own cwd or `fd/<n>` is a directory outside the guest root, so the reverse mapping gives none. A dead or unnamed directory gives this kind too. | EACCES | the host path's answer | the host path must not reach the guest. A held non-directory behind `fd/<n>` is not refused: it goes to the kernel untranslated and gets the native ENOTDIR. |
+| `proc_link_other_process` | never written. Another process's procfs entries (its magic links, cmdline, environ, maps and the rest) are the kernel's, as under proot (§4.9.8), per the owner directive of 2026-11-14; earlier drafts of this change refused them. The kind keeps its wire tag, unused. | — | — | literoot assumes non-hostile programs |
+| `base_moved` | the base's /proc name does not lead back to it (moved, or held in another mount namespace), or the base changed during the search check | EACCES | the lookup's answer | the dev+ino check failed, so the name is not proven |
+| `no_guest_route` | the final follow reached a relative link with no guest route | EACCES | the link's resolution | no guest-side name exists for the result |
+| `probe_unsupported` | triggers 1-6 below | EACCES, nothing injected | the call's own answer | literoot has no trustworthy probe for this call |
+| `synthetic_file_unavailable` (answered, not refused) | a cmdline literoot answers itself (its own process's, or a shared-record row's, §4.9.5) cannot be made. In-guest: the probe gate is closed (a guest filter installed or being installed in the process, which its children inherit, a flagged record, or the thread's dispatch ON or unreadable), memfd_create fails or admission refuses it, the Tool-side write fails or the calling thread's descriptor is not the empty memfd (the memfd is closed first), or openat2's argument probe proves nothing. On ptrace: the tracer itself is not dumpable, the guest left the tracer's mount namespace, the tracer's argument check gives any answer but EBADF, EINVAL, E2BIG or EAGAIN, the tracer's memfd cannot be made, or the guest's rewritten call fails with anything but EMFILE, ENFILE, ENOMEM or a restart code, or opens another object | the kernel's own cmdline file, which on every backend holds the argv literoot exec'd: `[rootfs interpreter, program, args…]` for a dynamically linked program or a script | the process's command line | nothing is refused: the guest gets the kernel's file, and the line says the synthesized answer was unavailable |
+
+`probe_unsupported` triggers:
+1. **setxattr or lsetxattr with a dead name, or a failed search check, in a dead base.** literoot's syscall table
+   (Reverie's syscalls 0.6.18, last number 461) cannot name setxattrat. So the call is refused on every kernel,
+   6.13 and later included, where setxattrat exists. It is refused by name, before argument validation. Native
+   answers the argument errors first (EINVAL, ERANGE, E2BIG, EFAULT), then ENOENT or EACCES. A ".." climb that lands
+   on a live directory is translated normally (fix 3's route).
+2. **An untrusted probe result.** A probe or the search check returned ENOSYS, EPERM, a success (nothing is closed),
+   or anything outside its expected set. EINTR and the ERESTART* codes are outside every expected set, and there is
+   never a second injection.
+3. **A guest seccomp filter.** The process installed or inherited a guest seccomp filter during the run, or an install
+   is in flight (§4.9.4). This trigger is best-effort (§4.9.4, detector).
+4. **A socket not positively identified as AF_UNIX** in the guest's current network namespace, given a relative AF_UNIX
+   path in a dead cwd. That is a non-AF_UNIX socket, or an AF_UNIX socket from another network namespace. Natively the
+   first kind answers a family errno (for example EINVAL or EAFNOSUPPORT); the second would have been answered by a
+   path lookup. Both are refused by name. Natively an unbound UDP socket is autobound before the error for
+   addrlen >= 16 (IPv4) or >= 24 (IPv6) (MEASURED, M9). For shorter lengths it is autobound only when no cgroup on the
+   host has a connect4/6 BPF program attached (SOURCE-ONLY, INFERRED; not observable here). literoot never autobinds
+   it. Reproducing each family's exact native errno is a follow-up, not part of fix 4.
+5. **The descriptor changed** between the Tool's domain read and the probe.
+6. **Syscall user dispatch ON.** A path call that needs a literoot probe, made on a thread with syscall user dispatch on
+   (any mode but OFF), is refused with nothing injected. Native would answer it. On ptrace the mode is read from the
+   kernel (PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG, Linux v6.4 or later). If that read fails with EIO, EINVAL or ENOSYS,
+   tracking of the thread's own prctl calls is used instead, with the once-per-run line
+   `literoot: sud config read unavailable errno=<e>`. Any other error fails closed. On trap and liteinst the mode always
+   comes from tracking. Tracking counts only an exact 0 as success. Under §4.9.5 the in-guest ordinary route can reach
+   only OFF, so in-guest this trigger is pinned by a unit only. Counted: `sud_refused` out of `probes`.
+
+The same line is also written, outside the numbered triggers, for:
+- a Tool-side fdinfo or fd read error other than ENOENT;
+- an unreadable /proc status at a probe;
+- a filter-count deficit or an unreadable count (§4.9.4, detector).
+
+#### 4.9.2 Answers recorded for a dead base, and launcher tokens
+
+- `literoot: answered path dead_base_name` and `literoot: answered path dead_base_search` record NATIVE answers, not
+  refusals. They are listed here so a reader knows the records exist. For example, the 0600 dead base reached with
+  "../x" gets the native EACCES and is recorded as `dead_base_search`. The order is the argument probe, then EACCES
+  (search check), then EISDIR, then ENOENT, as natively.
+- `literoot: refused launcher interp_not_guest`: on the walked-loader route, where the preload cannot arm, the in-guest
+  launch is refused by name.
+- In-guest exec and threads (stage 1b) are refused by name (EOPNOTSUPP); they work in ptrace mode only.
+- https://github.com/rrnewton/literoot/issues/4: fix 4 closes the WALK part (a planted rootfs `proc/<x>` link). A
+  rootfs `/proc` that is itself a symlink is an ordinary guest symlink: without `-b /proc` it resolves inside the guest
+  root (an absolute `/proc` target loops to ELOOP, as natively in a chroot), and with `-b /proc` the bind is terminal
+  and the rootfs entry is not read. No procfs check runs at startup. The rest of the issue stays open there.
+- Evidence label, not a difference: the execve RLIMIT_NPROC EAGAIN cell is "source equivalence, not measured" (the same
+  kernel function with the same task state; the state cannot be produced unprivileged).
+
+#### 4.9.3 Limits of the probes
+
+- **Hook arguments.** Pre-lookup security hooks (LSM socket/inode hooks, BPF cgroup sock_addr programs) see the PROBE's
+  arguments ("x" with dirfd -1, or sun_path "/"; T3 bind's "/" with addrlen 4 and T4's 2-byte address), not the
+  guest's. Under any LSM or cgroup BPF hook, no probe can create, connect, write or exec.
+- **Two "not proven" cells:** connect-EINVAL (an LSM that denies with EINVAL itself) and bind-EADDRINUSE (an LSM that
+  denies with EADDRINUSE itself). Any other probe result is outside the expected set (trigger 2).
+- **Connect differences.** (a) The UNIX_CONNECT BPF hook does not run: natively it sees "x" and could rewrite it to a
+  live listener. literoot's T4 fails before the hook, so the answer is ENOENT or EACCES and nothing connects.
+  (b) Stream/seqpacket connect's new-socket allocation (unix_create1, sock_wmalloc) is not reproduced: natively ENFILE
+  or ENOMEM is possible before the lookup, never under literoot. (c) A PASSCRED/PASSPIDFD socket is not autobound by a
+  failed dead-base connect: natively it is autobound (M7: length 8), while under literoot its length stays 2. literoot
+  does less than native, never more. If a reproduced autobind is ever added, it goes through security_socket_bind.
+- **O_PATH fds** given to bind or connect: EBADF, as natively (read from fdinfo flags).
+- **fd-reuse windows.** These are bounded limits, not native parity. The domain read's A→B→A swap and the base
+  re-read's A→B→A sit beside fix 3's closed-fd window and the fd-number reuse window on `/proc/self/fd/<n>/…`. A
+  transient fd change gives the conservative refusal (trigger 5). In the undetectable A→B→A case it gives an errno from
+  another object. In the domain-read window, T4 on a swapped-in socket never does more than the native call racing the
+  same swap.
+- **An untrusted probe success never closes anything.** If the kernel ever really allocated an fd (impossible by the
+  source), the cost is one leaked fd, never a closed guest fd. openat2's argument probe (its open_how against
+  descriptor -1 after a failed walk) follows the same rule.
+- **openat2's argument probe needs an open gate.** It runs only with the probe gate open (no guest filter installed,
+  pending or flagged, and the thread's dispatch mode OFF) and under admission, like every other probe. Under a closed
+  gate an openat2 whose walk fails and whose open_how the kernel would refuse first (EINVAL, E2BIG, EFAULT, EMFILE)
+  answers the walk's errno (ELOOP or EACCES). The call fails either way.
+- **Pre-lookup EPERM.** A native LSM EPERM before the lookup is answered as a refusal too: conservative, and named.
+
+#### 4.9.4 Guest seccomp filters
+
+- **(i) The named refusal and its denominator.** A process that installed or inherited a guest seccomp filter gets
+  trigger 3 for every later probe. Per process, literoot counts installs, installs_refused, translated, refused and
+  unseen_best_effort. Each process writes one `literoot: guest seccomp filter summary ...` line when it exits, and gates5
+  sums these per backend. The line `literoot: guest seccomp filter install attempted` is written before each install
+  is forwarded.
+- **(ii) An install made while a probe is in flight is refused.** A guest seccomp filter install made while a literoot
+  probe of the same thread group is in flight is refused with EOPNOTSUPP and
+  `literoot: refused seccomp_install probes_in_flight in_flight=<k>`, on every backend. The refusal depends on the ORDER
+  of the two events, not on time. It is counted per process (installs, installs_refused) and summed per backend by
+  gates5. On trap and liteinst it cannot fire while Reverie's in-guest thread admission is off: each guest process has
+  one thread, so no probe can overlap an install.
+- **(iii) Filters from before the run** are invisible. Probes they deny give `probe_unsupported`, and a probe's ENOSYS or
+  EPERM is never trusted. A filter that FAKES a plausible errno (for example EBADF for T1) cannot be detected.
+- **(iv) Detector.** On trap and liteinst the Tool compares the process's Seccomp_filters count with the expected count:
+  the count read before arming, plus 1 for Reverie's install, plus every install made since. This catches a filter
+  installed through Reverie's trusted gate. An excess sets the filter flag and is counted as `unseen_best_effort`.
+  A deficit or an unreadable count is refused. The first check runs before the process's first translated call, and a
+  result latches: the expected count is never rebased to an observation. The detector is best-effort: a guest that
+  jumps to a trusted gate can defeat it. The count is the procfs view, labelled "untranslated" and not
+  "host-authentic": a chroot or a substituted /proc can change it. Filters and dispatch set before the run are
+  disclosed limits. Plain `-r` without /proc still runs. On those backends the launcher writes, once each, as soon as it knows the backend:
+  `literoot: scope detector best-effort; defeatable by a guest that jumps to a trusted gate` and
+  `literoot: scope constructor-checks best-effort; defeatable by code that runs before the preload's constructor (LD_PRELOAD window)`.
+- **(v) literoot's own syscalls under guest filters** are tracked in https://github.com/rrnewton/literoot/issues/7. A
+  filter the guest installs also judges every syscall literoot injects: the translated path calls, their staging and
+  the Tool's `prctl(PR_SET_NAME)`. On trap and liteinst it also judges every Tool-side syscall of the in-process Tool:
+  the fdinfo and fd reads, the re-reads, and the refusal and summary RPC to the launcher. So a filter can refuse, fake
+  or kill a call the guest did not literally make. Fix 4 guards only its own probes, through (i)-(iv). Done when: cBPF
+  evaluation of the probe and of the original call, for probes AND the pre-existing injections.
+
+#### 4.9.5 Trusted gate and syscall user dispatch
+
+- **Containment.** literoot is not a security boundary; it assumes non-hostile programs (owner directive 2026-11-14).
+  In particular, in-guest backends (trap, liteinst) do not contain a guest that jumps to a trusted gate. Reverie's in-guest filter ALLOWs the
+  exact trusted-gate instruction addresses by design. A guest that jumps there makes kernel calls (clone, seccomp,
+  unshare, …) that neither Reverie nor literoot observes, including a dispatch setter, after which a fix-4 probe may be
+  decided by the guest's dispatch. See https://github.com/rrnewton/literoot/issues/7.
+- **Syscall user dispatch on in-guest backends.** In-guest backends (trap, liteinst) refuse any
+  prctl(PR_SET_SYSCALL_USER_DISPATCH) that would turn dispatch on: EOPNOTSUPP and the side-log line
+  `literoot: refused guest syscall_user_dispatch`. Turning it off is allowed. An ordinary-route
+  ptrace(PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG) keeps literoot's in-guest ptrace refusal (EPERM) and writes the same
+  line; the line count does not split the two setters. Reason: the in-guest runtime owns SIGSYS (a guest's own SIGSYS
+  handler is refused with EPERM), and a guest with dispatch on and a BLOCK selector is killed by SIGSYS with no message
+  (measured on trap, liteinst and the TrapHost build). After an ON made through the trusted gate with a BLOCK selector,
+  the in-guest runtime's own calls are dispatched, and the process dies by SIGSYS with no message (the same mechanism).
+  Programs that need syscall user dispatch, for example Wine, need the ptrace backend, where it works natively. No Wine
+  smoke run; the synthetic sud_probe stands in for it. R2 and run 2's evidence are recorded in
+  https://github.com/rrnewton/literoot/issues/7.
+- **Pre-existing injections under the guest's dispatch.** literoot's pre-existing injected calls (translated path
+  calls, their staging, the Tool's prctl(PR_SET_NAME)), and on trap and liteinst every Tool-side syscall of the
+  in-process Tool, are also decided by a guest's syscall user dispatch, and can raise SIGSYS or kill the guest. Fix 4
+  does not change this. Tracked in https://github.com/rrnewton/literoot/issues/7, done when no injected call runs while
+  the injecting thread has dispatch on, or such a call is refused by name.
+- **Tracking limits** (wherever tracking is the source: ptrace before v6.4, trap and liteinst): a filter from before the
+  run that fakes a 0 for an OFF call leaves the thread ON while tracking records OFF (the (iii) class). A tracer
+  outside literoot can set a guest task's mode with PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG. On ptrace, Reverie holds
+  every guest task's tracer slot. In-guest, an outside tracer is not seen.
+- **The preload's OFF call** (LD_PRELOAD route, before arming):
+  - x86_64: EINVAL counts as "dispatch absent" only on a release below 5.11 with no release-altering persona bit. A
+    distro backport with an old release string is a backport risk. An x86 7.3+ kernel built with
+    CONFIG_SYSCALL_USER_DISPATCH=n answers EINVAL legitimately and gets the named failure. Tracked follow-up: accept "absent" when
+    the kernel's own config, where readable (/proc/config.gz or /boot/config-<release>), says the option is not set.
+  - arm64: EINVAL counts as "dispatch absent" with no release bound. Through v7.3-rc6 only x86 selects it. If a future
+    arm64 kernel gains dispatch, a host policy's EINVAL there would be misread as absent. Tracked follow-up: bound this acceptance
+    once arm64 selects GENERIC_ENTRY and syscall user dispatch.
+  - A uname or personality faked by code that runs before the constructor is the LD_PRELOAD-window case below.
+- **LD_PRELOAD route only: code before the preload's constructor.** IFUNC resolvers, DT_PREINIT_ARRAY and the
+  initializers glibc orders before the constructor all run before Reverie's filter. The preload clears dispatch for the
+  initial thread and refuses to arm with more than one thread (`Threads: 1` from the same status read as the filter
+  count). Both checks are best-effort and can be defeated by code that runs before the preload's constructor
+  (literoot is not a security boundary; it assumes non-hostile programs). A
+  pre-constructor SIGSYS handler is outside the guarantee: its exit_group is itself dispatched, so the
+  process dies by SIGSYS, which fails closed. A filter installed in that window is outside the guarantee too: it is
+  inside the baseline, so the detector does not see it. The mapped-successor route has no such window.
+- **Own views and other processes.** literoot answers the guest's OWN procfs views of its command line and
+  executable: an open of its own `cmdline` (by pid, by any of its thread ids, `self`, `thread-self` or
+  `task/<tid>`, spelled or through a final symlink, from a dirfd or a cwd under /proc) gives its guest-side argv
+  from literoot's records, not the launcher's, and an open or execve of its own `exe` reaches its guest exe. Its own
+  `root` is the guest root, and its own `cwd` and `fd/<n>` continue from the directory's guest path when it has one
+  that leads back to the same directory (the own links have this identity check too: §4.9.8). Readlink
+  of its own links answers by owner, whatever the naming: `root` reads `/` (once the host rootfs path),
+  and `cwd`, `fd/<n>` and `map_files/<k>` read their guest paths. Every other per-process entry of its own
+  (environ, maps, smaps, …) is the kernel's: it shows host values (launcher variables such as LD_PRELOAD with host
+  paths, the host paths of mapped files). A guest process literoot does not own but that has a row in literoot's
+  shared record (a guest's child on the in-guest backends, where no tracer can confirm it) is a guest process too:
+  its `root`, `cwd` and directory `fd/<n>` continue and read as the guest's, readlink, open and execve of its `exe`
+  reach the row's exe, and an open of its `cmdline` gives the row's argv, so ps inside the guest shows guest argv
+  for it. A row that is gone, or that has no argv (or no exe), gets the kernel's file; another argv (a bare-pid
+  cache, the caller's own) never answers for it. On ptrace such a child is traced, so it is owned; an open of its
+  `exe` answers from its row too. Another (host) process's entries are the kernel's, as under
+  proot: literoot assumes non-hostile programs (owner directive 2026-11-14; before it, they were refused as
+  `proc_link_other_process`). One exception keeps a walk correct: a name continued past, or a final follow of, its
+  `root`, `cwd` or a directory `fd/<n>` continues from that directory's guest path when it has a verified one, and
+  otherwise goes to the kernel with the links in its rest counted against the walk's budget (§4.9.8). The full
+  table is §4.9.8.
+- **Synthetic command lines.** A cmdline literoot answers itself (its own process's, or a shared-record row's) is a
+  memfd named `literoot-cmdline` holding the argv, mode 0444, made for that one open.
+  On ptrace the tracer makes it, fills it, makes it 0444 and seals it
+  (F_SEAL_WRITE, SHRINK, GROW and SEAL), and the guest's own call is rewritten to reopen it through
+  `/proc/<tracer pid>/task/<tracer tid>/fd/<n>` (the tracer thread's own descriptor table), with O_NOFOLLOW cleared
+  (the guest named a regular file) and, for openat2, the RESOLVE_BENEATH, IN_ROOT, NO_XDEV, NO_MAGICLINKS,
+  NO_SYMLINKS and CACHED bits cleared in a staged 24-byte copy of open_how. The guest's own call is the only call
+  injected; what is written into the guest is its arguments, staged in the thread's scratch page (the rewritten
+  name and, for openat2, the open_how). A thread with no page yet takes one from the pool, or maps a new pool first
+  (an injected mmap the guest's filters see; Known limits). Staging is a tracer write into the guest, which ptrace
+  allows only over a guest the tracer may attach to: a non-dumpable guest cannot be staged into unless the tracer is
+  privileged (true of every translated call, not only this one). First the tracer runs the kernel's argument checks
+  on a copy of the guest's arguments against descriptor -1, which opens nothing. For openat2 that copy has the
+  guest's layout (the same offset in a page; a page the guest cannot read is inaccessible in the copy), so the
+  kernel's own checks run in its order: the size against 24 and the page size, the range's end against the top of
+  user memory, the extension word by word (E2BIG at the first nonzero word, EFAULT at an unreadable one), then the
+  24 bytes. EBADF means valid, and EINVAL, E2BIG, EAGAIN and EFAULT are the guest's answer. A success at descriptor
+  -1 can only be made up by a filter of the tracer's: the kernel's file answers, and nothing is closed. Then the answers the flags alone
+  decide for an existing regular file, in the kernel's order: EEXIST for O_CREAT|O_EXCL, ENOTDIR for O_DIRECTORY,
+  EACCES for a write mode or O_TRUNC (unless the tracer runs as root); under O_PATH only ENOTDIR. The route needs a
+  dumpable tracer (PR_GET_DUMPABLE) and a guest in the tracer's mount namespace (literoot records every successful
+  unshare(CLONE_NEWNS), setns and namespace-moving clone, and assumes a move when it cannot tell); otherwise the
+  kernel's file answers. A descriptor the tracer can inspect must name the memfd, or it is closed and the kernel's
+  file answers; the tracer's own descriptor closes when the call returns, or is held across a restart code until
+  that thread's next such call or its exit.
+  In-guest it is an injected memfd_create, with MFD_CLOEXEC
+  exactly when the guest's open asked for O_CLOEXEC, behind the probe gate and under admission (§4.9.3), then filled
+  from the Tool's side at offset 0, so the guest's descriptor reads it from the start. The write goes through the
+  calling thread's own descriptor table, which differs from its thread group leader's after unshare(CLONE_FILES) or
+  close_range(CLOSE_RANGE_UNSHARE): pidfd_open(tid, PIDFD_THREAD) and pidfd_getfd (a thread pidfd reads that
+  thread's table) and pwrite on the duplicate, or, when either call fails, a write through a fresh open of
+  `/proc/<tid>/fd/<n>`. Before any write the file must be the one that descriptor names (same device and inode), a
+  regular file, and empty; otherwise nothing is written. Then its mode is set to 0444. No file or directory is made
+  anywhere, so no host directory is needed and nothing is left behind. When it cannot be made (the probe gate is
+  closed, memfd_create
+  fails or admission refuses it, or the write or its check fails, in which case the memfd is closed first), the
+  kernel's own cmdline file answers and the side log says `literoot: answered path synthetic_file_unavailable`.
+  That file holds the argv literoot exec'd, on every backend: `[rootfs interpreter, program, args…]` for a
+  dynamically linked program or a script (§4.7), which is not what the program was started with. Known differences
+  from the kernel's file, on both routes: readlink of the descriptor shows `/memfd:literoot-cmdline (deleted)`;
+  st_size is the length (natively 0); st_mode is 0444 like the kernel's, but it is a memfd's inode. In-guest only:
+  F_GETFL shows O_RDWR, and the memfd is unsealed, so any guest can write to or truncate it through that descriptor
+  (write(2) and ftruncate(2) check the descriptor, and the 0444 mode only governs a reopen), where the kernel's
+  cmdline descriptor cannot be written; and the guest's open flags other than O_CLOEXEC are not applied (O_DIRECTORY,
+  O_WRONLY, openat2's RESOLVE_* bits). In-guest, openat2's open_how is checked first, through the probe below the gate
+  (§4.9.3): only the kernel's EBADF for a lookup on descriptor -1 lets the memfd answer, its pre-lookup errors
+  (EINVAL, E2BIG, EFAULT, EMFILE) are the guest's, and any other result, or a closed gate, leaves the open to the
+  kernel (the fallback line). So for openat2 the two routes differ: where the in-guest probe proves nothing the
+  kernel's file (the exec'd argv above) answers where ptrace synthesizes the guest's argv; an EAGAIN (RESOLVE_CACHED
+  with O_CREAT, O_TRUNC or O_TMPFILE) is the guest's answer on both, but in-guest it comes from the kernel's own open,
+  after the fallback line; and with no free descriptor, ptrace answers the flag-decided EEXIST, ENOTDIR or EACCES
+  before the guest's EMFILE, where the kernel and the in-guest probe answer EMFILE first. The two errno lists above
+  (EINVAL, E2BIG, EAGAIN and EFAULT through the tracer; EINVAL, E2BIG, EFAULT and EMFILE in-guest) are what each
+  argument probe answers directly, not a limit on what either route's final open returns. Both in-guest choices, this
+  probe and the memfd route with its writable, unsealed descriptor and unapplied open flags, are known in-guest
+  differences, and the C4 gate (tests/c4_backend_branches.rs) names them with these reasons rather than keying a
+  refusal: neither refuses anything. In-guest the
+  injection runs in the calling guest thread, and the Tool's own pidfd and write calls run in the same process; that
+  route is checked in the source and measured only by the shared-record consumer rows.
+
+#### 4.9.6 Wire identity
+
+- The launcher reads the preload library's `.literoot_wire_id` record before it spawns anything. The preload checks
+  the identity that the launcher appends to its tool selector before it arms. Both carry LITEROOT_WIRE_DIGEST, one
+  SHA-256 over the config layout and the refusal schema.
+- **Swap limit.** The check reads the file at `<path>`, and the guest's loader opens it later. A file swapped in
+  between is not a build-mismatch case. If it happens anyway, the second barrier stops an old preload before arming,
+  with the old preload's own message.
+- **Disclosed plan delta (C5d).** The digest pin runs in the launcher's default-features test build. That build needs
+  `reverie-inguest` as a dev-dependency (Cargo.toml:78; same rev and features as the normal dependency), beside the
+  `reverie-rpc-transport` that C5d names, because the module that computes the digest also places the coordinator
+  descriptor. Cargo.lock is unchanged by it. Review accepted it as disclosed.
+- **Disclosed plan delta (C5d recording seam).** C5d's preload-side mismatch unit must show that a refused identity
+  connects nothing and decodes nothing. To make that observable, the two preload constructors' steps after the
+  bootstrap (the UTF-8 check, the identity check, then the selector's arming and the install) now run through one
+  shared function, `wire_id::arm_with`. Its closure is the only holder of the coordinator socket and the only path to
+  the install that decodes the config. The unit `preload_rejects_config_only_mismatch` passes a recording closure: a
+  config-only mismatch is refused with 0 calls, and this build's identity reaches it exactly once. A source tripwire
+  pins both constructors to that step. The messages and the order of checks are unchanged. The production change is
+  that factoring, with no new API surface beyond the function itself.
+
+#### 4.9.7 Exit-summary identity
+
+- Exit summaries (`guest seccomp filter summary`, `probe summary`) identify a process by `receipt_id`, a number the
+  launcher assigns to that process's one exit-summary emission. It is unique within the run by construction. It orders
+  receipt only, not creation, and it is compared for equality only. The plan had specified a "run-unique creation
+  sequence number". That cannot be produced
+  in-guest without a new response RPC.
+- The alternative, the kernel pair (pid, starttime from /proc/<pid>/stat field 22), was rejected for two reasons:
+  - it is not unique: a pid can be reused within one clock tick (clone3 set_tid or ns_last_pid in a user+pid
+    namespace), and pid namespaces repeat numbers;
+  - it is not host-authentic: the read follows the process's mount namespace and root, so a substituted or private
+    procfs can supply different content, and starttime carries the reader's time-namespace offset.
+- Each summary also carries `kernel_id`, the pidfs inode. It is collected by the tracer on ptrace only (Linux 6.9+)
+  and is always 0 in-guest (0 = uncollected). It is kernel metadata, not authenticated, and not the identity. On ptrace,
+  a nonzero kernel_id shared by two identified receipts raises the warning `suspected_duplicate`. The warning never
+  merges records or excludes them from sums. In-guest, a duplicate emission is visible only through gates5's roster,
+  which flags both a missing emission (`expected_absent`) and an extra one (`expected_surplus`).
+- A route that rebuilt a Tool for a live process without ExecState would emit twice. No route does so today: ExecState
+  v3 carries the record across exec, and one emitter writes it. On ptrace (6.9+) such a double emission shows as
+  `suspected_duplicate`. Before 6.9, and in-guest, only the roster shows it.
+- A process that never emits (killed without exit callbacks, or alive at the end of the run, on any backend) has no
+  summary. The reader cannot see it, and gates5 counts it against its roster as expected and absent.
+
+
+#### 4.9.8 Per-process procfs entries: own views
+
+literoot assumes non-hostile programs (owner directive 2026-11-14). It decides only a guest process's views of its
+command line, executable, root, cwd and directory descriptors (its own, and a guest child's from its row); every
+other procfs entry is the kernel's, and so is every entry of a host process, as under proot, except where a walk
+continues past or follows a host process's directory link (below).
+
+Every open of these entries is decided by one shared route, `self_link_route`, on all three open arms (openat,
+open, openat2) and execve, on every backend (the Tool code is the same; backends differ only in which processes
+are owned or have a shared-record row). It judges the final host entry of the spelled path, and, for an open that
+follows a final symlink, the entry the guest-view walk resolves to (§4.9.5). The tool view turns `self` into the
+caller's tgid and `thread-self` into `<tgid>/task/<tid>`, and a thread id in `/proc/<tid>` is taken as its thread
+group, so every naming below reaches the same classifiers: magic links by `classify_rel` (src/translate.rs), the
+cmdline file by `proc_cmdline_pid` (src/rootfs_tool.rs), both with the `<N>/` and `<N>/task/<T>/` forms.
+
+Owner classes, judged by thread group: **own** is the caller's process (on ptrace, any process literoot traces).
+**row** is a process literoot does not own that has a shared-record row: a guest's child on the in-guest backends.
+**other** is any other process (a host process). Every process is judged under the caller's root: a guest child
+that emulates a chroot of its own (`root_override`) is not represented, a disclosed limit. The equal-root case
+is the one pinned.
+
+| Entry | own: every naming | row: `/proc/<N>/X`, `/proc/<N>/task/<T>/X` | other |
+| --- | --- | --- | --- |
+| `cmdline` | the caller's guest argv, in a memfd (§4.9.5) | the row's argv, in a memfd | the kernel's |
+| `exe` | the guest exe (open and execve follow it; readlink); an open without following (O_NOFOLLOW, O_PATH, O_CREAT\|O_EXCL) is the kernel's link | the row's exe (open and execve follow it; readlink); without following, the kernel's link | the kernel's |
+| `root` | the guest root; a name under it is the guest's; readlink `/` | as own | continued past or followed: the directory's verified guest path, else the kernel's (the links after it counted); readlink the kernel's |
+| `cwd`, `fd/<n>` | the kernel's on open; a name under a directory continues from its verified guest path (`proc_link_outside_root` when it has none, §4.9.1); readlink the guest path | as own | as `root` |
+| every other entry | the kernel's | the kernel's | the kernel's |
+
+A directory's **verified guest path** (`GuestProcLinks::verified_reverse`): the link's target, read by the Tool,
+is absolute and not deleted, has the link's device and inode, maps back into the guest (`RootConfig::reverse`),
+and that guest name, translated again, reaches the same device and inode (a deeper bind can shadow the name). A
+host process's link that fails this, or that the Tool cannot read (another uid, or not dumpable), goes to the
+kernel as is, and the links in the rest of the name count against the walk's 40-link budget
+(`translate::count_raw_tail`); the walk then gives no guest route, so chdir records the kernel's cwd (reversed, or
+UNNAMED_CWD) and execve records the file it reached.
+
+Own namings: `/proc/<pid>/X`, `/proc/<pid>/task/<tid>/X`, `/proc/self/X`, `/proc/thread-self/X`,
+`/proc/self/task/<tid>/X`, `/proc/<tid>/X` and `/proc/<tid>/task/<tid>/X`, each spelled, through a symlink or a
+chain of them, from a dirfd on `/proc` or `/proc/<pid>`, or relative to a cwd under /proc. A row's or an own
+`cmdline` that cannot be made falls back to the kernel's file (`answered path synthetic_file_unavailable`). A row
+that is gone, or has no argv or exe, gets the kernel's file.
+
+Unit rows: `own_views::own_views_on_every_naming` (every own naming, plain, through a symlink, from both dirfds and
+from a cwd, on openat, openat2 and open, on the ptrace and the in-guest configurations, on a guest root that is not
+the host's, so the guest exe and root differ from the kernel's), `own_views::other_process_is_native` (another
+process's exe, cwd, root, cmdline, environ and maps on open, and its exe, cwd, root and fd/0 on readlink, all equal
+to a native call), `own_views::own_numeric_readlink_is_reversed`, `own_views::own_exe_nofollow_is_the_link`,
+`own_views::own_fd_map_files_and_traversal`, `own_views::row_root_cwd_fd_are_the_guests`,
+`own_views::truncated_thread_self_readlink_reads_the_callers_table` and `own_views::thread_self_fd_is_the_callers_table`
+(a thread with a descriptor table of its own), `own_views::guest_only_task_dir_and_parent_stay_in_procfs`,
+`own_views::planted_rootfs_proc_link_loops_in_the_guest`, `own_views::own_root_reroots_charge_the_link_budget`,
+`own_views::directory_bound_at_self_root_is_ordinary`, the `route_units` (a relative final link after a ".." out of a
+deleted directory), the `raw_walk_units`
+(another process's directory link), the a1 units (rows) and the p1b units (symlinks). `task/<T>/map_files` does
+not exist in the kernel's thread directory, so it is ENOENT natively and through literoot.
+
+Known limits:
+- **A command line literoot cannot synthesize shows the exec'd argv.** On the in-guest backends, a process whose
+  probe gate is closed reads `[rootfs interpreter, program, args…]` (for a dynamically linked program or a script)
+  for its own cmdline and for its guest children's: a process with a seccomp filter installed or being installed,
+  and every descendant of it (the record's filter state is inherited at fork), a flagged record, or a thread with
+  syscall user dispatch ON. On ptrace none of these matter (§4.9.5); the same fallback happens only when the tracer
+  is not dumpable or the guest left its mount namespace. The side log says `answered path
+  synthetic_file_unavailable` each time.
+- **The readlink-to-call window.** literoot reads a host process's directory link, then the guest's call runs. If
+  that process moves in between, the call lands where it was when literoot read the link, as if the call had run a
+  moment earlier. Afterwards the guest's cwd and exe records hold still.
+- **The tail count is conservative.** After a host process's link goes to the kernel, literoot counts the links in
+  the rest of the name by walking the kernel's objects from that link (by descriptor, in that process's mount
+  namespace). It stops counting, with no error, at procfs (magic links, self, thread-self), at a component it cannot
+  open, stat or read, or at a non-directory: over-counting would turn a native success into ELOOP. So a guest that
+  can search a directory the Tool cannot (other credentials or namespace capabilities) can follow more than 40
+  links in all, up to 40 more inside that rest. A final link the kernel follows because of a trailing slash or
+  "/." is counted with the rest, once.
+- **An execve whose file has no name.** An execve through a host process's link records the file it reached: its
+  guest name when one leads back to it, else its host path (opens of /proc/self/exe then open that host file,
+  readlink gives it, and its row publishes no exe). When the Tool cannot name the file at all (another mount
+  namespace, a deleted file, a file it cannot reach), the record is the spelling, and a later open of
+  /proc/self/exe walks it again.
+- **A new thread can need an injected mmap.** A thread's first staging takes a 4096-byte slot from its image's pool
+  (16 slots, mapped by the post-exec handler of a successful execve) or an exited thread's slot. Four cases map a new
+  pool first, in the task that stages: the 17th thread of an image alive at once with no slot free (and so on every
+  16th after it); in a process forked without an exec (its pool is not carried across the fork), its first new
+  thread, and then every 16th; the first staging of a `CLONE_VM` process that is not a vfork; and on ptrace a vfork
+  or posix_spawn child whose caller has no slot while none is free (a caller with no slot takes a free one before
+  the clone, so the child shares it; with none free the child maps a pool in the shared address space that the
+  caller's process does not reuse, 64 KiB on each such spawn). The call is
+  `mmap(NULL, 65536, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`, which the guest did not make. On
+  ptrace it is injected into that thread, so every seccomp filter attached to the thread (one the guest installed,
+  or one it inherited), the process's RLIMIT_AS and its memory cgroup judge it; a filter that refuses it fails that
+  thread's path call, and one that kills kills the thread. In-guest (trap, liteinst) the runtime issues it through
+  Reverie's trusted gate, which Reverie's own filter allows by address, and every other filter on the thread (one
+  the guest installed, or one from before the run) judges it, as for every injected call (§4.9.4 (v)); in-guest a
+  process has one thread today (thread admission is off), so only the post-exec pool is mapped there. The
+  post-exec mapping itself predates this change (it was one page) and is the same class.
+- **A pending execve's identity.** On ptrace a process's exe and argv are its successor's from just before the
+  execve is injected (they are recorded first, for the new image) until the call returns: a sibling thread that
+  reads /proc/self/exe or cmdline in that window sees the successor's. A failed execve restores the prior ones.
+  Natively the old values hold until the exec's point of no return.
+- **openat2's open_how check on arm64.** The tracer's copy models access_ok with the top of user memory at 2^48,
+  or 2^52 when a mapping above 2^48 succeeds; a kernel built for 52-bit addresses on 48-bit hardware, and the
+  tagged-address ABI (a tagged open_how pointer), are not modelled: such a range can answer EFAULT where the kernel
+  checks the extension first.
+- **A walk refusal is logged before an argument error.** In-guest, an openat2 whose walk is refused by name, and
+  whose open_how the kernel would refuse first, answers the kernel's EINVAL, but the refusal line was already
+  written.
+- **A traced child's exe without a row.** On ptrace, readlink of an owned child's `exe` with no row falls back to a
+  record keyed by bare pid (a fork child can read its launch program's, a reused pid a stale value); an open of it
+  is then the kernel's link, which names the loader. An exec that reached a file with no guest
+  name leaves no such record and publishes an empty row exe: readlink then gives the kernel's link.
+- **Other processes' entries are the kernel's**, per the owner directive of 2026-11-14 (earlier drafts of this
+  change refused another process's magic links, exe, cwd, root, fd and map_files, in its walk, and its cmdline,
+  environ, maps and similar files). A guest sees what the kernel shows: host command lines, host paths, the host
+  environment of same-uid processes.
+- **Own environ, maps, smaps and the rest show host values**: launcher variables such as LD_PRELOAD with host paths,
+  the shared-record and probe descriptors, and the host paths of mapped files. Rewriting them is outside fix 4
+  (§4.5).
+- **RESOLVE_* is passed through, and RESOLVE_IN_ROOT re-roots.** openat2's open_how goes to the kernel unchanged,
+  with literoot's absolute host path. Under RESOLVE_IN_ROOT the kernel resolves an absolute name from the dirfd (or
+  the cwd for AT_FDCWD): path_init skips the root jump for LOOKUP_IN_ROOT and roots the walk at the dirfd
+  (fs/namei.c:2714-2715 and :2767 at v7.1.3). So the kernel can open a different entry from the one literoot
+  judged. The concrete case: with `-r /` (the default rootfs), D a descriptor on `/proc`, and P another process,
+  `openat2(D, "/P/environ", {resolve = RESOLVE_IN_ROOT})` is judged as the ordinary `/P/environ` and opens
+  `/proc/P/environ`; the same holds for a dirfd on `/proc/P` with `"/environ"`, and for AT_FDCWD after
+  `chdir("/proc/P")`. Under RESOLVE_BENEATH the kernel refuses every absolute name with EXDEV (nd_jump_root,
+  fs/namei.c:1129-1130), and literoot injects an absolute host path, so every translated RESOLVE_BENEATH openat2,
+  relative names included, gives EXDEV where natively it can succeed. A cmdline literoot
+  synthesizes on ptrace is the exception: those bits are cleared in its rewritten call (§4.9.5). Emulating both in
+  literoot's walk (and injecting with AT_FDCWD and the flags cleared) is (2b)'s work.
+- **A bind at a /proc magic path matches its spelling.** A bind at `/proc/self/root` (or another magic path) applies
+  to that spelling, a guest-path prefix as in proot: the walk then classifies the bound directory, an ordinary one.
+  `/proc/<own pid>/root` does not match it and is still procfs's link.
+- **An unresolvable `-w` starts in "/".** When the launcher's `-w` names no directory (missing, not a directory, or
+  more than 40 links on its walk), the guest starts in "/" without a message. proot makes the same choice, with a
+  warning.
+- **A call with two errors can answer the walk's.** literoot translates a name before the kernel sees the call, so a
+  call with both an invalid argument and a name the walk refuses (more than 40 links, or a named refusal) answers the
+  walk's errno where the kernel would answer the argument's first. openat2 is the exception while its probe gate is
+  open: EINVAL, E2BIG, EFAULT and EMFILE come first through its argument probe (§4.9.3); ENFILE and ENOMEM, which the
+  kernel can also return before the lookup, are not among them. The call fails either way.
+- **The cwd after a rename.** literoot keeps the cwd as a guest path and rewrites it when this process renames one of
+  its ancestors (the old prefix becomes the new one, as in proot). Two cases are not followed: another process renames
+  an ancestor of this process's cwd, or this process exchanges two directories (renameat2 RENAME_EXCHANGE) and its
+  cwd is under the exchange's second name. Later relative names then resolve from the old guest path, which can name
+  another directory's entries. getcwd stays the kernel's, de-translated.
+- **getcwd with a small buffer.** getcwd runs in the kernel with the guest's buffer, and its answer is then
+  de-translated, so a buffer too small for the HOST path gives ERANGE even when the guest path would fit.
+- **AF_UNIX names.** bind and connect give the kernel the walk's host path, so getsockname returns the canonical guest
+  path of what was bound (every link, "..", alias and `/proc/self/fd/<n>` spelling resolved), not the name the guest
+  used, as in proot. A host path longer than 107 bytes is ENAMETOOLONG even when the guest's name is short; proot
+  binds such a name to a short temporary path instead.
+- **Descriptors literoot makes in the guest's table.** Two in-guest routes reach a descriptor they create in the
+  guest's table by its number: the filter-count read (an open, reads and a close of /proc/self/status, §4.9.4) and
+  the cmdline memfd (memfd_create, then literoot's write and identity check, and a close when either fails, §4.9.5).
+  Another thread of the same guest that closes or replaces that number meanwhile (close_range, closefrom, dup2 onto
+  it) makes literoot read, or close, its replacement; an empty regular file opened writable at that number also
+  passes the memfd's identity check and then holds the argv, mode 0444. Natively such a thread already breaks its
+  sibling threads' descriptors; literoot assumes non-hostile programs.
+
 ## 5. Android constraints (M3), in the owner's priority order
 
 The Android app sandbox is not "Linux but smaller": the app runs as an
@@ -405,7 +866,7 @@ launcher only waits and forwards the exit status/signals).
 | cwd (guest path) | Per-process mutable | Initialised from `-w`, updated by translated `chdir`, copied on `fork`, preserved on `execve` |
 | fd → guest-path table | Per-process mutable | Recorded on `open*`/`dup*`/`socket`, dropped on `close`, `O_CLOEXEC` entries dropped on `execve`, lazy `/proc/self/fd` recovery for unknown fds (§4.3) |
 | io_uring ring records | Per-process mutable | Created at `io_uring_setup`, dropped at ring fd close |
-| Scratch path buffers | Per-thread | Preallocated, reused; no allocator on the hot path |
+| Scratch path buffers | Per-thread | One 4096-byte slot per thread. The post-exec handler of a successful `execve` maps a pool of 16 slots in one injected anonymous mmap of 64 KiB: the exec'ing thread takes the first, and new threads take the others, or an exited thread's slot of the same image, zeroed before use; a new thread maps another 16-slot pool (one mmap) only when none is free. A `fork` child keeps the caller's copy, a `vfork` child shares the suspended caller's, a thread or other `CLONE_VM` child gets its own; a staged write never runs past the slot. On a 64 KiB kernel the 16 slots share one kernel page with no guard page between them, so the explicit length checks are what bound every staged write. Image numbers are unique in the process (one counter), so a slot of another image is never reused. Earlier the code kept ONE slot per process despite this row, so one thread's staging could overwrite another's before the kernel read it (reachable on ptrace) |
 
 Handoff mechanism: the launcher stages the immutable blob in the
 Tool region before first instruction (A-stop) or via an inherited
