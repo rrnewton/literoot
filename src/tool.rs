@@ -1064,9 +1064,10 @@ fn run_backend(
     in_guest: bool,
 ) -> Result<u8, String> {
     let kill_on_exit = cfg.kill_on_exit;
-    // LITEROOT_STATS (off by default): decided once, before any
-    // backend starts, and never passed to the guest.
-    let stats = crate::run_stats::RunStats::from_env(&mut cmd);
+    // LITEROOT_STATS / LITEROOT_EXIT_RECORD / LITEROOT_CGROUP (off by
+    // default): decided once, before any backend starts, and never passed
+    // to the guest; the run's own cgroup is entered here.
+    let stats = crate::run_stats::RunStats::from_env(&mut cmd)?;
     // Shared probe-cache generation (memfd inherited by the
     // whole guest tree; translate.rs probe coherence).
     let gen_fd = crate::translate::create_shared_gen_fd();
@@ -1146,7 +1147,7 @@ fn run_backend(
             let (output, snapshot) = runtime.block_on(async {
                 use reverie::BackendStatsSource as _;
                 use reverie_inguest::launcher::PreloadBackend;
-                if stats.enabled() {
+                if stats.counting() {
                     let (output, _global, source) =
                         PreloadBackend::run_with_output_and_preload_data_and_stats::<RootfsTool>(
                             cmd,
@@ -1178,8 +1179,7 @@ fn run_backend(
             let code = status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8;
-            stats.finish(backend, code, snapshot.as_ref(), None)?;
-            return Ok(code);
+            return Ok(stats.conclude(backend, code, snapshot.as_ref(), None));
         }
         #[cfg(not(feature = "in-guest"))]
         {
@@ -1202,7 +1202,7 @@ fn run_backend(
             let (output, snapshot) = runtime.block_on(async {
                 use reverie::BackendStatsSource as _;
                 use reverie_liteinst::LiteinstBackend;
-                if stats.enabled() {
+                if stats.counting() {
                     let (output, _global, source) =
                         LiteinstBackend::run_with_output_and_preload_data_and_stats::<RootfsTool>(
                             cmd,
@@ -1234,8 +1234,7 @@ fn run_backend(
             let code = status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8;
-            stats.finish(backend, code, snapshot.as_ref(), None)?;
-            return Ok(code);
+            return Ok(stats.conclude(backend, code, snapshot.as_ref(), None));
         }
     }
 
@@ -1248,7 +1247,7 @@ fn run_backend(
         );
     }
     // Taken from the tracer before wait() consumes it; Some only
-    // when LITEROOT_STATS requested collection.
+    // when LITEROOT_STATS requested counting.
     #[cfg(feature = "run")]
     let mut stats_source = None;
     #[cfg(feature = "run")]
@@ -1467,8 +1466,7 @@ fn run_backend(
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8;
         let snapshot = stats_source.map(|source| source.backend_stats());
         let counts = snapshot.as_ref().map(crate::run_stats::ptrace_counts);
-        stats.finish(backend, code, snapshot.as_ref(), counts)?;
-        Ok(code)
+        Ok(stats.conclude(backend, code, snapshot.as_ref(), counts))
     }
 }
 

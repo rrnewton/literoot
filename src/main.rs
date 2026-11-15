@@ -470,6 +470,8 @@ fn launcher_token(error: &str) -> &'static str {
         "unlimited_stack_loader"
     } else if error.contains("static executables are not supported by the in-guest backend") {
         "static_floor"
+    } else if error.starts_with("LITEROOT_CGROUP:") {
+        "stats_cgroup"
     } else if launcher_error_exit_code(error) == 2 {
         "kill_on_exit"
     } else {
@@ -539,6 +541,8 @@ fn main() -> ExitCode {
             Some("launch")
         } else if reporter_missing() {
             Some("reporter")
+        } else if stats_record_failed() {
+            Some("stats_record")
         } else {
             None
         });
@@ -577,6 +581,15 @@ fn launch_failed() -> bool {
 fn reporter_missing() -> bool {
     #[cfg(feature = "tool")]
     return tool::reporter_missing();
+    #[cfg(not(feature = "tool"))]
+    return false;
+}
+
+/// Whether the guest finished but its LITEROOT_STATS record could not be
+/// written (see `run_stats::record_failed`).
+fn stats_record_failed() -> bool {
+    #[cfg(feature = "tool")]
+    return run_stats::record_failed();
     #[cfg(not(feature = "tool"))]
     return false;
 }

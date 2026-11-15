@@ -45,8 +45,16 @@ use crate::refusal_log;
 /// for a launcher that can tell that case apart; this one cannot by type,
 /// so it writes `launch`. `reporter`, an in-guest run in which no preload
 /// process acknowledged refusal reporting (a preload built before this
-/// log, which runs the guest but reports nothing).
-pub const END_ERRORS: &[&str] = &["log_write", "connections_open", "launch", "reporter"];
+/// log, which runs the guest but reports nothing). `stats_record`, the
+/// guest finished but the requested LITEROOT_STATS record could not be
+/// written (`run_stats`); the run's status is then `STATS_RECORD_EXIT`.
+pub const END_ERRORS: &[&str] = &[
+    "log_write",
+    "connections_open",
+    "launch",
+    "reporter",
+    "stats_record",
+];
 /// `route` labels.
 pub const ROUTES: &[&str] = &["preload", "static_m2", "ptrace"];
 /// `fork_policy` kinds: the record's five, `clone` split by `CLONE_THREAD`
@@ -82,6 +90,7 @@ pub const LAUNCHER: &[&str] = &[
     "static_pie",
     "kill_on_exit",
     "refusal_log_repeated",
+    "stats_cgroup",
     "other",
 ];
 
