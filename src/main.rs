@@ -420,6 +420,8 @@ fn print_usage() {
          \x20 --identity-only        the default rule above, requested explicitly\n\
          \x20 -k, --kernel-release <s>  spoof uname release\n\
          \x20 --backend <name>       ptrace (POC reference) | liteinst (design §3); guest ptrace is refused on in-guest backends\n\
+         \x20                        in-guest backends use the embedded preload, cached under $XDG_CACHE_HOME/literoot\n\
+         \x20                        (else ~/.cache/literoot); LITEROOT_PRELOAD=<file> overrides it when its stamp matches\n\
          \x20 --kill-on-exit         kill the traced guest tree when the initial guest exits (ptrace backend only; CLONE_UNTRACED children are not traced and escape)\n\
          \x20                        kill-on-exit refusals exit 2 (a guest may also exit 2; the literoot: kill-on-exit: stderr prefix distinguishes)\n\
          \x20 --check <guest-path>   print translation and exit (repeatable)\n\

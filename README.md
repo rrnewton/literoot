@@ -19,6 +19,18 @@ Some path system calls can reach host files that the invoking user can already
 access. Do not rely on literoot to confine untrusted programs. A fix is in
 progress.
 
+Install with `cargo install --path <checkout>` or `cargo install --git <repo>`.
+The build also builds literoot's in-guest preload and embeds it in the
+binary, so the in-guest backends need no second build step. Installing from
+crates.io is not supported. At launch literoot writes the preload to a
+private cache, `$XDG_CACHE_HOME/literoot/<sha256>/` (else
+`~/.cache/literoot/<sha256>/`), and checks its SHA-256 again just before the
+guest loads it. Other users cannot write there; a process of the same user
+could still replace the file between that check and the load. When the
+in-guest preload cannot be used, literoot refuses by name; it never falls back
+to ptrace. `LITEROOT_PRELOAD=<file>` runs a separately built preload instead,
+admitted only when its stamp matches this literoot.
+
 See [docs/design.md](docs/design.md) for the full design: CLI compatibility
 scope, interception mechanism, Android syscall-emulation requirements, state
 model, dependency pins, and the correctness/performance test plan.
