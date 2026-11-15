@@ -107,6 +107,26 @@ static LITEROOT_INIT: unsafe extern "C" fn(
     *mut *mut libc::c_char,
 ) = initialize;
 
+// The compatibility stamp: one allocated SHT_NOTE section,
+// `.note.literoot.preload` (name `literoot`, type 0x4c4954), which the
+// launcher finds through PT_NOTE and never by section name. build.rs derives
+// its protocol_version from the files both sides compile and the pinned
+// Reverie revisions, and its flavour from this build's features. Left out of
+// the private runtime image, like the constructor above. The root build
+// script fails the build when the note is missing from the blob it embeds.
+#[allow(dead_code)] // the musl mapped-successor image emits no note
+mod stamp_note {
+    include!(concat!(env!("OUT_DIR"), "/literoot_note.rs"));
+
+    #[repr(C, align(4))]
+    pub(crate) struct Note(pub(crate) [u8; LITEROOT_NOTE_BYTES.len()]);
+
+    #[cfg(not(all(feature = "mapped-successor", target_env = "musl")))]
+    #[used]
+    #[unsafe(link_section = ".note.literoot.preload")]
+    pub(crate) static LITEROOT_NOTE: Note = Note(LITEROOT_NOTE_BYTES);
+}
+
 // LITEROOT_INIT is the only root.
 #[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
 unsafe fn loaded_as_preload() -> bool {

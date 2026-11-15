@@ -112,10 +112,21 @@ static ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
 /// An empty drain sends nothing, except the first in a process: that report
 /// acknowledges the reporter, which a preload built before the side log
 /// never sends (`rootfs_tool::REPORTER_ACKNOWLEDGED`).
+///
+/// The `reporter-off` test fixture sends nothing at all, so the launcher
+/// sees a stamp-valid preload that never acknowledges and must fail the run
+/// (the root build script refuses to embed such a build, by its marker).
+#[cfg(not(feature = "reporter-off"))]
 async fn report<G: GlobalRPC<LiterootGlobal> + ?Sized>(rpc: &G, refusals: Vec<Refusal>) {
     if !refusals.is_empty() || !ACKNOWLEDGED.swap(true, Ordering::AcqRel) {
         rpc.send_rpc(Refused(refusals)).await;
     }
+}
+
+#[cfg(feature = "reporter-off")]
+async fn report<G: GlobalRPC<LiterootGlobal> + ?Sized>(rpc: &G, refusals: Vec<Refusal>) {
+    let _ = (rpc, refusals);
+    let _ = std::hint::black_box(&crate::stamp_note::REPORTER_OFF_MARKER);
 }
 
 /// The side-log refusal for a host refusal of one dispatch.

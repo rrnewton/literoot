@@ -68,6 +68,10 @@ exec-watch = []
 # Build it with --no-default-features. src/lib.rs refuses, by name, the two
 # combinations that would put a second global allocator in it.
 watched-initial = ["inguest-trap", "exec-watch", "exec-stage"]
+# Test fixture only: the preload hosts the real Tool with a valid stamp but
+# never sends its reporting acknowledgement (src/reporting.rs). The launcher
+# must fail such a run by name. The root build script refuses to embed it.
+reporter-off = []
 
 [dependencies]
 reverie = { package = "reverie-core", git = "https://github.com/facebookexperimental/reverie", rev = "6281d616a880056c78bf9d34c602e8d0903d07f4" }
@@ -78,6 +82,10 @@ libc = "0.2.186"
 # The initial-image packet's config wire fingerprint (src/initial_packet.rs).
 sha2 = { version = "0.10.9", optional = true }
 serde = { version = "1.0.219", features = ["derive"] }
+
+[build-dependencies]
+# The stamp's protocol_version derivation (src/preload_stamp.rs, via build.rs).
+sha2 = "0.10.9"
 
 
 
