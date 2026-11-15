@@ -12,7 +12,10 @@ crate-type = ["cdylib"]
 # Pinned Reverie rev: 6281d616a880056c78bf9d34c602e8d0903d07f4 (facebookexperimental/reverie main).
 [features]
 default = ["liteinst"]
-liteinst = ["dep:reverie-liteinst"]
+# reverie-inguest directly too, with the same features reverie-liteinst
+# already enables on it, for the runtime-descriptor calls in
+# src/runtime_memfds.rs.
+liteinst = ["dep:reverie-liteinst", "dep:reverie-inguest"]
 # Trap-only in-guest via Reverie's TrapHost API: no reverie-ptrace
 # and no reverie-liteinst. default-features=false keeps
 # reverie-inguest's own preload-constructor out (this crate has its
