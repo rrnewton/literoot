@@ -9,10 +9,15 @@
 #     positive);
 #   - a swapped preload is caught in both directions (the old liteinst check
 #     passed a trap preload);
-#   - each check fails on a case only it can see: T1 on a source whose trap
-#     graph resolves reverie-liteinst, T2 on a wrong sha256 and on a log that
-#     compiled reverie-liteinst, T3 on a liteinst preload given with the
-#     trap log, and a stripped copy is UNAVAILABLE (exit 3);
+#   - each check arm fails on a case only it can see: T1 on a source whose
+#     trap graph resolves reverie-liteinst (R8), whose trap graph lacks
+#     reverie-inguest (R18) and whose default graph lacks reverie-liteinst
+#     (R17); T2 on a wrong sha256 (R5), a log that compiled reverie-liteinst
+#     (R6) and a log that never compiled reverie-inguest (R15); T3 on a
+#     liteinst preload given as trap with the trap log (R7), a trap preload
+#     given as liteinst with the liteinst log (R14) and a copy whose
+#     reverie_inguest symbols are removed (R16); a stripped copy is
+#     UNAVAILABLE (exit 3, R9);
 #   - run.sh stops on a row whose preload fails, and on a row with no
 #     --preload-ids line, and gets past the identity check for a good row.
 #
@@ -70,15 +75,46 @@ row R6-T2-log-compiled-liteinst 1 "T2: the build log compiled reverie-liteinst" 
     "$id" trap "$trap_so" "$trap_sha" "$lite_log" "$src" "${tgt[@]}"
 row R7-T3-liteinst-symbols 1 "T3:" "$id" trap "$lite_so" "$lite_sha" "$trap_log" "$src" "${tgt[@]}"
 
-# T1: a copy of this checkout whose inguest-trap feature also pulls
-# reverie-liteinst (the lock already holds it, so cargo tree stays offline).
-mkdir "$scratch/src-t1" || exit 2
-(cd "$src" && tar --exclude=./target --exclude=./.git -cf - .) | tar -x -C "$scratch/src-t1" || exit 2
-sed -i 's/^inguest-trap = \["dep:reverie-inguest"\]$/inguest-trap = ["dep:reverie-inguest", "dep:reverie-liteinst"]/' \
-    "$scratch/src-t1/preload/Cargo.toml" || exit 2
-grep -qx 'inguest-trap = \["dep:reverie-inguest", "dep:reverie-liteinst"\]' "$scratch/src-t1/preload/Cargo.toml" \
-    || { echo "FAIL R8 fixture: the inguest-trap feature line was not found"; exit 1; }
+# T1: copies of this checkout with one feature line of preload/Cargo.toml
+# changed (the lock already holds every crate, so cargo tree stays offline).
+# srccopy NAME FROM TO: the copy at $scratch/NAME, or a fixture failure.
+srccopy() {
+    mkdir "$scratch/$1" || exit 2
+    (cd "$src" && tar --exclude=./target --exclude=./.git -cf - .) | tar -x -C "$scratch/$1" || exit 2
+    FROM=$2 TO=$3 python3 -I -c 'import os,sys
+p=sys.argv[1]; s=open(p).read(); f=os.environ["FROM"]+"\n"
+if s.count(f) != 1: sys.exit(1)
+open(p, "w").write(s.replace(f, os.environ["TO"]+"\n"))' "$scratch/$1/preload/Cargo.toml" \
+        || { echo "FAIL $1 fixture: the line to change was not found exactly once"; exit 1; }
+}
+srccopy src-t1 'inguest-trap = ["dep:reverie-inguest"]' 'inguest-trap = ["dep:reverie-inguest", "dep:reverie-liteinst"]'
 row R8-T1-graph-resolves-liteinst 1 "T1:" "$id" trap "$trap_so" "$trap_sha" "$trap_log" "$scratch/src-t1" "${tgt[@]}"
+srccopy src-t17 'default = ["liteinst"]' 'default = []'
+row R17-T1-liteinst-graph-lacks-liteinst 1 "T1:" "$id" liteinst "$lite_so" "$lite_sha" "$lite_log" "$scratch/src-t17" "${tgt[@]}"
+srccopy src-t18 'inguest-trap = ["dep:reverie-inguest"]' 'inguest-trap = []'
+row R18-T1-trap-graph-lacks-inguest 1 "T1:" "$id" trap "$trap_so" "$trap_sha" "$trap_log" "$scratch/src-t18" "${tgt[@]}"
+
+# T2: a trap build log with its "Compiling reverie-inguest" line removed.
+grep -vE '^[[:space:]]*Compiling reverie-inguest v' "$trap_log" > "$scratch/trap-no-inguest.log"
+row R15-T2-log-never-compiled-inguest 1 "T2: the build log compiled reverie-inguest 0 times" \
+    "$id" trap "$trap_so" "$trap_sha" "$scratch/trap-no-inguest.log" "$src" "${tgt[@]}"
+
+# T3, liteinst side: a trap preload given as liteinst with the liteinst log
+# (T1 and T2 pass; only T3's liteinst arm can refuse).
+row R14-T3-trap-preload-as-liteinst 1 "T3: no reverie_liteinst symbol in a liteinst preload" \
+    "$id" liteinst "$trap_so" "$trap_sha" "$lite_log" "$src" "${tgt[@]}"
+
+# T3, inguest arm: a copy of the trap preload with every reverie_inguest
+# symbol removed from its symbol table, other symbols kept, given with its
+# own sha (T1 and T2 pass; only T3's inguest count can refuse).
+objcopy --wildcard --strip-symbol='*15reverie_inguest*' "$trap_so" "$scratch/no-inguest.so" 2> "$scratch/objcopy.err" || exit 2
+noin_sha=$(sha256sum "$scratch/no-inguest.so" | cut -d' ' -f1)
+if [ "$(nm --defined-only "$scratch/no-inguest.so" 2> /dev/null | grep -cF 15reverie_inguest)" -ne 0 ] \
+    || [ "$(nm --defined-only "$scratch/no-inguest.so" 2> /dev/null | wc -l)" -eq 0 ]; then
+    echo "FAIL R16 fixture: the copy should keep symbols and lose every reverie_inguest one"; exit 1
+fi
+row R16-T3-no-inguest-symbols 1 "T3: no reverie_inguest symbol" \
+    "$id" trap "$scratch/no-inguest.so" "$noin_sha" "$trap_log" "$src" "${tgt[@]}"
 
 # T3 UNAVAILABLE: a stripped copy, given with its own sha so T2 passes.
 cp "$trap_so" "$scratch/stripped.so" && strip --strip-all "$scratch/stripped.so" || exit 2
