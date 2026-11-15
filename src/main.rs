@@ -10,16 +10,22 @@
 
 mod arch;
 #[cfg(feature = "tool")]
+mod dead_base;
+#[cfg(feature = "tool")]
 mod exec_stage;
 mod refusal_log;
 mod side_log;
+#[cfg(test)]
+mod test_source;
 #[cfg(feature = "tool")]
 mod exec_state;
 #[cfg(feature = "tool")]
 mod fake_creds;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
-#[cfg(all(feature = "private-runtime", feature = "tool"))]
+// Test builds compile it too, for the wire-digest pin (C5d): the codec and
+// sha2 are dev-dependencies.
+#[cfg(all(feature = "tool", any(test, feature = "private-runtime")))]
 #[cfg_attr(not(test), allow(dead_code))] // Row e/f's launcher is the first non-test caller.
 mod initial_packet;
 #[cfg(all(test, feature = "private-runtime", feature = "tool"))]
@@ -38,6 +44,8 @@ mod preload_materialize;
 #[cfg(all(feature = "tool", any(feature = "in-guest", feature = "inguest-trap")))]
 mod preload_stamp;
 mod translate;
+#[cfg(feature = "tool")]
+mod wire_id;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

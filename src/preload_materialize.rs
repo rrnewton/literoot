@@ -619,6 +619,29 @@ mod tests {
         assert_eq!(lines.next(), None, "{text}");
     }
 
+    /// The blob build.rs embeds carries the record the launcher checks
+    /// before it spawns anything (crate::wire_id::check_preload): the same
+    /// .literoot_wire_id bytes as this build's WIRE_ID_RECORD. Red if the
+    /// preload loses the section or embeds a blob of another wire identity.
+    #[test]
+    fn embedded_preload_carries_this_builds_wire_id() {
+        let mut seen = 0;
+        for flavour in [Flavour::Liteinst, Flavour::TrapHost] {
+            let Some(embedded) = flavour.embedded() else {
+                continue;
+            };
+            seen += 1;
+            assert_eq!(
+                crate::wire_id::wire_id_of(embedded.bytes),
+                Ok(crate::wire_id::WIRE_ID_RECORD),
+                "{flavour:?}: the embedded blob's .literoot_wire_id record"
+            );
+        }
+        if cfg!(any(feature = "in-guest", feature = "inguest-trap")) {
+            assert!(seen > 0, "an in-guest build embeds at least one preload");
+        }
+    }
+
     fn denied_map(_: &File, _: usize) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::EPERM))
     }

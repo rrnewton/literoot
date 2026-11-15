@@ -393,7 +393,11 @@ fn explicit_linker_as_main_guest_view(
     let Some(target) = linker_target_arg(args) else {
         return false;
     };
-    let target_host = resolve_in_rootfs(config, cwd_guest, Path::new(target));
+    // A walk past 40 links cannot be inspected: classify it as uncertain,
+    // which caps (the launch itself then fails with ELOOP).
+    let Ok(target_host) = resolve_in_rootfs(config, cwd_guest, Path::new(target)) else {
+        return true;
+    };
     match read_elf_interp_bounded(&target_host) {
         InterpRead::Named(interp) => {
             if interp == guest_prog || interp == guest_found {
@@ -402,7 +406,9 @@ fn explicit_linker_as_main_guest_view(
             // Resolve the interpreter through the same guest view
             // (rootfs, binds, symlinks) before comparing: a guest
             // alias of the loader names the same host file.
-            let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&interp));
+            let Ok(interp_host) = resolve_in_rootfs(config, cwd_guest, Path::new(&interp)) else {
+                return true;
+            };
             interp_names_program(&interp_host.to_string_lossy(), host_prog)
         }
         InterpRead::Uncertain => true,
@@ -795,6 +801,11 @@ pub fn run_guest(
         ));
     }
     let in_guest = backend != "ptrace";
+    // C5.6: the in-guest backends' best-effort checks, disclosed once each
+    // in the side log as soon as the backend is known; never on ptrace.
+    if in_guest {
+        crate::side_log::scope_lines();
+    }
     // Resolve a relative -w against the host cwd's guest view
     // (proot: `-w .` keeps $PWD), then apply the missing-dir
     // fallback to "/" (proot rule).
@@ -814,12 +825,18 @@ pub fn run_guest(
         };
         &cwd_owned
     };
-    let cwd_effective: &Path = if config.translate(cwd_guest, Path::new("/"), None).is_dir() {
+    // The launch directory as the kernel will hold it: -w's links,
+    // the final one included, resolved through the guest root, never
+    // left for the kernel to follow in the host's namespace.
+    let launch = crate::rootfs_tool::launch_dir(config, cwd_guest);
+    let cwd_effective: &Path = if launch.is_some() {
         cwd_guest
     } else {
         Path::new("/")
     };
     let cwd_guest = cwd_effective;
+    let (launch_host, launch_guest) =
+        launch.unwrap_or_else(|| (config.rootfs.clone(), PathBuf::from("/")));
     let cfg = LiterootConfig {
         rootfs: config.rootfs.to_string_lossy().into_owned(),
         binds: config
@@ -833,7 +850,7 @@ pub fn run_guest(
                 )
             })
             .collect(),
-        cwd: cwd_guest.to_string_lossy().into_owned(),
+        cwd: launch_guest.to_string_lossy().into_owned(),
         fake_root: config.fake_root,
         fake_uid: config.fake_ids.map(|(u, _)| u),
         fake_gid: config.fake_ids.map(|(_, g)| g),
@@ -844,6 +861,7 @@ pub fn run_guest(
         kompat_force: std::env::var_os("PROOT_FORCE_KOMPAT").is_some(),
         post_exec_at_exec_stop: !in_guest,
         refuse_guest_ptrace: in_guest,
+        refuse_guest_dispatch: in_guest,
         initial_exe: String::new(),
         initial_argv: Vec::new(),
         initial_stack_limit: None,
@@ -882,19 +900,20 @@ pub fn run_guest(
     set_config(cfg.clone());
     // Execute permission is checked by the kernel on the real
     // execve; our interp/shebang routes would bypass it, so
-    // check here (test-rootfs-shebang-exec, execve EACCES).
-    {
+    // check here (test-rootfs-shebang-exec, execve EACCES). A walk
+    // past 40 links fails here too, as the kernel's ELOOP.
+    let host_prog = {
         use std::os::unix::fs::PermissionsExt as _;
-        match std::fs::metadata(&host_prog) {
-            Ok(md) if md.is_dir() => {
+        match host_prog.and_then(|host| std::fs::metadata(&host).map(|md| (host, md))) {
+            Ok((_, md)) if md.is_dir() => {
                 command_not_runnable();
                 return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
-            Ok(md) if md.permissions().mode() & 0o111 == 0 => {
+            Ok((_, md)) if md.permissions().mode() & 0o111 == 0 => {
                 command_not_runnable();
                 return Err(format!("literoot: {guest_prog}: Permission denied"));
             }
-            Ok(_) => {}
+            Ok((host, _)) => host,
             Err(e) => {
                 if path_error_is_not_runnable(&e) {
                     command_not_runnable();
@@ -902,7 +921,7 @@ pub fn run_guest(
                 return Err(format!("literoot: {guest_prog}: {e}"));
             }
         }
-    }
+    };
     // Shebang scripts: exec the guest interpreter with the
     // script's guest path (argv0 fidelity: $0 is the script as
     // spelled, e.g. through a symlink — test-symlink-script-argv0).
@@ -911,20 +930,20 @@ pub fn run_guest(
         .filter(|img| !img.starts_with(b"\x7fELF"))
         .and_then(|img| parse_shebang_pub(&img));
     if let Some((script_interp, script_opt)) = shebang {
+        let interp_host = launch_walk(config, cwd_guest, &script_interp)?;
         // Self-referential shebang: the kernel would ELOOP.
-        if resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp)) == host_prog {
+        if interp_host == host_prog {
             eprintln!("literoot: {guest_prog}: Too many levels of symbolic links");
             command_not_runnable();
             return Err("Too many levels of symbolic links".into());
         }
-        let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(&script_interp));
         let interp_interp = std::fs::read(&interp_host)
             .ok()
             .and_then(|img| crate::translate::elf_interp(&img));
         let mut has_loader = interp_interp.is_some();
         let mut cmd = match interp_interp {
             Some(ld) => {
-                let ld_host = resolve_in_rootfs(config, cwd_guest, Path::new(&ld));
+                let ld_host = launch_walk(config, cwd_guest, &ld)?;
                 let mut c = reverie::process::Command::new(&ld_host);
                 c.arg0(&ld);
                 c.arg(&script_interp);
@@ -947,12 +966,7 @@ pub fn run_guest(
         for a in command.iter().skip(1) {
             cmd.arg(a);
         }
-        let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
-        let host_cwd = if host_cwd.is_dir() {
-            host_cwd
-        } else {
-            config.rootfs.clone()
-        };
+        let host_cwd = launch_host.clone();
         // A script naming ld.so itself as its interpreter
         // (`#!<ld.so> <dynamic-program>`) is explicit linker-as-main
         // too: classify it in the same host view, over the exact
@@ -1016,12 +1030,7 @@ pub fn run_guest(
     // below; classify it as loader-as-main too, in the
     // effective host view the backend admission uses (the host
     // current directory the command below is given).
-    let host_cwd = config.translate(cwd_guest, Path::new("/"), None);
-    let host_cwd = if host_cwd.is_dir() {
-        host_cwd
-    } else {
-        config.rootfs.clone()
-    };
+    let host_cwd = launch_host.clone();
     let explicit_linker = prog_interp.is_none()
         && (explicit_linker_as_main(
             &host_prog,
@@ -1047,7 +1056,7 @@ pub fn run_guest(
     let has_loader = interp_guest.is_some() || explicit_linker;
     let mut cmd = match &interp_guest {
         Some(interp) => {
-            let interp_host = resolve_in_rootfs(config, cwd_guest, Path::new(interp));
+            let interp_host = launch_walk(config, cwd_guest, interp)?;
             let mut c = reverie::process::Command::new(&interp_host);
             c.arg0(interp);
             c.arg(&guest_found);
@@ -1186,8 +1195,18 @@ fn run_backend(
         // that actually spawns watched; asserting it here would
         // arm the guest's exec forwarding with no watcher to
         // re-bootstrap successors.
+        // Both exist only in the builds with an in-guest backend, the
+        // only users of the selector.
+        #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
         let watched = false;
-        let selector = crate::rootfs_tool::tool_selector(watched).to_vec();
+        // The selector carries this build's wire identity, which the
+        // preload checks before it arms (wire_id::split_selector).
+        #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+        let selector = crate::wire_id::selector_with_identity(
+            std::str::from_utf8(crate::rootfs_tool::tool_selector(watched))
+                .expect("tool selectors are ASCII"),
+        )
+        .into_bytes();
         // Same Tool, hosted in-guest via the literoot preload. The
         // trap backend prefers Reverie's TrapHost launcher when this
         // build has it (inguest-trap): zero ptrace, no site patching.
@@ -1197,6 +1216,9 @@ fn run_backend(
         if backend == "trap" {
             let preload = select_preload(crate::preload_materialize::Flavour::TrapHost)?;
             crate::side_log::route("preload");
+            // Before anything is spawned: the preload must carry this
+            // build's wire identity (config layout and refusal schema).
+            crate::wire_id::check_preload(&preload)?;
             let (output, _global) = runtime.block_on(async {
                 reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
                     RootfsTool,
@@ -1227,6 +1249,7 @@ fn run_backend(
             );
             let preload = select_preload(crate::preload_materialize::Flavour::Liteinst)?;
             crate::side_log::route("preload");
+            crate::wire_id::check_preload(&preload)?;
             let (output, _global) = runtime.block_on(async {
                 reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
                     cmd,
@@ -1677,25 +1700,37 @@ fn classify_kill_wait_error(error: &reverie::Error) -> KillWaitErrorClass {
 /// Resolve a guest program path to a host executable, following
 /// symlinks *inside* the rootfs (an absolute symlink such as
 /// Alpine's `/bin/sh -> /bin/busybox` must restart in the rootfs,
-/// never escape to the host — design §4.2).
-fn resolve_in_rootfs(config: &RootConfig, cwd_guest: &Path, guest: &Path) -> PathBuf {
-    let mut guest = guest.to_path_buf();
-    for _ in 0..40 {
-        let host = config.translate(&guest, cwd_guest, None);
-        match std::fs::read_link(&host) {
-            Ok(target) if target.is_absolute() => guest = target,
-            Ok(target) => {
-                let mut next = guest
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("/"));
-                next.push(target);
-                guest = next;
-            }
-            Err(_) => return host,
-        }
-    }
-    config.translate(&guest, cwd_guest, None)
+/// never escape to the host — design §4.2). One walk with the guest's
+/// own budget: intermediate and final links count together, and past 40
+/// the launch fails with ELOOP rather than handing the host kernel a
+/// path that still holds a link.
+fn resolve_in_rootfs(
+    config: &RootConfig,
+    cwd_guest: &Path,
+    guest: &Path,
+) -> std::io::Result<PathBuf> {
+    // The launcher walks on its own behalf: through /proc, only its own
+    // process's links count as its (see GuestProcLinks).
+    // SAFETY: gettid has no preconditions.
+    let tid = unsafe { libc::gettid() };
+    let proc = crate::rootfs_tool::GuestProcLinks::new(config, std::process::id() as i32, tid);
+    crate::rootfs_tool::follow_guest_path_from(config, &proc, cwd_guest, guest).map_err(|e| {
+        std::io::Error::from_raw_os_error(match e {
+            crate::translate::WalkError::TooManyLinks => libc::ELOOP,
+            crate::translate::WalkError::Refused(_) => libc::EACCES,
+            crate::translate::WalkError::Kernel(e) => e,
+        })
+    })
+}
+
+/// [`resolve_in_rootfs`] for an interpreter or loader the launch execs: a
+/// walk past 40 links refuses the launch by name, as a native execve
+/// fails with ELOOP when its interpreter's walk does.
+fn launch_walk(config: &RootConfig, cwd_guest: &Path, guest: &str) -> Result<PathBuf, String> {
+    resolve_in_rootfs(config, cwd_guest, Path::new(guest)).map_err(|e| {
+        command_not_runnable();
+        format!("literoot: {guest}: {e}")
+    })
 }
 
 /// The first PATH candidate that is a regular file, as its guest path.
@@ -1719,8 +1754,9 @@ fn find_guest_in_path(
             continue;
         }
         let guest = Path::new(dir).join(prog);
-        let cand = config.translate(&guest, cwd_guest, None);
-        match std::fs::metadata(&cand) {
+        // The candidate as the guest sees it: its links followed through
+        // the guest root, never by the host kernel.
+        match resolve_in_rootfs(config, cwd_guest, &guest).and_then(std::fs::metadata) {
             Ok(md) if md.is_file() => return Ok(Some(guest.to_string_lossy().into_owned())),
             Ok(_) => {}
             Err(e) if path_error_is_not_runnable(&e) => {}

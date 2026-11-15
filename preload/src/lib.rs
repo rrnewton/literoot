@@ -43,6 +43,8 @@ compile_error!(
 
 #[path = "../../src/arch.rs"]
 mod arch;
+#[path = "../../src/dead_base.rs"]
+mod dead_base;
 mod exec_stage;
 #[path = "../../src/exec_state.rs"]
 mod exec_state;
@@ -63,6 +65,10 @@ mod mapped_entry;
 mod mapped_initial_entry;
 #[path = "../../src/refusal_log.rs"]
 mod refusal_log;
+// The LD_PRELOAD constructor's checks before arming; the musl mapped
+// image has no constructor.
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
+mod prearm;
 mod reporting;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
@@ -71,8 +77,20 @@ mod runtime_memfds;
 #[path = "../../src/shared_record.rs"]
 #[allow(dead_code)] // Future shared-record transports are the first production callers.
 mod shared_record;
+#[cfg(test)]
+#[path = "../../src/test_source.rs"]
+mod test_source;
 #[path = "../../src/translate.rs"]
 mod translate;
+#[path = "../../src/wire_id.rs"]
+mod wire_id;
+
+/// This build's wire identity record, which the launcher reads from the
+/// library file before it spawns anything (wire_id::check_preload). The
+/// constructor's selector check reads it too, so the linker keeps it.
+#[used]
+#[unsafe(link_section = ".literoot_wire_id")]
+static WIRE_ID: [u8; wire_id::WIRE_ID_LEN] = wire_id::WIRE_ID_RECORD;
 
 use std::mem::MaybeUninit;
 
@@ -193,6 +211,15 @@ unsafe extern "C" fn initialize(
     // one-shot or each image's first guest execve would skip
     // translation (see rootfs_tool::mark_launcher_exec_seen).
     rootfs_tool::mark_launcher_exec_seen();
+    // Before arming: one status read (Threads: 1, and the filter count P),
+    // the dispatch OFF call for this thread, and the expected filter count
+    // once Reverie's single in-process install has run (P + 1). The
+    // Threads: 1 check and the OFF call are best-effort; defeatable by code
+    // that runs before the preload's constructor (LD_PRELOAD window).
+    match prearm::check_before_arming() {
+        Ok(expected) => rootfs_tool::set_filter_baseline(expected),
+        Err(reason) => fail(reason),
+    }
     #[cfg(feature = "inguest-trap")]
     {
         let bootstrap = match unsafe { reverie_inguest::bootstrap::take_preload_bootstrap() } {
@@ -202,37 +229,37 @@ unsafe extern "C" fn initialize(
         };
         // Before installation: hide the shared memfds' numbers.
         runtime_memfds::adopt_at_image_start();
-        let selected = match String::from_utf8(bootstrap.tool_data) {
-            Ok(selected) => selected,
-            Err(_) => fail("tool selector is not valid UTF-8"),
-        };
-        let armed = match rootfs_tool::exec_watch_for_selector(&selected) {
-            Ok(armed) => armed,
-            Err(msg) => fail(&msg),
-        };
-        let socket = bootstrap.coordinator;
-        let result = match selected.as_str() {
-            "literoot" | "literoot-watched" => unsafe {
-                reverie_inguest::guest::tool_install::install_tool_with::<
-                    reporting::ReportingTool,
-                    _,
-                >(
-                    &socket,
-                    false,
-                    reverie_inguest::guest::tool_install::TrapHost::new(
-                        reverie_inguest::guest::tool_install::TrapOptions {
-                            exec_watch: armed,
-                            ..Default::default()
-                        },
-                    ),
-                )
-            },
-            other => fail(&format!(
-                "unknown tool selector {other:?} (expected \"literoot\")"
-            )),
-        };
-        if let Err(error) = result {
-            fail(&format!("install literoot tool: {error}"));
+        // The launcher's wire identity (config layout and refusal schema),
+        // checked before the selector is read and before anything connects
+        // or decodes: a launcher from another build is refused by name.
+        let _ = std::hint::black_box(&WIRE_ID);
+        let armed = wire_id::arm_with(bootstrap.tool_data, |selected| {
+            let armed = rootfs_tool::exec_watch_for_selector(selected)?;
+            let socket = bootstrap.coordinator;
+            match selected {
+                "literoot" | "literoot-watched" => unsafe {
+                    reverie_inguest::guest::tool_install::install_tool_with::<
+                        reporting::ReportingTool,
+                        _,
+                    >(
+                        &socket,
+                        false,
+                        reverie_inguest::guest::tool_install::TrapHost::new(
+                            reverie_inguest::guest::tool_install::TrapOptions {
+                                exec_watch: armed,
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                }
+                .map_err(|error| format!("install literoot tool: {error}")),
+                other => Err(format!(
+                    "unknown tool selector {other:?} (expected \"literoot\")"
+                )),
+            }
+        });
+        if let Err(msg) = armed {
+            fail(&msg);
         }
     }
     #[cfg(not(feature = "inguest-trap"))]
@@ -244,35 +271,35 @@ unsafe extern "C" fn initialize(
         };
         // Before installation: hide the shared memfds' numbers.
         runtime_memfds::adopt_at_image_start();
-        let selected = match String::from_utf8(bootstrap.tool_data) {
-            Ok(selected) => selected,
-            Err(_) => fail("tool selector is not valid UTF-8"),
-        };
-        // Watched mode is TrapHost-only: the liteinst runtime's
-        // exec_watch knob is not reachable from literoot, so an
-        // asserted watched launch against this flavour refuses
-        // by name instead of silently running unarmed.
-        let armed = match rootfs_tool::exec_watch_for_selector(&selected) {
-            Ok(armed) => armed,
-            Err(msg) => fail(&msg),
-        };
-        if armed {
-            fail(
-                "launcher asserted watched mode but this preload is the \
-                 liteinst flavour; exec-watch arming is TrapHost-only",
-            );
-        }
-        let socket = bootstrap.coordinator;
-        let result = match selected.as_str() {
-            "literoot" => unsafe {
-                reverie_liteinst::install_tool_from_bootstrap::<reporting::ReportingTool>(&socket)
-            },
-            other => fail(&format!(
-                "unknown tool selector {other:?} (expected \"literoot\")"
-            )),
-        };
-        if let Err(error) = result {
-            fail(&format!("install literoot tool: {error}"));
+        // The launcher's wire identity (config layout and refusal schema),
+        // checked before the selector is read and before anything connects
+        // or decodes: a launcher from another build is refused by name.
+        let _ = std::hint::black_box(&WIRE_ID);
+        let armed = wire_id::arm_with(bootstrap.tool_data, |selected| {
+            // Watched mode is TrapHost-only: the liteinst runtime's
+            // exec_watch knob is not reachable from literoot, so an
+            // asserted watched launch against this flavour refuses
+            // by name instead of silently running unarmed.
+            if rootfs_tool::exec_watch_for_selector(selected)? {
+                return Err("launcher asserted watched mode but this preload is the \
+                            liteinst flavour; exec-watch arming is TrapHost-only"
+                    .to_owned());
+            }
+            let socket = bootstrap.coordinator;
+            match selected {
+                "literoot" => unsafe {
+                    reverie_liteinst::install_tool_from_bootstrap::<reporting::ReportingTool>(
+                        &socket,
+                    )
+                }
+                .map_err(|error| format!("install literoot tool: {error}")),
+                other => Err(format!(
+                    "unknown tool selector {other:?} (expected \"literoot\")"
+                )),
+            }
+        });
+        if let Err(msg) = armed {
+            fail(&msg);
         }
     }
 }
@@ -321,6 +348,7 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
         kompat_force,
         post_exec_at_exec_stop,
         refuse_guest_ptrace,
+        refuse_guest_dispatch,
         initial_exe,
         initial_argv,
         initial_stack_limit,
@@ -337,6 +365,7 @@ fn config_eq(a: &rootfs_tool::LiterootConfig, b: &rootfs_tool::LiterootConfig) -
         && *kompat_force == b.kompat_force
         && *post_exec_at_exec_stop == b.post_exec_at_exec_stop
         && *refuse_guest_ptrace == b.refuse_guest_ptrace
+        && *refuse_guest_dispatch == b.refuse_guest_dispatch
         && *initial_exe == b.initial_exe
         && *initial_argv == b.initial_argv
         && *initial_stack_limit == b.initial_stack_limit
@@ -351,6 +380,11 @@ fn decode_successor_state(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     let tool = rootfs_tool::RootfsTool::from_exec_state(state, &config.to_root_config())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    // The mapped route's filter-count baseline is fixed at 1: the image
+    // controller arms only with Reverie's single launcher-installed filter
+    // (R guest/exec_private.rs:1822, 1915), and no constructor runs here.
+    // Not wired yet: no successor transport reaches this consumer.
+    rootfs_tool::set_filter_baseline(1);
     Ok((
         reporting::ReportingTool::wrapping(tool),
         rootfs_tool::RootfsThreadState::default(),
@@ -556,6 +590,7 @@ mod successor_tests {
             kompat_force: false,
             post_exec_at_exec_stop: false,
             refuse_guest_ptrace: true,
+            refuse_guest_dispatch: true,
             initial_exe: "/bin/sh".to_string(),
             initial_argv: vec!["sh".to_string()],
             initial_stack_limit: None,
@@ -601,6 +636,9 @@ mod successor_tests {
         mutations.push(c);
         let mut c = launched_config();
         c.refuse_guest_ptrace = false;
+        mutations.push(c);
+        let mut c = launched_config();
+        c.refuse_guest_dispatch = false;
         mutations.push(c);
         for (i, mutant) in mutations.iter().enumerate() {
             assert!(
@@ -726,5 +764,25 @@ mod first_image_source_tests {
             .find(|line| !line.is_empty() && !line.starts_with("//"))
             .expect("the initializer body has a statement");
         assert_eq!(first, call);
+    }
+}
+
+#[cfg(test)]
+mod wire_id_tests {
+    /// C5d: the record this library carries is the launcher's constant. Both
+    /// builds compile the one shared src/wire_id.rs, so the bytes the launcher
+    /// reads from `.literoot_wire_id` are its own LITEROOT_WIRE_DIGEST.
+    #[test]
+    fn preload_reads_the_same_wire_digest() {
+        let record = super::WIRE_ID;
+        assert_eq!(&record[..16], super::wire_id::WIRE_ID_MAGIC);
+        assert_eq!(record[16..20], super::wire_id::REFUSAL_RPC_REVISION.to_le_bytes());
+        assert_eq!(record[20..], super::wire_id::LITEROOT_WIRE_DIGEST);
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source.matches("#[path = \"../../src/wire_id.rs\"]\nmod wire_id;").count(),
+            1,
+            "the preload's wire_id is the shared file, not a copy"
+        );
     }
 }

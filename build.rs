@@ -47,6 +47,7 @@ const RERUN_PATHS: &[&str] = &[
     "preload/build.rs",
     "preload/src",
     "src/arch.rs",
+    "src/dead_base.rs",
     "src/exec_state.rs",
     "src/fake_creds.rs",
     "src/initial_packet.rs",
@@ -54,7 +55,9 @@ const RERUN_PATHS: &[&str] = &[
     "src/refusal_log.rs",
     "src/rootfs_tool.rs",
     "src/shared_record.rs",
+    "src/test_source.rs",
     "src/translate.rs",
+    "src/wire_id.rs",
 ];
 
 /// Every variable this script reads or deliberately passes to the child.

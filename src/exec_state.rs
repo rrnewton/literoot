@@ -30,8 +30,9 @@ use crate::translate::RootConfig;
 /// Wire magic ("LRX1").
 pub const MAGIC: &[u8; 4] = b"LRX1";
 /// Only supported wire version. Version 2 added each listing's
-/// directory identity (`dirent_obj`); version 1 is refused.
-pub const VERSION: u16 = 2;
+/// directory identity (`dirent_obj`); version 3 the S.3 record's lifetime
+/// part (`record`), which exec keeps. Versions 1 and 2 are refused.
+pub const VERSION: u16 = 3;
 /// Hard cap on the encoded payload (aligned with the native
 /// route's successor-state cap). Capture refuses by name above
 /// this rather than truncating: a truncated fd map changes `*at`
@@ -40,6 +41,9 @@ pub const MAX_ENCODED_BYTES: usize = 1024 * 1024;
 
 const FLAG_HAS_FAKE: u16 = 1 << 0;
 const FLAG_HAS_ROOT_OVERRIDE: u16 = 1 << 1;
+/// `exe_guest` is a host path (`ProcState::exe_host`). A flag with no
+/// payload of its own: a record without it reads as before.
+const FLAG_EXE_HOST: u16 = 1 << 2;
 const CWD_SENTINEL: &[u8] = b"/__literoot_unset__";
 
 /// Canonical exec-continuity snapshot. Path-like fields are raw
@@ -52,6 +56,9 @@ pub struct ExecState {
     pub fds: Vec<(i32, Vec<u8>)>,
     pub fake: Option<[u32; 6]>,
     pub exe_guest: Vec<u8>,
+    /// `exe_guest` is a host path, with no guest name.
+    #[serde(default)]
+    pub exe_host: bool,
     pub argv: Vec<Vec<u8>>,
     pub virtual_fds: Vec<(i32, Vec<u8>, bool)>,
     pub dirent_pending: Vec<(i32, Vec<u8>)>,
@@ -61,6 +68,87 @@ pub struct ExecState {
     /// directory dup'd onto the number.
     #[serde(default)]
     pub dirent_obj: Vec<(i32, u64, u64)>,
+    /// The S.3 record's lifetime part, which exec keeps:
+    /// applied only by the successor constructor, never at a fork restore
+    /// (a fork seed carries the default).
+    #[serde(default)]
+    pub record: LifetimeRecord,
+}
+
+/// The lifetime part of a process's S.3 record: the flag, both exit
+/// summaries' counters, and whether they were emitted. The transient
+/// admission state (probes in flight, installs pending), the per-image
+/// baseline and the kernel metadata are not carried: exec resets them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifetimeRecord {
+    pub guest_filter: bool,
+    pub flag: crate::dead_base::FlagState,
+    pub installs: u64,
+    pub installs_refused: u64,
+    pub translated: u64,
+    pub refused: u64,
+    pub unseen_best_effort: u64,
+    pub probes: u64,
+    pub sud_refused: u64,
+    pub sud_fallback: u64,
+    pub summary_emitted: bool,
+}
+
+impl LifetimeRecord {
+    /// The part of `a` exec keeps. An install still pending in another
+    /// thread ends with that thread in the exec (de_thread): its result is
+    /// unknown, so the flag is set conservatively.
+    pub fn of(a: &crate::dead_base::Admission) -> Self {
+        let guest_filter = a.guest_filter || a.install_pending > 0;
+        let flag = match a.flag {
+            crate::dead_base::FlagState::None if guest_filter => crate::dead_base::FlagState::Installed,
+            flag => flag,
+        };
+        Self {
+            guest_filter,
+            flag,
+            installs: a.installs,
+            installs_refused: a.installs_refused,
+            translated: a.translated,
+            refused: a.refused,
+            unseen_best_effort: a.unseen_best_effort,
+            probes: a.probes,
+            sud_refused: a.sud_refused,
+            sud_fallback: a.sud_fallback,
+            summary_emitted: a.summary_emitted,
+        }
+    }
+
+    /// The record a successor image starts with.
+    pub fn admission(self) -> crate::dead_base::Admission {
+        crate::dead_base::Admission {
+            guest_filter: self.guest_filter,
+            flag: self.flag,
+            installs: self.installs,
+            installs_refused: self.installs_refused,
+            translated: self.translated,
+            refused: self.refused,
+            unseen_best_effort: self.unseen_best_effort,
+            probes: self.probes,
+            sud_refused: self.sud_refused,
+            sud_fallback: self.sud_fallback,
+            summary_emitted: self.summary_emitted,
+            ..Default::default()
+        }
+    }
+
+    fn counters(&self) -> [u64; 8] {
+        [
+            self.installs,
+            self.installs_refused,
+            self.translated,
+            self.refused,
+            self.unseen_best_effort,
+            self.probes,
+            self.sud_refused,
+            self.sud_fallback,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,11 +286,13 @@ impl ExecState {
             fds,
             fake: st.fake,
             exe_guest,
+            exe_host: st.exe_host,
             argv: st.argv.clone(),
             virtual_fds,
             dirent_pending,
             dirent_seen,
             dirent_obj,
+            record: LifetimeRecord::of(&st.admission),
         }
     }
 
@@ -238,6 +328,9 @@ impl ExecState {
         let mut seed = Self::capture(st, files, cfg);
         seed.exe_guest = current_exe.as_os_str().as_bytes().to_vec();
         seed.argv = current_argv.to_vec();
+        // A fork child's record is a new group's (its first thread's
+        // start), never its parent's.
+        seed.record = LifetimeRecord::default();
         seed
     }
 
@@ -279,6 +372,7 @@ impl ExecState {
         };
         st.fake = self.fake;
         st.exe_guest = path_from_bytes(&self.exe_guest);
+        st.exe_host = self.exe_host;
         st.argv = self.argv.clone();
         // One stream per number with listing state, holding all of it,
         // the directory identity included (R8).
@@ -390,6 +484,9 @@ impl ExecState {
         if s.root_override.is_some() {
             flags |= FLAG_HAS_ROOT_OVERRIDE;
         }
+        if s.exe_host {
+            flags |= FLAG_EXE_HOST;
+        }
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -438,6 +535,17 @@ impl ExecState {
             out.extend_from_slice(&dev.to_le_bytes());
             out.extend_from_slice(&ino.to_le_bytes());
         }
+        let record = &s.record;
+        out.push(u8::from(record.guest_filter));
+        out.push(match record.flag {
+            crate::dead_base::FlagState::None => 0,
+            crate::dead_base::FlagState::Installed => 1,
+            crate::dead_base::FlagState::Inherited => 2,
+        });
+        for v in record.counters() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push(u8::from(record.summary_emitted));
         if out.len() > MAX_ENCODED_BYTES {
             return Err(ExecStateError::TooLarge);
         }
@@ -462,7 +570,7 @@ impl ExecState {
             return Err(ExecStateError::UnsupportedVersion(version));
         }
         let flags = r.u16()?;
-        if flags & !(FLAG_HAS_FAKE | FLAG_HAS_ROOT_OVERRIDE) != 0 {
+        if flags & !(FLAG_HAS_FAKE | FLAG_HAS_ROOT_OVERRIDE | FLAG_EXE_HOST) != 0 {
             return Err(ExecStateError::Malformed);
         }
         let cwd = r.bytes()?.to_vec();
@@ -482,6 +590,7 @@ impl ExecState {
             None
         };
         let exe_guest = r.bytes()?.to_vec();
+        let exe_host = flags & FLAG_EXE_HOST != 0;
         let argv = r.byte_list()?;
         let n_virtual = r.count()?;
         let mut virtual_fds = Vec::new();
@@ -517,6 +626,38 @@ impl ExecState {
             let ino = r.u64()?;
             dirent_obj.push((fd, dev, ino));
         }
+        let flag_byte = |b: u8| match b {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ExecStateError::Malformed),
+        };
+        let guest_filter = flag_byte(r.take(1)?[0])?;
+        let flag = match r.take(1)?[0] {
+            0 => crate::dead_base::FlagState::None,
+            1 => crate::dead_base::FlagState::Installed,
+            2 => crate::dead_base::FlagState::Inherited,
+            _ => return Err(ExecStateError::Malformed),
+        };
+        let mut counters = [0u64; 8];
+        for v in &mut counters {
+            *v = r.u64()?;
+        }
+        let summary_emitted = flag_byte(r.take(1)?[0])?;
+        let [installs, installs_refused, translated, refused, unseen_best_effort, probes, sud_refused, sud_fallback] =
+            counters;
+        let record = LifetimeRecord {
+            guest_filter,
+            flag,
+            installs,
+            installs_refused,
+            translated,
+            refused,
+            unseen_best_effort,
+            probes,
+            sud_refused,
+            sud_fallback,
+            summary_emitted,
+        };
         if r.pos != bytes.len() {
             return Err(ExecStateError::TrailingBytes);
         }
@@ -526,11 +667,13 @@ impl ExecState {
             fds,
             fake,
             exe_guest,
+            exe_host,
             argv,
             virtual_fds,
             dirent_pending,
             dirent_seen,
             dirent_obj,
+            record,
         };
         state.validate_guest_paths()?;
         Ok(state)
@@ -670,11 +813,25 @@ mod tests {
             ],
             fake: Some([1000, 0, 0, 100, 0, 100]),
             exe_guest: b"/bin/sh".to_vec(),
+            exe_host: false,
             argv: vec![b"sh".to_vec(), b"-c".to_vec(), b"echo hi".to_vec()],
             virtual_fds: vec![(4, b"/virt".to_vec(), true), (8, b"/v2".to_vec(), false)],
             dirent_pending: vec![(4, vec![1, 2, 3, 0, 255])],
             dirent_seen: vec![(4, vec![b"alpha".to_vec(), b"beta".to_vec()]), (9, vec![])],
             dirent_obj: vec![(4, 0x801, u64::MAX), (9, 0, 0)],
+            record: LifetimeRecord {
+                guest_filter: true,
+                flag: crate::dead_base::FlagState::Inherited,
+                installs: 11,
+                installs_refused: 12,
+                translated: 13,
+                refused: 14,
+                unseen_best_effort: 15,
+                probes: 16,
+                sud_refused: 17,
+                sud_fallback: 18,
+                summary_emitted: false,
+            },
         }
     }
 
@@ -699,11 +856,15 @@ mod tests {
             free_scratch: vec![0x1000],
             getcwd_scratch: Some(0x2000),
             exe_guest: PathBuf::from("/bin/sh"),
+            exe_host: false,
             argv: vec![b"sh".to_vec()],
             fake: None,
             fake_fs: None,
             dispatch_seq: 7,
             translate_memo: Vec::new(),
+            searched_bases: Vec::new(),
+            gate_closed_at: None,
+            admission: Default::default(),
             config_memo: None,
             pending_stack_limit: None,
             initial_stack_limit_consumed: false,
@@ -725,6 +886,30 @@ mod tests {
         let bytes = s.encode().expect("encode full");
         assert_eq!(&bytes[0..4], MAGIC);
         assert_eq!(ExecState::decode(&bytes).expect("decode full"), s);
+    }
+
+    /// The exe-host flag survives exec: set,
+    /// it is encoded as its bit and read back; clear, the bytes are those
+    /// of a record from before it; capture and apply carry it.
+    #[test]
+    fn exe_host_flag_round_trips() {
+        let mut s = minimal_state();
+        let plain = s.encode().expect("encode plain");
+        s.exe_host = true;
+        let flagged = s.encode().expect("encode flagged");
+        assert_eq!(u16::from_le_bytes([plain[6], plain[7]]) & FLAG_EXE_HOST, 0);
+        assert_eq!(u16::from_le_bytes([flagged[6], flagged[7]]) & FLAG_EXE_HOST, FLAG_EXE_HOST);
+        assert_eq!(plain.len(), flagged.len(), "the flag has no payload");
+        assert!(ExecState::decode(&flagged).expect("decode flagged").exe_host);
+        assert!(!ExecState::decode(&plain).expect("decode plain").exe_host);
+        let mut st = proc_state();
+        st.exe_host = true;
+        let cap = ExecState::capture(&st, MAIN_FILES, &cfg("/work/dir"));
+        assert!(cap.exe_host);
+        let mut fresh = proc_state();
+        cap.apply_to(&mut fresh, &RootConfig::new(PathBuf::from("/"), Vec::new()))
+            .expect("apply");
+        assert!(fresh.exe_host);
     }
 
     #[test]
@@ -803,8 +988,9 @@ mod tests {
         let mut bytes = minimal_state().encode().expect("encode");
         bytes[0] = b'X';
         assert_eq!(ExecState::decode(&bytes), Err(ExecStateError::BadMagic));
-        // Version 1 (no directory identities) and anything newer refuse.
-        for v in [1u8, 3] {
+        // Version 1 (no directory identities), version 2 (no S.3 record)
+        // and anything newer refuse.
+        for v in [1u8, 2, 4] {
             let mut bytes = minimal_state().encode().expect("encode");
             bytes[4] = v;
             bytes[5] = 0;
@@ -853,7 +1039,92 @@ mod tests {
         for _ in 0..5 {
             out.extend_from_slice(&0u32.to_le_bytes());
         }
+        // The default record: flags 0, eight zero counters, not emitted.
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&[0; 64]);
+        out.push(0);
         out
+    }
+
+    /// Exec keeps both summaries' lifetime counters and the flag, every
+    /// field with its own value; a malformed flag byte refuses.
+    #[test]
+    fn exec_state_v3_round_trip_keeps_both_summaries_lifetime_counts() {
+        for flag in crate::dead_base::FLAG_STATES {
+            let mut s = minimal_state();
+            s.record = LifetimeRecord {
+                guest_filter: flag != crate::dead_base::FlagState::None,
+                flag,
+                installs: 1,
+                installs_refused: 2,
+                translated: 3,
+                refused: 4,
+                unseen_best_effort: 5,
+                probes: 6,
+                sud_refused: 7,
+                sud_fallback: u64::MAX,
+                summary_emitted: true,
+            };
+            let bytes = s.encode().expect("encode");
+            assert_eq!(ExecState::decode(&bytes).expect("decode"), s);
+            let a = s.record.admission();
+            assert_eq!(LifetimeRecord::of(&a), s.record);
+            assert!(a.in_flight.is_empty() && a.install_pending == 0 && a.kernel_id.is_none());
+        }
+        let mut bytes = minimal_state().encode().expect("encode");
+        let flag_at = bytes.len() - 1 - 64 - 1;
+        bytes[flag_at] = 3;
+        assert_eq!(ExecState::decode(&bytes), Err(ExecStateError::Malformed));
+    }
+
+    /// An install pending at exec flags the record conservatively.
+    #[test]
+    fn exec_record_flags_a_pending_install() {
+        let mut a = crate::dead_base::Admission::default();
+        let _t = a.begin_install().unwrap();
+        let r = LifetimeRecord::of(&a);
+        assert!(r.guest_filter && r.flag == crate::dead_base::FlagState::Installed);
+        assert_eq!(r.installs, 1);
+    }
+
+    /// A fork seed carries no record: the child starts a new group.
+    /// R3.4: a fork child's restore (consume_pending's `apply_to`) never
+    /// applies an exec state's record, even one that carries counters: the
+    /// child's record is a new group's, set at its first thread's start.
+    /// Only the successor constructor (`RootfsTool::from_exec_state`)
+    /// applies it.
+    #[test]
+    fn fork_restore_does_not_apply_the_record() {
+        let mut st = proc_state();
+        let state = ExecState {
+            cwd: b"/work".to_vec(),
+            exe_guest: b"/bin/sh".to_vec(),
+            record: LifetimeRecord {
+                guest_filter: true,
+                flag: crate::dead_base::FlagState::Installed,
+                installs: 4,
+                probes: 9,
+                summary_emitted: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let root = crate::translate::RootConfig::new(PathBuf::from("/"), Vec::new());
+        state.apply_to(&mut st, &root).unwrap();
+        assert_eq!(st.cwd, PathBuf::from("/work"), "the restore ran");
+        assert_eq!(LifetimeRecord::of(&st.admission), LifetimeRecord::default());
+        assert!(!st.admission.guest_filter && !st.admission.summary_emitted);
+    }
+
+    #[test]
+    fn fork_seed_carries_no_record() {
+        let mut st = proc_state();
+        st.admission.installs = 3;
+        st.admission.guest_filter = true;
+        let seed = ExecState::capture_fork_seed(&st, MAIN_FILES, &cfg("/"), Path::new("/bin/sh"), &[]);
+        assert_eq!(seed.record, LifetimeRecord::default());
+        let exec = ExecState::capture(&st, MAIN_FILES, &cfg("/"));
+        assert_eq!(exec.record.installs, 3);
     }
 
     #[test]

@@ -29,8 +29,10 @@ default = ["run", "in-guest"]
 # `tool` is the backend-neutral RootfsTool + launcher scaffolding.
 tool = ["dep:reverie", "dep:libc", "dep:serde", "dep:tokio"]
 # `run` alone is the ptrace-only build: no in-guest backend crates
-# (reverie-liteinst / reverie-inguest / liteinst) are compiled, so it
-# builds on architectures the in-guest stack does not serve yet.
+# (reverie-liteinst / reverie-inguest / liteinst) are compiled into the
+# binary, so it builds on architectures the in-guest stack does not serve
+# yet. Its test builds still compile reverie-inguest, a dev-dependency of
+# the initial-packet units.
 run = ["tool", "dep:reverie-ptrace"]
 # sha2: the embedded preload's digest and the user preload's stamp
 # (src/preload_materialize.rs, src/preload_stamp.rs).
@@ -73,6 +75,15 @@ sha2 = { version = "0.10.9", optional = true }
 
 [build-dependencies]
 # build.rs: the preload stamp's protocol_version and the embedded digest.
+sha2 = "0.10.9"
+
+# The wire-digest pin (src/initial_packet.rs, C5d) recomputes the digest in
+# the default test build: the coordinator RPC's codec and SHA-256, plus
+# reverie-inguest for the module's coordinator-descriptor placement (the
+# default build already compiles it, through reverie-liteinst).
+[dev-dependencies]
+reverie-rpc-transport = { git = "https://github.com/facebookexperimental/reverie", rev = "6281d616a880056c78bf9d34c602e8d0903d07f4" }
+reverie-inguest = { git = "https://github.com/facebookexperimental/reverie", rev = "6281d616a880056c78bf9d34c602e8d0903d07f4", default-features = false, features = ["launcher", "coordinator-rpc"] }
 sha2 = "0.10.9"
 
 [profile.release]

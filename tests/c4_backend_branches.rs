@@ -7,10 +7,61 @@
 //! `note_guest_refusal(` call follows within `WINDOW` lines.
 
 /// Config fields the launcher sets only for in-guest backends.
-const CONDITIONED: &[&str] = &["refuse_guest_ptrace", "post_exec_at_exec_stop"];
+const CONDITIONED: &[&str] = &[
+    "refuse_guest_ptrace",
+    "post_exec_at_exec_stop",
+    "refuse_guest_dispatch",
+    "tool_in_guest",
+];
 
 /// Branches scoped out of C4: (a substring of the reading line, the reason).
-const SCOPED_OUT: &[(&str, &str)] = &[];
+const SCOPED_OUT: &[(&str, &str)] = &[
+    (
+        "// kernel_id: never collected in-guest",
+        "the in-guest branch skips diagnostic metadata; it refuses nothing",
+    ),
+    (
+        "// note_now: sends the note itself",
+        "the branch is the install-attempt note's own send, not a refusal",
+    ),
+    (
+        "// trigger 6: in-guest mode from tracking",
+        "the branch picks trigger 6's mode source; a refusal it causes writes probe_unsupported",
+    ),
+    (
+        "// detector: in-guest filter count",
+        "the C3.6 detector; a refusal it causes writes probe_unsupported",
+    ),
+    (
+        "// first-callback check: in-guest only",
+        "the baseline check; a refusal it causes later writes probe_unsupported",
+    ),
+    (
+        "// shared-record tripwire",
+        "a tripwire for a clone Reverie refuses in-guest; a created one is a named fatal stop",
+    ),
+    (
+        "// cmdline: probe first in-guest",
+        "a disclosed in-guest difference (design §4.9.5, Synthetic command lines): in-guest the \
+         guarded probe, the kernel's own argument check run in the guest, decides openat2's \
+         arguments before the synthesized cmdline answers; where it proves nothing (a closed \
+         gate, refused admission, or any answer but EBADF and the pre-lookup EINVAL, E2BIG, \
+         EFAULT and EMFILE) the kernel's cmdline file (the exec'd loader argv) answers where \
+         ptrace synthesizes the guest's argv, and that fallback writes \
+         synthetic_file_unavailable (note_cmdline_fallback), also before an EAGAIN that the \
+         kernel's own open then returns; those errnos are the ones each argument probe answers \
+         directly (the tracer's: EINVAL, E2BIG, EAGAIN and EFAULT), not a limit on what either \
+         route's final open returns",
+    ),
+    (
+        "// cmdline: memfd route",
+        "a disclosed in-guest difference (design §4.9.5, Synthetic command lines): in-guest \
+         the synthesized cmdline is an injected memfd whose F_GETFL shows O_RDWR, unsealed, \
+         writable and truncatable by any guest (its 0444 mode only governs a reopen), and on \
+         which open flags other than O_CLOEXEC are not applied; its fallbacks give the \
+         kernel's cmdline file and write synthetic_file_unavailable (note_cmdline_fallback)",
+    ),
+];
 
 const WINDOW: usize = 12;
 
