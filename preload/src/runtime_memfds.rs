@@ -25,21 +25,36 @@
 //!   identity the launcher put in the environment (the launcher's number
 //!   in a first image, the predecessor's placed number after an exec),
 //!   adopt it, and place it.
-//! - Fork child (`replace_in_fork_child`, from the Tool's
-//!   `handle_thread_start`, which Reverie runs in the child before the
-//!   callback that forked returns): the child inherited its parent's
-//!   copies at numbers recorded under the parent's pid, which the runtime
-//!   closes in a child (`close_inherited_runtime_fds`). So the child
-//!   reopens each copy by path, closes the inherited records itself, and
-//!   places the reopened copies under its own pid. Only plain forks create
-//!   a child in-guest; see the comment on the Tool's clone arms.
+//! - Fork child (`replace_in_fork_child`, from the Tool's `new`, the
+//!   first Tool code Reverie runs in a fork child, and again, as a no-op,
+//!   from `handle_thread_start`): the child inherited its parent's copies
+//!   at numbers recorded under the parent's pid, which the runtime closes
+//!   in a child (`close_inherited_runtime_fds`). So the child reopens each
+//!   copy by path, closes the inherited records itself, and places the
+//!   reopened copies under its own pid. Only plain forks create a child
+//!   in-guest; see the comment on the Tool's clone arms.
+//!
+//!   The reopens go through the runtime's own syscall gate, before any
+//!   libc call in the child. Under LiteInst a libc syscall from a site
+//!   the guest's own calls have already had patched enters the runtime's
+//!   hook, which reads the RCB clock first; a fork child's first clock
+//!   read closes the inherited records (Reverie 6281d616,
+//!   `reverie-inguest/src/guest/installed_tool.rs` `dispatch_saved_syscall`,
+//!   and `clock.rs` `rcb_clock`). A libc reopen would therefore close the
+//!   very copy it reopens. The gate's syscall instruction is allowed by
+//!   the runtime's filter and never traps (`trap.rs` `raw_syscall6`), so
+//!   no site there is ever patched. tests/runtime_memfds.rs
+//!   `liteinst_clock_read_before_the_reopen_fails_loudly` is the twin of a
+//!   mutant, applied as a patch by the test runner and absent from this
+//!   tree, that reads the clock before the reopens: under it the tree must
+//!   lose both memfds in every fork child and say so on stderr.
 //!
 //! A failure leaves that memfd absent in that process, never an
 //! unprotected copy: the shared record falls back to the callers'
 //! process-local state, and the probe generation keeps a mapping the
 //! process already has (losing only exec inheritance) or falls back to
-//! the process-local counter. With `LITEROOT_DEBUG` set, each failure
-//! prints one line.
+//! the process-local counter. Every build prints one line on stderr for
+//! each failure, so a lost memfd is never silent.
 //!
 //! Limits, stated rather than fixed:
 //! - Reverie's own reserved descriptors are sockets or anonymous inodes,
@@ -81,10 +96,9 @@ fn raw_pid() -> i32 {
     unsafe { raw_syscall6(libc::SYS_getpid, [0; 6]) as i32 }
 }
 
+/// One stderr line for a memfd this process cannot hold, in every build.
 fn report(what: &str, error: &dyn std::fmt::Display) {
-    if std::env::var_os("LITEROOT_DEBUG").is_some() {
-        eprintln!("literoot: {what} unavailable in this process: {error}");
-    }
+    eprintln!("literoot: {what} unavailable in this process: {error}");
 }
 
 fn close(fd: i32) {
@@ -168,34 +182,84 @@ pub(crate) fn adopt_at_image_start() {
     shared_record::set_fork_child_hook(replace_in_fork_child);
 }
 
-/// A new descriptor on the file open at `fd`, opened through
-/// `/proc/self/fd/<fd>`, kept only when `same_file` accepts it. A Tool
-/// call that names a recorded number is refused like the guest's
-/// (`forward_nested_tool_syscall`); a path open names no descriptor.
-fn reopen(fd: i32, same_file: impl FnOnce(i32) -> bool) -> std::io::Result<i32> {
-    let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}"))
-        .expect("a descriptor path has no NUL");
-    // SAFETY: opens a path; the new descriptor is owned here.
-    let copy = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if copy < 0 {
-        return Err(std::io::Error::last_os_error());
+/// `/proc/self/fd/<fd>` as a NUL-terminated path in `buf`, without
+/// allocating. Returns the path's length without the NUL.
+fn proc_fd_path(fd: i32, buf: &mut [u8; 32]) -> usize {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut n = fd.max(0) as u32;
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
     }
-    if !same_file(copy) {
-        close(copy);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the inherited number holds another file",
-        ));
+    let mut at = PREFIX.len();
+    for i in (0..len).rev() {
+        buf[at] = digits[i];
+        at += 1;
     }
-    Ok(copy)
+    buf[at] = 0;
+    at
 }
 
-/// Re-place a fork child's copies under its own pid. A no-op for a thread
-/// start in the process that placed them, and for a lineage that placed
-/// nothing. The parent's copies are reopened first and the inherited
-/// records closed before the new copies are placed, so the record stays
-/// bounded (the memfds and the counter) on every build, whenever the
-/// runtime first reads its clock in the child.
+/// A new descriptor on the file open at `fd`, opened through
+/// `/proc/self/fd/<fd>` by the runtime's gate: no libc call, no
+/// allocation. A path open names no descriptor, so the runtime does not
+/// refuse it. The caller checks the new descriptor's identity.
+fn reopen_raw(fd: i32) -> std::io::Result<i32> {
+    let mut path = [0u8; 32];
+    proc_fd_path(fd, &mut path);
+    // SAFETY: opens a NUL-terminated path in a live stack buffer; the new
+    // descriptor is owned by the caller.
+    let copy = unsafe {
+        raw_syscall6(
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as i64 as u64,
+                path.as_ptr() as u64,
+                (libc::O_RDWR | libc::O_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    if copy < 0 {
+        return Err(std::io::Error::from_raw_os_error(-copy as i32));
+    }
+    Ok(copy as i32)
+}
+
+/// Keeps `copy` when `same_file` accepts it, and closes it otherwise.
+fn checked(
+    copy: std::io::Result<i32>,
+    same_file: impl FnOnce(i32) -> bool,
+) -> std::io::Result<i32> {
+    let copy = copy?;
+    if same_file(copy) {
+        return Ok(copy);
+    }
+    close(copy);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "the inherited number holds another file",
+    ))
+}
+
+/// Re-place a fork child's copies under its own pid. A no-op in the
+/// process that placed them (its own Tool construction and thread
+/// starts, and every call after the first in a child), and for a lineage
+/// that placed nothing. Everything before the two reopens is memory or
+/// the runtime's gate, so no libc call can close the inherited copies
+/// first (module docs). The inherited records are closed before the new
+/// copies are placed, so the record stays bounded (the memfds and the
+/// counter) on every build, whenever the runtime first reads its clock in
+/// the child.
 fn replace_in_fork_child() {
     let pid = raw_pid();
     let placer = PLACED_BY.load(Ordering::Acquire);
@@ -208,10 +272,17 @@ fn replace_in_fork_child() {
     if probe.is_none() && store.is_none() {
         return;
     }
-    let probe_copy = probe.map(|(fd, identity)| {
-        reopen(fd, |copy| FdIdentity::of_fd(copy).ok() == Some(identity))
+    // Both copies first, through the runtime's gate.
+    let probe_copy = probe.map(|(fd, _)| reopen_raw(fd));
+    let store_copy = store.map(|store| reopen_raw(store.fd()));
+    // Libc may run from here on: the copies just opened are not recorded,
+    // so a clock read that closes the inherited records leaves them.
+    let probe_copy = probe.zip(probe_copy).map(|((_, identity), copy)| {
+        checked(copy, |copy| FdIdentity::of_fd(copy).ok() == Some(identity))
     });
-    let store_copy = store.map(|store| reopen(store.fd(), |copy| store.is_store_file(copy)));
+    let store_copy = store
+        .zip(store_copy)
+        .map(|(store, copy)| checked(copy, |copy| store.is_store_file(copy)));
     if let Err(error) = protect::close_inherited_runtime_fds() {
         report("the inherited runtime descriptors' close", &error);
     }
@@ -273,6 +344,45 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             out.status.success(),
         )
+    }
+
+    #[test]
+    fn proc_fd_path_writes_the_number_and_a_nul() {
+        for (fd, want) in [
+            (0, "/proc/self/fd/0"),
+            (7, "/proc/self/fd/7"),
+            (1000, "/proc/self/fd/1000"),
+            (i32::MAX, "/proc/self/fd/2147483647"),
+        ] {
+            let mut buf = [0xffu8; 32];
+            let len = proc_fd_path(fd, &mut buf);
+            assert_eq!(&buf[..len], want.as_bytes());
+            assert_eq!(buf[len], 0);
+        }
+    }
+
+    /// The fork child's reopen: through the runtime's gate, the same file,
+    /// close-on-exec until placed; a closed number is ENOENT, which is what
+    /// a reopen after the runtime closed the inherited copy would see.
+    #[test]
+    fn raw_reopen_opens_the_same_file_and_refuses_a_closed_number() {
+        let fd = memfd(c"literoot-raw-reopen-test");
+        let copy = reopen_raw(fd).expect("reopen an open memfd");
+        assert_ne!(copy, fd);
+        assert_eq!(
+            FdIdentity::of_fd(copy).unwrap(),
+            FdIdentity::of_fd(fd).unwrap()
+        );
+        let flags = unsafe { libc::fcntl(copy, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        unsafe { libc::close(copy) };
+        // A high number no other test uses, closed again at once.
+        let gone = 901;
+        assert_eq!(unsafe { libc::dup2(fd, gone) }, gone);
+        unsafe { libc::close(gone) };
+        let err = reopen_raw(gone).expect_err("a closed number");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        unsafe { libc::close(fd) };
     }
 
     #[test]

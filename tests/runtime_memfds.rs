@@ -15,6 +15,26 @@
 //! resolved with a real directory (the probe generation). The root must
 //! see both.
 //!
+//! The root opens a file before it forks. Under LiteInst that has the
+//! guest's own open() site patched, so a libc open from literoot's
+//! runtime in a fork child enters the runtime's hook (and its clock,
+//! which closes the inherited copies) instead of trapping: the condition
+//! under which a libc reopen in the child lost both memfds.
+//!
+//! `liteinst_clock_read_before_the_reopen_fails_loudly` runs the same
+//! LiteInst tree and passes on this tree. It is the twin of a mutant that
+//! the test runner applies as a patch, absent from this tree: each fork
+//! child reads the runtime's RCB clock before its reopen, as if Reverie had
+//! moved a clock read ahead of the Tool's construction. Under that patch
+//! the test must fail: the children hold no copy while the root holds one
+//! of each, and literoot prints both lost-memfd lines without
+//! LITEROOT_DEBUG. The test prints literoot's stderr lines so the runner
+//! can check that shape.
+//!
+//! There is no --kill-on-exit variant: in-guest backends refuse that flag
+//! by design, before any guest runs, and tests/kill_on_exit.rs
+//! `inguest_kill_on_exit_refused_by_name` pins the refusal.
+//!
 //! The guest also prints, as an observation only, whether an open by
 //! path of each runtime-range descriptor succeeds: Reverie's own sockets
 //! and anonymous inodes cannot be reopened by path (ENXIO), and the
@@ -186,14 +206,21 @@ fn make_root(label: &str) -> PathBuf {
 }
 
 /// Runs the guest under `backend` with fake root (sethostname) and the
-/// default binds, and returns its stdout.
-fn run(backend: &str) -> String {
-    let root = make_root(backend);
+/// default binds, and returns its stdout and stderr.
+fn run(backend: &str) -> (String, String) {
+    run_with(backend, backend)
+}
+
+/// `run` in a root named after `label`. LITEROOT_DEBUG is always
+/// removed: the lost-memfd lines must not need it.
+fn run_with(backend: &str, label: &str) -> (String, String) {
+    let root = make_root(label);
     let out = Command::new(literoot_bin())
         .args(["--backend", backend, "-0", "-R"])
         .arg(&root)
         .arg("/bin/memfds")
         .env_remove("LITEROOT_PRELOAD")
+        .env_remove("LITEROOT_DEBUG")
         .env("PATH", "/bin:/usr/bin")
         .output()
         .expect("spawn literoot");
@@ -206,13 +233,13 @@ fn run(backend: &str) -> String {
     );
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
     println!("{backend} stdout:\n{stdout}");
-    stdout
+    (stdout, stderr)
 }
 
 /// Every process of the tree saw `count` copies of each memfd, and every
 /// copy it saw refused fcntl by number; the grandchild's hostname and
-/// directory reached the root.
-fn check(backend: &str, stdout: &str, count: usize) {
+/// directory reached the root; and literoot reported no lost memfd.
+fn check(backend: &str, (stdout, stderr): &(String, String), count: usize) {
     for who in ["root", "child", "grandchild"] {
         let line = format!("{who} count probe-gen={count} shared-record={count}");
         assert!(
@@ -238,12 +265,29 @@ fn check(backend: &str, stdout: &str, count: usize) {
         stdout.lines().any(|l| l == "root link-file=from-realdir"),
         "{backend}: the grandchild's directory did not reach the root (probe generation): {stdout}"
     );
+    assert!(
+        !stderr.contains("unavailable in this process"),
+        "{backend}: literoot lost a shared memfd: {stderr}"
+    );
 }
 
 #[cfg(feature = "in-guest")]
 #[test]
 fn liteinst_tree_holds_each_memfd_once_out_of_reach_by_number() {
     check("liteinst", &run("liteinst"), 1);
+}
+
+/// The twin of the clock-first mutant (module docs): it passes on this
+/// tree and must fail, loudly, under the runner's patch. It prints
+/// literoot's stderr lines so the runner can check the failure's shape.
+#[cfg(feature = "in-guest")]
+#[test]
+fn liteinst_clock_read_before_the_reopen_fails_loudly() {
+    let out = run_with("liteinst", "liteinst-clock-first");
+    for line in out.1.lines().filter(|l| l.starts_with("literoot: ")) {
+        println!("liteinst-clock-first stderr: {line}");
+    }
+    check("liteinst", &out, 1);
 }
 
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]

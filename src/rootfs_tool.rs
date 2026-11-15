@@ -1205,6 +1205,14 @@ impl Tool for RootfsTool {
     type ThreadState = RootfsThreadState;
 
     fn new(pid: Pid, cfg: &LiterootConfig) -> Self {
+        // In-guest, this is the first Tool code a fork child runs
+        // (Reverie constructs the child's Tool before its thread
+        // state and thread start). Re-place the shared memfds here,
+        // before any libc call below can close the inherited copies;
+        // see preload/src/runtime_memfds.rs. A no-op in the process
+        // that placed them and under ptrace, where no hook is
+        // registered.
+        crate::shared_record::run_fork_child_hook();
         // Creation-time registration (fork event under ptrace,
         // process construction in-guest): a fork child that only
         // sleeps/writes/exits may make no subscribed syscall
@@ -1371,11 +1379,11 @@ impl Tool for RootfsTool {
         // children whose Tool construction path may not call
         // Tool::new.
         self.note_process_for_kill_on_exit(guest);
-        // In-guest, a fork child first re-places its own copies of
-        // the shared memfds, which it inherited at numbers its
-        // parent recorded (preload/src/runtime_memfds.rs); a no-op
-        // for threads, for the process that placed them, and under
-        // ptrace, where no hook is registered.
+        // In-guest, a fork child re-placed its own copies of the
+        // shared memfds in `new` (preload/src/runtime_memfds.rs).
+        // Reverie builds every process's Tool with `new`, so this
+        // second call is a no-op (as for threads and under ptrace);
+        // it keeps the re-placement from resting on that order alone.
         crate::shared_record::run_fork_child_hook();
         // The shared store is registered before ordinary guest
         // execution: in-guest by the preload's identity-checked
