@@ -85,6 +85,13 @@ impl Run<'_> {
     /// The exit status and the refusal log's lines. Output is not
     /// printed, so nothing from the environment can reach the test log.
     fn go(&self, dir: &Path) -> (i32, Vec<String>) {
+        let (status, lines, _) = self.go_with_stderr(dir);
+        (status, lines)
+    }
+
+    /// As `go`, plus literoot's stderr, for checks against fixed text only
+    /// (never printed).
+    fn go_with_stderr(&self, dir: &Path) -> (i32, Vec<String>, String) {
         let log = dir.join("refusal.log");
         let _ = std::fs::remove_file(&log);
         let mut cmd = Command::new(literoot_bin());
@@ -102,7 +109,8 @@ impl Run<'_> {
             .lines()
             .map(str::to_owned)
             .collect();
-        (out.status.code().unwrap_or(-1), lines)
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.code().unwrap_or(-1), lines, stderr)
     }
 }
 
@@ -249,9 +257,14 @@ fn unwritable_record_ends_with_its_own_status_and_token() {
         )],
         argv: &["/bin/true"],
     };
-    let (status, log) = run.go(&dir);
+    let (status, log, stderr) = run.go_with_stderr(&dir);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(status, 5, "STATS_RECORD_EXIT");
+    // Checked, not printed.
+    assert!(
+        stderr.contains("LITEROOT_STATS: cannot append"),
+        "the record failure's fixed text is missing from stderr"
+    );
     let pid = begin_pid(&log);
     assert!(log.contains(&format!("literoot: end {pid} error stats_record")), "{log:?}");
     assert!(!log.iter().any(|l| l.starts_with("literoot: refused")), "{log:?}");

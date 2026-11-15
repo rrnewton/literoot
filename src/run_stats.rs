@@ -41,7 +41,8 @@
 //!   reaped through the root guest; an orphan reparented away is not in
 //!   it): user and system time, max RSS, voluntary and involuntary context
 //!   switches. `rusage_children` is a PARTIAL value: it covers only the
-//!   children this launcher waited for (and what they waited for);
+//!   children this launcher waited for (and what they waited for), and its
+//!   `maxrss_kb` is the largest single reaped descendant, not a sum;
 //! - `cgroup`. Without `LITEROOT_CGROUP` no cgroup code runs at all and
 //!   this field says only `"guest_cpu_state": "UNAVAILABLE"` with its
 //!   reason (on a host without delegation, for example). With it, before
