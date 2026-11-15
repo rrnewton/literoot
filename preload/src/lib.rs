@@ -74,10 +74,7 @@ mod shared_record;
 #[path = "../../src/translate.rs"]
 mod translate;
 
-use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
 
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_scoped_tool_allocator!();
@@ -130,32 +127,48 @@ mod stamp_note {
 }
 
 // LITEROOT_INIT is the only root.
+/// Whether this library was loaded into another program rather than run as
+/// the program itself, decided by load address alone: the program's entry
+/// point lies in the main object. A test through the library's file name
+/// depends on the file system (an unlinked or replaced library, a
+/// /proc/self/fd name, no /proc), and an answer that cannot be reached
+/// must never mean "do not arm": it fails by name.
 #[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
 unsafe fn loaded_as_preload() -> bool {
-    let mut info = MaybeUninit::<libc::Dl_info>::uninit();
-    let found = unsafe {
-        libc::dladdr(
-            initialize as *const () as *const libc::c_void,
-            info.as_mut_ptr(),
-        )
-    };
-    if found == 0 {
-        return false;
+    let entry = unsafe { libc::getauxval(libc::AT_ENTRY) };
+    if entry == 0 {
+        fail("no AT_ENTRY in the auxiliary vector: cannot tell whether the preload is the program");
     }
-    let info = unsafe { info.assume_init() };
-    if info.dli_fname.is_null() {
-        return false;
-    }
-    let mapped_name = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
-    if mapped_name.is_empty() {
-        return false;
-    }
-    let mapped_path = Path::new(std::ffi::OsStr::from_bytes(mapped_name));
-    match (mapped_path.canonicalize(), std::env::current_exe()) {
-        (Ok(mapped_path), Ok(executable)) => mapped_path != executable,
-        _ => false,
-    }
+    let ours = unsafe { object_base(initialize as *const () as *const libc::c_void) };
+    let main = unsafe { object_base(entry as *const libc::c_void) };
+    ours != main
 }
+
+// LITEROOT_INIT is the only root.
+/// The load base of the object holding `addr`, or a named failure.
+#[cfg_attr(
+    all(feature = "mapped-successor", target_env = "musl"),
+    allow(dead_code)
+)]
+unsafe fn object_base(addr: *const libc::c_void) -> *mut libc::c_void {
+    let mut info = MaybeUninit::<libc::Dl_info>::uninit();
+    if unsafe { libc::dladdr(addr, info.as_mut_ptr()) } == 0 {
+        fail(&format!(
+            "no loaded object holds {addr:p}: cannot tell whether the preload is the program"
+        ));
+    }
+    unsafe { info.assume_init() }.dli_fbase
+}
+
+/// No sealed bootstrap descriptor reached this image, so nothing says how to
+/// arm it; going on would run the program without literoot.
+#[cfg_attr(
+    all(feature = "mapped-successor", target_env = "musl"),
+    allow(dead_code)
+)]
+const NO_BOOTSTRAP: &str =
+    "loaded without a literoot bootstrap (no sealed bootstrap descriptor was inherited); \
+     refusing to run this program without literoot";
 
 // LITEROOT_INIT is the only root.
 #[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
@@ -184,7 +197,7 @@ unsafe extern "C" fn initialize(
     {
         let bootstrap = match unsafe { reverie_inguest::bootstrap::take_preload_bootstrap() } {
             Ok(Some(bootstrap)) => bootstrap,
-            Ok(None) => return,
+            Ok(None) => fail(NO_BOOTSTRAP),
             Err(error) => fail(&format!("invalid preload bootstrap: {error}")),
         };
         // Before installation: hide the shared memfds' numbers.
@@ -226,7 +239,7 @@ unsafe extern "C" fn initialize(
     {
         let bootstrap = match unsafe { reverie_liteinst::take_preload_bootstrap() } {
             Ok(Some(bootstrap)) => bootstrap,
-            Ok(None) => return,
+            Ok(None) => fail(NO_BOOTSTRAP),
             Err(error) => fail(&format!("invalid preload bootstrap: {error}")),
         };
         // Before installation: hide the shared memfds' numbers.

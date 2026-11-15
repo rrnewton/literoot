@@ -139,6 +139,10 @@ const STAMP: (&str, &str) = ("preload_stamp", "preload stamp mismatch: rebuild t
 const PROBE: (&str, &str) = ("preload_probe", "preload cannot be mapped executable here");
 const SEPARATOR: (&str, &str) = ("preload_separator", "preload path contains a separator");
 const MISSING: (&str, &str) = ("preload_missing", "LITEROOT_PRELOAD names no readable file");
+/// What a user does about a missing or unreadable LITEROOT_PRELOAD. It ends
+/// the detail line, so the named refusal stays one whole line.
+const MISSING_HINT: &str =
+    "point LITEROOT_PRELOAD at a readable preload built with this literoot, or unset it to use the embedded one";
 const NOT_BUILT: (&str, &str) = ("not_built", "in-guest not built into this binary");
 
 fn refuse((token, message): (&'static str, &'static str), detail: impl Into<String>) -> Refusal {
@@ -262,14 +266,14 @@ pub(crate) fn cache_candidates(xdg: Option<OsString>, home: Option<OsString>) ->
 /// memory, and never written.
 pub(crate) fn admit_user(path: &Path, flavour: Flavour, hooks: &Hooks) -> Result<PathBuf, Refusal> {
     let bytes = read_capped(path, preload_stamp::MAX_FILE)
-        .map_err(|e| refuse(MISSING, format!("{}: {e}", path.display())))?;
+        .map_err(|e| refuse(MISSING, format!("{}: {e}; {MISSING_HINT}", path.display())))?;
     let stamp = preload_stamp::parse(&bytes)
         .map_err(|why| refuse(STAMP, format!("{}: {why}", path.display())))?;
     preload_stamp::check(&stamp, PROTOCOL_VERSION, flavour.stamp())
         .map_err(|why| refuse(STAMP, format!("{}: {why}", path.display())))?;
     let canonical = path
         .canonicalize()
-        .map_err(|e| refuse(MISSING, format!("{}: {e}", path.display())))?;
+        .map_err(|e| refuse(MISSING, format!("{}: {e}; {MISSING_HINT}", path.display())))?;
     check_separator(&canonical)?;
     final_probe(&canonical, hooks)?;
     Ok(canonical)
@@ -592,6 +596,27 @@ mod tests {
 
     fn ok_map(_: &File, _: usize) -> io::Result<()> {
         Ok(())
+    }
+
+    /// A LITEROOT_PRELOAD that names no readable file is refused by name,
+    /// as one whole line, and the detail line says what to do about it.
+    #[test]
+    fn missing_user_preload_is_refused_by_name_with_a_hint() {
+        let scratch = Scratch::new("missing-preload");
+        let path = scratch.0.join("no-such-preload.so");
+        let refusal = admit_user(&path, Flavour::Liteinst, &Hooks::REAL).unwrap_err();
+        assert_eq!(refusal.token, "preload_missing");
+        let text = refusal.text();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("LITEROOT_PRELOAD names no readable file"), "{text}");
+        let detail = lines.next().unwrap_or_default();
+        assert!(detail.starts_with(&format!("literoot: {}: ", path.display())), "{detail}");
+        assert!(
+            detail.ends_with("point LITEROOT_PRELOAD at a readable preload built with this literoot, \
+                              or unset it to use the embedded one"),
+            "the detail ends with what to do: {detail}"
+        );
+        assert_eq!(lines.next(), None, "{text}");
     }
 
     fn denied_map(_: &File, _: usize) -> io::Result<()> {
