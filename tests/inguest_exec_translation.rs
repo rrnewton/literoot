@@ -75,7 +75,7 @@ fn inguest_first_execve_takes_translated_route() {
         }
         panic!(
             "inguest-exec: preload not built at {} — build the preload \
-             (cargo build -p literoot-preload --release) or set \
+             (cargo build --release --manifest-path preload/Cargo.toml) or set \
              LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
             preload.display()
         );

@@ -175,7 +175,7 @@ fn in_guest_cross_process_swap_shared_vs_mutant() {
         }
         panic!(
             "coherence-ig: preload not built at {} — build the preload \
-             (cargo build -p literoot-preload --release) or set \
+             (cargo build --release --manifest-path preload/Cargo.toml) or set \
              LITEROOT_ALLOW_SKIP_PRELOAD=1 to skip explicitly",
             preload.display()
         );
