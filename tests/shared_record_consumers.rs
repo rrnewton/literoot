@@ -104,7 +104,7 @@ static int observe(int do_exec) {
     close(ready[1]);
     if (read_byte(ready[0]) != 0) return 103;
     print_observed(pid);
-    printf("shared_env=%s\n", getenv("LITEROOT_SHARED_RECORD_FD") ? "present" : "absent");
+    printf("shared_env=%s\n", getenv("LITEROOT_SHARED_RECORD_ID") ? "present" : "absent");
     fflush(stdout);
     kill(pid, SIGKILL);
     int status = 0;
@@ -467,7 +467,7 @@ fn ptrace_parent_reads_fork_child_shared_exe_and_cmdline() {
         &["/bin/sr", "argA"],
         &[
             ("SR_MODE", "observe-fork"),
-            ("LITEROOT_SHARED_RECORD_FD", "7"),
+            ("LITEROOT_SHARED_RECORD_ID", "7:7"),
         ],
         None,
     );

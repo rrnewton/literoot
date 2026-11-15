@@ -6,24 +6,47 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Probe-cache generation: bumped by the Tool on any successful
 /// mutating path syscall so cached component kinds never outlive
-/// a rename/unlink/symlink change. If the memfd env is scrubbed
-/// or the fd was closed before first use, this silently falls
-/// back to the process-local counter (per-process coherence
-/// only) — same stated limit class as host-side mutation.
+/// a rename/unlink/symlink change. If no shared generation memfd
+/// was adopted (the identity env was scrubbed, or no copy was
+/// inherited), this silently falls back to the process-local
+/// counter (per-process coherence only) — same stated limit
+/// class as host-side mutation.
 ///
 /// Coherence scope: the counter lives in a launcher-created
 /// memfd (MAP_SHARED) inherited across the whole guest tree, so
 /// a mutation in any guest process invalidates every process's
-/// cache. Without the memfd (unit tests, --check) it falls back
-/// to a process-local atomic. Host-side mutation (outside any
-/// guest) is NOT detected — a stated divergence from proot,
+/// cache. In-guest, each image's preload maps it before the
+/// guest runs (`adopt_shared_gen`, called by the preload's
+/// runtime_memfds module), and fork children inherit that
+/// mapping. Without the memfd (unit tests, --check) it falls
+/// back to a process-local atomic. Host-side mutation (outside
+/// any guest) is NOT detected — a stated divergence from proot,
 /// which re-probes on every canonicalization.
 static PROBE_GEN_LOCAL: AtomicU64 = AtomicU64::new(0);
-static PROBE_GEN_SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PROBE_GEN_SHARED: OnceLock<usize> = OnceLock::new();
+/// The descriptor this process holds on the shared generation
+/// memfd, or -1. The counter itself is reached through the
+/// mapping; the descriptor is kept only so that an exec inherits
+/// the memfd. In-guest it is a number the runtime keeps the guest
+/// away from, and it changes when a fork child re-places its copy.
+static PROBE_GEN_FD: AtomicI32 = AtomicI32::new(-1);
+/// The file identity of the adopted shared generation memfd.
+static PROBE_GEN_IDENTITY: OnceLock<FdIdentity> = OnceLock::new();
+
+/// Internal launcher-to-preload environment variable naming the
+/// shared generation memfd by file identity
+/// ([`FdIdentity::encode`]), never by descriptor number: each
+/// in-guest image finds its inherited copy by this identity and
+/// moves it to a number the runtime keeps the guest away from, so
+/// the number differs per process. The identity protects against
+/// number reuse; it is not authentication. A guest can point it at
+/// any file it holds, which desyncs only its own tree.
+pub const PROBE_GEN_ID_ENV: &str = "LITEROOT_PROBE_GEN_ID";
 
 fn shared_gen() -> Option<&'static AtomicU64> {
     // Mutant switch for the coherence test: force the
@@ -34,22 +57,17 @@ fn shared_gen() -> Option<&'static AtomicU64> {
     if std::env::var_os("LITEROOT_PROBE_LOCAL").is_some() {
         return None;
     }
-    if let Some(p) = PROBE_GEN_SHARED.get() {
-        return Some(unsafe { &*(*p as *const AtomicU64) });
-    }
-    if let Ok(fd_s) = std::env::var("LITEROOT_PROBE_GEN_FD") {
-        if let Ok(fd) = fd_s.parse::<i32>() {
-            init_shared_gen_from_fd(fd);
-            return PROBE_GEN_SHARED
-                .get()
-                .map(|p| unsafe { &*(*p as *const AtomicU64) });
-        }
-    }
-    None
+    PROBE_GEN_SHARED
+        .get()
+        .map(|p| unsafe { &*(*p as *const AtomicU64) })
 }
 
 /// mmap the shared generation counter from `fd` (idempotent).
-pub fn init_shared_gen_from_fd(fd: i32) {
+/// Returns whether the counter is mapped.
+pub fn init_shared_gen_from_fd(fd: i32) -> bool {
+    if PROBE_GEN_SHARED.get().is_some() {
+        return true;
+    }
     unsafe {
         let ptr = libc::mmap(
             std::ptr::null_mut(),
@@ -63,24 +81,151 @@ pub fn init_shared_gen_from_fd(fd: i32) {
             let _ = PROBE_GEN_SHARED.set(ptr as usize);
         }
     }
+    PROBE_GEN_SHARED.get().is_some()
+}
+
+/// Adopt the shared generation memfd open at `fd` with file
+/// identity `identity` (in-guest preload, before the guest runs):
+/// map the counter and remember the descriptor. Returns whether
+/// the counter is mapped.
+#[allow(dead_code)] // The in-guest preload (preload/src/runtime_memfds.rs) is the caller.
+pub fn adopt_shared_gen(fd: i32, identity: FdIdentity) -> bool {
+    if !init_shared_gen_from_fd(fd) {
+        return false;
+    }
+    let _ = PROBE_GEN_IDENTITY.set(identity);
+    PROBE_GEN_FD.store(fd, Ordering::Release);
+    true
+}
+
+/// The shared generation memfd this process holds: its current
+/// descriptor and its file identity.
+#[allow(dead_code)] // The in-guest preload (preload/src/runtime_memfds.rs) is the caller.
+pub fn shared_gen_descriptor() -> Option<(i32, FdIdentity)> {
+    let fd = PROBE_GEN_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return None;
+    }
+    PROBE_GEN_IDENTITY.get().map(|identity| (fd, *identity))
+}
+
+/// Record the descriptor this process now holds on the shared
+/// generation memfd after moving it, or -1 when it holds none.
+/// The mapping is unaffected either way.
+#[allow(dead_code)] // The in-guest preload (preload/src/runtime_memfds.rs) is the caller.
+pub fn set_shared_gen_fd(fd: i32) {
+    PROBE_GEN_FD.store(fd, Ordering::Release);
 }
 
 /// Create the shared generation memfd (launcher side). Returns
-/// the fd (CLOEXEC cleared) to pass to the guest via env, or -1.
+/// the fd (CLOEXEC cleared, so the in-guest tree inherits it; the
+/// launcher hands the guest its identity, not its number), or -1.
+///
+/// The size is sealed (F_SEAL_SHRINK, F_SEAL_GROW, F_SEAL_SEAL)
+/// before the first mmap: every process maps exactly these 8
+/// bytes, and a truncate through any descriptor or path would
+/// otherwise make the next counter access fault (SIGBUS). The
+/// contents stay writable, as the counter must be.
 pub fn create_shared_gen_fd() -> i32 {
     unsafe {
         let name = c"literoot-probe-gen";
-        let fd = libc::memfd_create(name.as_ptr(), 0);
+        let fd = libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING);
         if fd < 0 {
             return -1;
         }
-        if libc::ftruncate(fd, 8) != 0 {
+        if libc::ftruncate(fd, 8) != 0
+            || libc::fcntl(
+                fd,
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+            ) != 0
+        {
             libc::close(fd);
             return -1;
         }
         init_shared_gen_from_fd(fd);
         fd
     }
+}
+
+/// A file's identity as `fstat` reports it: the launcher hands an
+/// in-guest image this pair instead of a descriptor number, and
+/// the image finds its inherited copy by it
+/// ([`find_read_write_descriptor`]). It protects against number
+/// reuse; it is not authentication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FdIdentity {
+    /// The identity of the file open at `fd`.
+    pub fn of_fd(fd: i32) -> std::io::Result<Self> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat borrows the descriptor and writes only
+        // through `stat`; a closed number is reported as EBADF.
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        })
+    }
+
+    /// `<st_dev>:<st_ino>` in decimal, the environment form.
+    pub fn encode(self) -> String {
+        format!("{}:{}", self.dev, self.ino)
+    }
+
+    /// The inverse of [`FdIdentity::encode`]; `None` for anything
+    /// else.
+    #[allow(dead_code)] // The in-guest preload is the caller.
+    pub fn decode(text: &str) -> Option<Self> {
+        let (dev, ino) = text.split_once(':')?;
+        Some(Self {
+            dev: dev.parse().ok()?,
+            ino: ino.parse().ok()?,
+        })
+    }
+}
+
+/// The highest-numbered descriptor this process has open for
+/// reading and writing on the file `identity` names, found by
+/// listing `/proc/self/fd`, or `None`. Highest, because a copy the
+/// runtime placed sits at or above its reserved minimum, above any
+/// number a program gets by lowest-free allocation; read-write,
+/// because a read-only reopen of the same file is not a copy the
+/// launcher handed down. Run it before the guest's first
+/// instruction in the image: it names descriptors through ordinary
+/// syscalls, which the installed runtime refuses on its own
+/// protected numbers.
+#[allow(dead_code)] // The in-guest preload (preload/src/runtime_memfds.rs) is the caller.
+pub fn find_read_write_descriptor(identity: FdIdentity) -> std::io::Result<Option<i32>> {
+    let mut found = None;
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // The listing's own directory descriptor and numbers closed
+        // since the listing fail or differ here and are skipped.
+        if FdIdentity::of_fd(fd).ok() != Some(identity) {
+            continue;
+        }
+        // SAFETY: F_GETFL only reads this descriptor's status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
+            continue;
+        }
+        found = found.max(Some(fd));
+    }
+    Ok(found)
 }
 
 pub fn probe_gen() -> u64 {
@@ -1073,5 +1218,80 @@ mod tests {
             c.translate(Path::new("/"), Path::new("/"), None),
             PathBuf::from("/srv/rootfs")
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_gen_tests {
+    use super::*;
+
+    fn memfd(name: &std::ffi::CStr) -> i32 {
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        fd
+    }
+
+    fn close(fd: i32) {
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn identity_round_trips_and_rejects_other_text() {
+        let identity = FdIdentity { dev: 64769, ino: 1234567 };
+        assert_eq!(identity.encode(), "64769:1234567");
+        assert_eq!(FdIdentity::decode("64769:1234567"), Some(identity));
+        for bad in ["", "7", "7:", ":7", "7:8:9", "-1:2", "a:2", "7 :8", "3"] {
+            assert_eq!(FdIdentity::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn find_takes_the_highest_read_write_copy_of_that_file_only() {
+        let file = memfd(c"literoot-find-test");
+        let identity = FdIdentity::of_fd(file).unwrap();
+        let other = memfd(c"literoot-find-other");
+        // A read-write duplicate high up: the copy a placement leaves.
+        let high = unsafe { libc::fcntl(file, libc::F_DUPFD_CLOEXEC, 700) };
+        assert!(high >= 700);
+        // A read-only reopen of the same file, higher still: not a
+        // handed-down copy, so it must not win.
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{file}")).unwrap();
+        let read_only = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(read_only >= 0);
+        let read_only_high = unsafe { libc::fcntl(read_only, libc::F_DUPFD_CLOEXEC, 900) };
+        assert!(read_only_high >= 900);
+        assert_eq!(find_read_write_descriptor(identity).unwrap(), Some(high));
+        close(high);
+        assert_eq!(find_read_write_descriptor(identity).unwrap(), Some(file));
+        close(file);
+        // Only read-only copies of it remain open.
+        assert_eq!(find_read_write_descriptor(identity).unwrap(), None);
+        close(read_only);
+        close(read_only_high);
+        assert_eq!(find_read_write_descriptor(identity).unwrap(), None);
+        close(other);
+    }
+
+    #[test]
+    fn shared_gen_memfd_is_size_sealed_before_use() {
+        let fd = create_shared_gen_fd();
+        assert!(fd >= 0, "create_shared_gen_fd failed");
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        assert_eq!(
+            seals,
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
+            "seals {seals:#x}"
+        );
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(stat.st_size, 8);
+        // Neither descriptor nor path can resize it.
+        assert_eq!(unsafe { libc::ftruncate(fd, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+        assert_eq!(unsafe { libc::truncate(path.as_ptr(), 4096) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        assert!(PROBE_GEN_SHARED.get().is_some(), "the counter is mapped");
+        close(fd);
     }
 }
