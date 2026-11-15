@@ -1063,11 +1063,24 @@ fn run_backend(
     backend: &str,
     in_guest: bool,
 ) -> Result<u8, String> {
-    let kill_on_exit = cfg.kill_on_exit;
     // LITEROOT_STATS / LITEROOT_EXIT_RECORD / LITEROOT_CGROUP (off by
     // default): decided once, before any backend starts, and never passed
-    // to the guest; the run's own cgroup is entered here.
+    // to the guest; the run's own cgroup is entered here. A finished run
+    // concludes the record itself; every error path abandons it here, so
+    // the cgroup's cleanup is never left to Drop.
     let stats = crate::run_stats::RunStats::from_env(&mut cmd)?;
+    run_backend_with(&stats, cmd, cfg, backend, in_guest).map_err(|e| stats.abandon(e))
+}
+
+/// [`run_backend`] once the record request is decided.
+fn run_backend_with(
+    stats: &crate::run_stats::RunStats,
+    mut cmd: reverie::process::Command,
+    cfg: LiterootConfig,
+    backend: &str,
+    in_guest: bool,
+) -> Result<u8, String> {
+    let kill_on_exit = cfg.kill_on_exit;
     // Shared probe-cache generation (memfd inherited by the
     // whole guest tree; translate.rs probe coherence).
     let gen_fd = crate::translate::create_shared_gen_fd();

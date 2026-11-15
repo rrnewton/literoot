@@ -45,9 +45,10 @@ use crate::refusal_log;
 /// for a launcher that can tell that case apart; this one cannot by type,
 /// so it writes `launch`. `reporter`, an in-guest run in which no preload
 /// process acknowledged refusal reporting (a preload built before this
-/// log, which runs the guest but reports nothing). `stats_record`, the
-/// guest finished but the requested LITEROOT_STATS record could not be
-/// written (`run_stats`); the run's status is then `STATS_RECORD_EXIT`.
+/// log, which runs the guest but reports nothing). `stats_record`, a
+/// requested stats record could not be written, or the run's measurement
+/// cgroup could not be read or cleaned up (`run_stats`); the run's status
+/// is then `STATS_RECORD_EXIT`, and this token outranks the others.
 pub const END_ERRORS: &[&str] = &[
     "log_write",
     "connections_open",
