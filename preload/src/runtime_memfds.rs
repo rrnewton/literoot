@@ -272,6 +272,10 @@ fn replace_in_fork_child() {
     if probe.is_none() && store.is_none() {
         return;
     }
+    // MUTANT (clock first; never in the tree): this fork child's first RCB
+    // clock read runs before the reopens, as if Reverie had moved one ahead
+    // of the Tool's construction. It closes the inherited copies.
+    let _ = reverie_inguest::guest::clock::read_guest_rcb_clock();
     // Both copies first, through the runtime's gate.
     let probe_copy = probe.map(|(fd, _)| reopen_raw(fd));
     let store_copy = store.map(|store| reopen_raw(store.fd()));
