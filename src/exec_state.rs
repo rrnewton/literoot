@@ -866,7 +866,6 @@ mod tests {
             pending_stack_limit: None,
             initial_stack_limit_consumed: false,
             kill_registered: false,
-            swallow_next_self_stop: false,
         }
     }
 
