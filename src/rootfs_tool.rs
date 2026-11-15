@@ -699,9 +699,15 @@ impl GlobalTool for LiterootGlobal {
     }
 }
 
-/// A per-dispatch translation memo key: (dispatch counter, dirfd, guest
-/// path, final symlink followed).
-type MemoKey = (u64, i32, PathBuf, bool);
+/// A per-dispatch translation memo key: (the translating thread, dirfd,
+/// guest path, final symlink followed). The thread scopes it to one
+/// dispatch: a thread runs one dispatch at a time, and its entries are
+/// dropped when its next dispatch starts and when it exits. Keyed by thread,
+/// not by a process-wide counter, because the value depends on the thread
+/// (its descriptor table, its /proc/<pid>/task/<tid> paths), and on ptrace
+/// another thread's dispatch can run while this one waits on an injection
+/// (https://github.com/rrnewton/literoot/issues/9).
+type MemoKey = (i32, i32, PathBuf, bool);
 /// A translation: the host path, the symlinks its walk followed, the guest
 /// route it came through (None when the name went to the kernel as is),
 /// and whether it went through another process's directory link.
@@ -778,27 +784,28 @@ pub(crate) struct ProcState {
     /// identity-only sets them; until then, and after an exec (where
     /// the kernel resets them), the fake effective ids.
     pub(crate) fake_fs: Option<(u32, u32)>,
-    /// Per-dispatch translation memo (stat-gap fix): one syscall
-    /// dispatch translates the same (dirfd, path) through several
-    /// helpers; memoize within the dispatch only, keyed by the
-    /// dispatch counter below. Never lives across dispatches, so no
-    /// cross-syscall staleness is possible.
+    /// Dispatch counter, bumped at every dispatch: keys `config_memo` (a
+    /// value no thread changes) and `gate_closed_at`.
     pub(crate) dispatch_seq: u64,
-    /// Per-dispatch translations, with the symlinks each walk followed and
-    /// the guest route it came through.
+    /// Per-dispatch translations (stat-gap fix: one syscall dispatch
+    /// translates the same (dirfd, path) through several helpers), with the
+    /// symlinks each walk followed and the guest route it came through,
+    /// each keyed by its thread ([`MemoKey`]). Never lives across a thread's
+    /// dispatches, so no cross-syscall staleness is possible.
     pub(crate) translate_memo: Vec<(MemoKey, Result<Walked, crate::translate::WalkError>)>,
-    /// The (dispatch, dirfd) bases whose ".." climb out of a deleted
-    /// directory the guest's own search check passed in this dispatch
-    /// (E1): only those climbs translate.
-    pub(crate) searched_bases: Vec<(u64, i32)>,
+    /// The (thread, dirfd) bases whose ".." climb out of a deleted
+    /// directory the guest's own search check passed in that thread's
+    /// current dispatch (E1): only those climbs translate. Keyed by thread
+    /// as [`MemoKey`] is (https://github.com/rrnewton/literoot/issues/9).
+    pub(crate) searched_bases: Vec<(i32, i32)>,
     /// The dispatch whose dead-base gate was found closed at the top of the
     /// route (S.3 placement), with the dispatch mode it read: the arm's own
     /// dead-base refusal counts it once (`probes`, `refused`, `sud_refused`).
     /// One slot per process, keyed by the shared `dispatch_seq`: when sibling
     /// threads dispatch at once, a closed-gate count can be lost or land on
     /// another thread's dispatch. Only these diagnostic counters can be
-    /// wrong; the refusal itself never depends on the slot. Same class as
-    /// `translate_memo` and `searched_bases`.
+    /// wrong; the refusal itself never depends on the slot. (The memo and
+    /// the searched bases, once the same class, are keyed by thread.)
     pub(crate) gate_closed_at: Option<GateClosed>,
     /// Probe admission for this thread group (S.3).
     pub(crate) admission: crate::dead_base::Admission,
@@ -819,19 +826,6 @@ pub(crate) struct ProcState {
     /// This process has been registered for --kill-on-exit
     /// in the pid registry (creation-time registration).
     pub(crate) kill_registered: bool,
-    /// Armed by a refused PTRACE_TRACEME until the next
-    /// intercepted (subscribed) syscall dispatch or exec:
-    /// guests that ignore the TRACEME result and
-    /// immediately self-SIGSTOP would stop untraced with
-    /// nobody to continue them, so the Kill arm swallows
-    /// that one self-stop. Taken (cleared) at every
-    /// dispatch entry and on exec. It is NOT cleared by
-    /// unsubscribed syscalls (read/write/getpid/... never
-    /// reach this Tool), so a later legitimate self-stop
-    /// after only unsubscribed syscalls is still
-    /// swallowed — the accepted leftover window, a known
-    /// limitation.
-    pub(crate) swallow_next_self_stop: bool,
 }
 
 /// Which kernel fd table a task of this process uses. Every thread starts
@@ -1040,7 +1034,6 @@ impl Default for RootfsTool {
                 admission: Default::default(),
                 config_memo: None,
                 kill_registered: false,
-                swallow_next_self_stop: false,
                 argv: Vec::new(),
                 pending_stack_limit: None,
                 initial_stack_limit_consumed: false,
@@ -1099,6 +1092,18 @@ pub struct RootfsThreadState {
     /// CLONE_VM process. Cleared after the inject.
     #[serde(default)]
     pub child_scratch: Option<ScratchPage>,
+    /// Armed by this thread's refused PTRACE_TRACEME until its next
+    /// intercepted (subscribed) syscall dispatch or exec: guests that
+    /// ignore the TRACEME result and immediately self-SIGSTOP would stop
+    /// untraced with nobody to continue them, so the Kill arm swallows that
+    /// one self-stop. Taken (cleared) at this thread's every dispatch entry
+    /// and on exec. Per thread, so another thread's dispatch never takes it
+    /// (https://github.com/rrnewton/literoot/issues/9). It is NOT cleared by
+    /// unsubscribed syscalls (read/write/getpid/... never reach this Tool),
+    /// so a later legitimate self-stop after only unsubscribed syscalls is
+    /// still swallowed: the accepted leftover window, a known limitation.
+    #[serde(default)]
+    pub swallow_self_stop: bool,
 }
 
 /// A thread's scratch slot (4096 bytes of an injected anonymous mmap) and
@@ -2104,6 +2109,7 @@ impl Tool for RootfsTool {
                 sud_on: false,
                 scratch: parent.child_scratch,
                 child_scratch: None,
+                swallow_self_stop: false,
             },
             None => RootfsThreadState::default(),
         }
@@ -2166,6 +2172,9 @@ impl Tool for RootfsTool {
         let mut st = self.state.lock().unwrap();
         // An exited thread's admitted probes can no longer inject (S.3).
         st.admission.release_thread(tid.as_raw());
+        // Its translations and searched bases (keyed by thread) go with it.
+        st.translate_memo.retain(|((t, ..), _)| *t != tid.as_raw());
+        st.searched_bases.retain(|(t, _)| *t != tid.as_raw());
         // Its scratch page, for the next new thread: only a page of this
         // image (a thread that exec killed held a page of the old one, now
         // unmapped), and never twice (a vfork child shares its caller's
@@ -2205,14 +2214,14 @@ impl Tool for RootfsTool {
             st.bootstrapped = true;
             // New image: every previous scratch mapping is gone.
             st.new_scratch_image();
-            // A pending self-stop swallow does not survive exec.
-            st.swallow_next_self_stop = false;
             // The kernel resets the filesystem ids to the effective ids.
             st.fake_fs = None;
         }
         // Exec resets the thread's syscall user dispatch mode.
         guest.thread_state_mut().sud_on = false;
         guest.thread_state_mut().scratch = None;
+        // A pending self-stop swallow does not survive exec.
+        guest.thread_state_mut().swallow_self_stop = false;
         // Pre-allocate the exec'ing thread's scratch page here, with the
         // pool for this image's new threads: injecting an mmap between a
         // guest's two execve calls was measured to make the second fail
@@ -2477,17 +2486,21 @@ impl Tool for RootfsTool {
         guest: &mut T,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        // New dispatch: per-dispatch translation memo is keyed by this
-        // counter and never consulted across dispatches. The
-        // self-stop swallow is likewise taken here: it is armed
-        // until this next intercepted dispatch; unsubscribed
-        // syscalls never reach here and do not clear it.
+        // New dispatch of this thread: its translation memo entries and
+        // searched bases are dropped (never consulted across its
+        // dispatches), and its self-stop swallow is taken: it is armed until
+        // this next intercepted dispatch; unsubscribed syscalls never reach
+        // here and do not clear it. Only this thread's: another thread's
+        // dispatch may be waiting on an injection meanwhile, with its entries
+        // live (https://github.com/rrnewton/literoot/issues/9).
         let swallow_armed = {
+            let tid = guest.tid().as_raw();
             let mut st = self.state.lock().unwrap();
             st.dispatch_seq = st.dispatch_seq.wrapping_add(1);
-            st.translate_memo.clear();
-            st.searched_bases.clear();
-            std::mem::take(&mut st.swallow_next_self_stop)
+            st.translate_memo.retain(|((t, ..), _)| *t != tid);
+            st.searched_bases.retain(|(t, _)| *t != tid);
+            drop(st);
+            std::mem::take(&mut guest.thread_state_mut().swallow_self_stop)
         };
         self.note_process_for_kill_on_exit(guest);
         if std::env::var_os("LITEROOT_DEBUG").is_some() {
@@ -3735,7 +3748,7 @@ impl Tool for RootfsTool {
                         note_guest_refusal(GuestKind::Ptrace);
                     }
                     if pt.request() == libc::PTRACE_TRACEME as u32 {
-                        self.state.lock().unwrap().swallow_next_self_stop = true;
+                        guest.thread_state_mut().swallow_self_stop = true;
                     }
                     Err(reverie::syscalls::Errno::EPERM.into())
                 } else {
@@ -5159,14 +5172,14 @@ impl RootfsTool {
     /// memoized to itself, so the arm opens the host file as is.
     fn own_exe_route<T: Guest<Self>>(&self, guest: &T, dirfd: i32) -> PathBuf {
         let exe = self.exe_guest(guest);
+        let tid = guest.tid().as_raw();
         let mut st = self.state.lock().unwrap();
         if st.exe_host {
-            let seq = st.dispatch_seq;
             st.translate_memo
-                .retain(|((at, fd, path, _), _)| !(*at == seq && *fd == dirfd && *path == exe));
+                .retain(|((t, fd, path, _), _)| !(*t == tid && *fd == dirfd && *path == exe));
             for follow in [false, true] {
                 st.translate_memo
-                    .push(((seq, dirfd, exe.clone(), follow), Ok((exe.clone(), 0, None, OtherLink::None))));
+                    .push(((tid, dirfd, exe.clone(), follow), Ok((exe.clone(), 0, None, OtherLink::None))));
             }
         }
         exe
@@ -6484,11 +6497,11 @@ impl RootfsTool {
         dirfd: i32,
         path: &Path,
     ) -> Result<Walked, reverie::syscalls::Errno> {
-        if let Some(hit) = self.memoized_translate(dirfd, path, false) {
+        if let Some(hit) = self.memoized_translate(guest.tid().as_raw(), dirfd, path, false) {
             return hit.map_err(walk_errno);
         }
         let hit = self.translate_for_uncached(guest, dirfd, path);
-        self.memoize_translate(dirfd, path, false, &hit);
+        self.memoize_translate(guest.tid().as_raw(), dirfd, path, false, &hit);
         hit.map_err(walk_errno)
     }
 
@@ -6497,12 +6510,13 @@ impl RootfsTool {
     /// translate the same name.
     fn memoized_translate(
         &self,
+        tid: i32,
         dirfd: i32,
         path: &Path,
         follow: bool,
     ) -> Option<Result<Walked, crate::translate::WalkError>> {
         let st = self.state.lock().unwrap();
-        let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
+        let key = (tid, dirfd, path.to_path_buf(), follow);
         st.translate_memo
             .iter()
             .find(|(k, _)| k == &key)
@@ -6511,6 +6525,7 @@ impl RootfsTool {
 
     fn memoize_translate(
         &self,
+        tid: i32,
         dirfd: i32,
         path: &Path,
         follow: bool,
@@ -6520,8 +6535,7 @@ impl RootfsTool {
             note_walk_error(e);
         }
         let mut st = self.state.lock().unwrap();
-        let key = (st.dispatch_seq, dirfd, path.to_path_buf(), follow);
-        st.translate_memo.push((key, hit.clone()));
+        st.translate_memo.push(((tid, dirfd, path.to_path_buf(), follow), hit.clone()));
     }
 
     fn translate_for_uncached<T: Guest<Self>>(
@@ -6544,7 +6558,7 @@ impl RootfsTool {
         } else {
             self.fd_guest_path(guest, &cfg, &st, dirfd)
         };
-        let searched = st.searched_bases.contains(&(st.dispatch_seq, dirfd));
+        let searched = st.searched_bases.contains(&(guest.tid().as_raw(), dirfd));
         // An empty path with a real dirfd (AT_EMPTY_PATH, or a call that
         // must fail ENOENT without it) names the fd's own object, which
         // the kernel already holds: leave it empty, so each syscall's own
@@ -6668,7 +6682,7 @@ impl RootfsTool {
         dirfd: i32,
         path: &Path,
     ) -> Result<Walked, reverie::syscalls::Errno> {
-        if let Some(hit) = self.memoized_translate(dirfd, path, true) {
+        if let Some(hit) = self.memoized_translate(guest.tid().as_raw(), dirfd, path, true) {
             return hit.map_err(walk_errno);
         }
         let cfg = self.config(guest);
@@ -6686,7 +6700,7 @@ impl RootfsTool {
             .map(|(resolved, resolved_guest)| {
                 (resolved, links, resolved_guest, policy.other_link())
             });
-        self.memoize_translate(dirfd, path, true, &hit);
+        self.memoize_translate(guest.tid().as_raw(), dirfd, path, true, &hit);
         hit.map_err(walk_errno)
     }
 
@@ -6896,9 +6910,8 @@ impl RootfsTool {
                     return Some(Err(answer.into()));
                 }
                 UnnamedRoute::Guest { climbed: true, .. } if !g.dead_name => {
-                    let mut st = self.state.lock().unwrap();
-                    let seq = st.dispatch_seq;
-                    st.searched_bases.push((seq, g.dirfd));
+                    let tid = guest.tid().as_raw();
+                    self.state.lock().unwrap().searched_bases.push((tid, g.dirfd));
                 }
                 UnnamedRoute::Refused(kind) => return Some(self.refuse_probe(kind)),
                 // The base changed class between the decide and now.
@@ -7733,9 +7746,9 @@ impl RootfsTool {
             _ => None,
         };
         let guest_bytes = match link_of {
-            // The guest root, "/", for every guest process (once the
-            // caller's own answered the host rootfs path, and a row's the
-            // kernel's "/").
+            // The guest root, "/", for every guest process (before this
+            // change the caller's own answered the host rootfs path, and a
+            // row's the kernel's "/").
             Some((MagicKind::Root, _)) => b"/".to_vec(),
             Some((MagicKind::Exe, pid)) if pid == own => {
                 let raw = self.exe_guest(guest);
@@ -9318,7 +9331,7 @@ fn proc_status_ids(pid: i32) -> Option<(i32, i32)> {
 /// - A guest process: one of the guest's own (itself, its threads, or on
 ///   the ptrace backend any task literoot's tracer traces), or a process
 ///   with a shared-record row (a guest child on the in-guest backends),
-/// judged by its thread group:
+///   judged by its thread group:
 ///   - `root` continues from the guest root;
 ///   - `cwd`, and `fd/<n>` holding a directory, continue from the
 ///     directory's guest path, when it has one that leads back to the same

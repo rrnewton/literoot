@@ -5532,8 +5532,8 @@ mod own_views {
 
     /// The guest's own links are answered by their owner, whatever the
     /// naming: a numeric pid or tid reads as /proc/self or /proc/thread-self
-    /// does; cwd and a directory fd/<n> give guest paths; root is "/" (once
-    /// the host rootfs path, a disclosed change).
+    /// does; cwd and a directory fd/<n> give guest paths; root is "/"
+    /// (before this change, the host rootfs path: a disclosed change).
     #[test]
     fn own_numeric_readlink_is_reversed() {
         let _lane = serial();
@@ -6723,5 +6723,213 @@ mod scratch_units {
             assert_eq!(super::super::child_scratch(flags, page), want, "{what}");
         }
         assert_eq!(super::super::child_scratch(libc::SIGCHLD as u64, None), None, "nothing to keep");
+    }
+}
+
+/// https://github.com/rrnewton/literoot/issues/9: the translation memo and
+/// the searched bases are per thread. Two threads of one process with split
+/// descriptor tables (A unshared CLONE_FILES) both name descriptor N: in A's
+/// table a deleted directory, in the process table (B's) a live one. B's
+/// whole dispatch runs inside A's held search-check injection, as another
+/// thread's handler can on ptrace while A waits.
+mod memo_units {
+    use super::a1_units::*;
+    use super::*;
+
+    /// A free descriptor number for this unit's tables, high enough that no
+    /// other unit uses it.
+    const N: i32 = 987;
+    const N2: i32 = 988;
+
+    /// Run `f(main_tid)` on a thread of its own that unshared CLONE_FILES,
+    /// `main_tid` being the calling thread's id (still alive, on the process
+    /// table).
+    fn on_split_table<R: Send>(f: impl FnOnce(i32) -> R + Send) -> R {
+        let main_tid = unsafe { libc::gettid() };
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // SAFETY: CLONE_FILES only: this thread gets its own table copy.
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0, "unshare(CLONE_FILES)");
+                f(main_tid)
+            })
+            .join()
+            .unwrap()
+        })
+    }
+
+    /// `dir` opened O_PATH|O_DIRECTORY at descriptor `at` of this thread's
+    /// table.
+    fn open_dir_at(dir: &Path, at: i32) {
+        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open {}", dir.display());
+        assert_eq!(unsafe { libc::dup2(fd, at) }, at);
+        close(fd);
+    }
+
+    fn openat_n(path: &std::ffi::CStr) -> Syscall {
+        Syscall::from_raw(
+            Sysno::openat,
+            SyscallArgs::new(N as usize, path.as_ptr() as usize, libc::O_RDONLY as usize, 0, 0, 0),
+        )
+    }
+
+    /// The translate_memo case of issue 9. A's openat(N, "../x") climbs out
+    /// of its deleted directory D (in the unit directory U): natively U/x.
+    /// While A's search check is held, B's openat(N, "../x") translates
+    /// from the live L = U/live/d: U/live/x, memoized. A's call must still
+    /// open U/x; with a memo shared by the threads it opened U/live/x.
+    #[test]
+    fn a_threads_translation_is_its_own() {
+        let _lane = serial();
+        let _off = DispatchOff;
+        take_reports();
+        let u = unit_dir();
+        std::fs::create_dir_all(u.join("live/d")).unwrap();
+        std::fs::write(u.join("x"), b"a's").unwrap();
+        std::fs::write(u.join("live/x"), b"b's").unwrap();
+        let want = native(u.join("x").to_str().unwrap());
+        let wrong = native(u.join("live/x").to_str().unwrap());
+        assert_ne!(want, wrong);
+        // The process table (B's): N is the live L.
+        open_dir_at(&u.join("live/d"), N);
+        let (got, b_result) = on_split_table(|main_tid| {
+            // A's table: N is the deleted D.
+            std::fs::create_dir(u.join("dead")).unwrap();
+            open_dir_at(&u.join("dead"), N);
+            std::fs::remove_dir(u.join("dead")).unwrap();
+            let mut scratch = Scratch::new();
+            let (tool, mut a) = on_host_root_ptrace(&mut scratch, &[]);
+            let mut b_page = Scratch::new();
+            let mut b = RecordingGuest::new(a.cfg.clone()).with_ids(None, Some(main_tid));
+            b.thread_state_mut().scratch = Some(super::super::ScratchPage { addr: b_page.addr(), image: 0 });
+            let b = Arc::new(Mutex::new(b));
+            let b_result = Arc::new(Mutex::new(None));
+            let held = {
+                let (tool, b, b_result) = (tool.clone(), b.clone(), b_result.clone());
+                Answer::Call(Box::new(move || {
+                    let mut b = b.lock().unwrap();
+                    // B's call is answered from the script: never executed.
+                    b.expect([Answer::Return(Ok(55))]);
+                    let r = dispatch(&tool, &mut b, openat_n(c"../x"));
+                    let staged = b.injected().last().map(|(_, args)| {
+                        // SAFETY: B staged the name in its own page.
+                        unsafe { std::ffi::CStr::from_ptr(args[1] as *const libc::c_char) }.to_bytes().to_vec()
+                    });
+                    *b_result.lock().unwrap() = Some((r.ok(), staged));
+                    Ok(0)
+                }))
+            };
+            // A: the argument probe (EBADF: the lookup is reached), the
+            // search check (held: B runs), then its own call, natively.
+            a.expect([err(Errno::EBADF), held]);
+            a.native_rest = true;
+            let r = dispatch(&tool, &mut a, openat_n(c"../x"));
+            let got = opened("A", &r);
+            close(N);
+            set_dispatch_read(None);
+            drop(b_page);
+            let b_result = b_result.lock().unwrap().take();
+            (got, b_result)
+        });
+        close(N);
+        let (b_ret, b_staged) = b_result.expect("B ran while A's search check was held");
+        assert_eq!(b_ret, Some(55), "B completes");
+        let b_name = u.join("live/x");
+        assert_eq!(b_staged, Some(b_name.as_os_str().as_encoded_bytes().to_vec()), "B's call names B's file");
+        assert_eq!(got, want, "A opens the file next to its own deleted directory, not B's");
+        assert!(take_reports().is_empty());
+        std::fs::remove_dir_all(&u).unwrap();
+    }
+
+    /// The searched_bases case of issue 9: A's renameat2(N, "../a", N2,
+    /// "../b", 0) climbs out of two deleted directories; A's first search check
+    /// passes, and B's whole dispatch runs inside A's second. A's call must
+    /// still translate both climbs and rename U/a to U/b, as natively; with
+    /// the searched bases shared by the threads, B's dispatch cleared A's
+    /// first one and A's call was refused.
+    #[test]
+    fn a_threads_searched_bases_are_its_own() {
+        let _lane = serial();
+        let _off = DispatchOff;
+        take_reports();
+        let u = unit_dir();
+        std::fs::create_dir_all(u.join("live/d")).unwrap();
+        std::fs::write(u.join("a"), b"a").unwrap();
+        open_dir_at(&u.join("live/d"), N);
+        let r = on_split_table(|main_tid| {
+            for (name, at) in [("dead1", N), ("dead2", N2)] {
+                std::fs::create_dir(u.join(name)).unwrap();
+                open_dir_at(&u.join(name), at);
+                std::fs::remove_dir(u.join(name)).unwrap();
+            }
+            let mut scratch = Scratch::new();
+            let (tool, mut a) = on_host_root_ptrace(&mut scratch, &[]);
+            let mut b_page = Scratch::new();
+            let mut b = RecordingGuest::new(a.cfg.clone()).with_ids(None, Some(main_tid));
+            b.thread_state_mut().scratch = Some(super::super::ScratchPage { addr: b_page.addr(), image: 0 });
+            let b = Arc::new(Mutex::new(b));
+            let held = {
+                let (tool, b) = (tool.clone(), b.clone());
+                Answer::Call(Box::new(move || {
+                    let mut b = b.lock().unwrap();
+                    b.expect([Answer::Return(Ok(55))]);
+                    let _ = dispatch(&tool, &mut b, openat_n(c"../x"));
+                    Ok(0)
+                }))
+            };
+            let call = Syscall::from_raw(
+                Sysno::renameat2,
+                SyscallArgs::new(N as usize, c"../a".as_ptr() as usize, N2 as usize, c"../b".as_ptr() as usize, 0, 0),
+            );
+            // A: the argument probe, the first search check (passes), the
+            // second (held: B runs), then its own call, natively.
+            a.expect([err(Errno::EBADF), ok0(), held]);
+            a.native_rest = true;
+            let r = dispatch(&tool, &mut a, call);
+            close(N);
+            close(N2);
+            set_dispatch_read(None);
+            drop(b_page);
+            r.ok()
+        });
+        close(N);
+        assert_eq!(r, Some(0), "A's rename completes");
+        assert!(!u.join("a").exists() && u.join("b").exists(), "U/a renamed to U/b");
+        assert!(take_reports().is_empty());
+        std::fs::remove_dir_all(&u).unwrap();
+    }
+
+    /// The self-stop swallow is the arming thread's: A's refused
+    /// PTRACE_TRACEME arms it for A's next self-SIGSTOP only. A sibling B's
+    /// dispatch neither takes it nor uses it: B's own SIGSTOP of the process
+    /// is delivered (injected), and A's is still swallowed afterwards. Run on
+    /// an in-guest configuration, where TRACEME is refused, with two guests
+    /// of one process standing for two threads.
+    #[test]
+    fn a_threads_self_stop_swallow_is_its_own() {
+        let _lane = serial();
+        take_guest_bits();
+        let root = unit_dir();
+        let tool = RootfsTool::default();
+        let tid = unsafe { libc::gettid() };
+        let pid = std::process::id() as usize;
+        let mut a = RecordingGuest::new(inguest_cfg(&root));
+        let mut b = RecordingGuest::new(inguest_cfg(&root)).with_ids(None, Some(tid + 1));
+        let traceme = Syscall::from_raw(Sysno::ptrace, SyscallArgs::new(libc::PTRACE_TRACEME as usize, 0, 0, 0, 0, 0));
+        let self_stop = || Syscall::from_raw(Sysno::kill, SyscallArgs::new(pid, libc::SIGSTOP as usize, 0, 0, 0, 0));
+        assert_eq!(errno(&dispatch(&tool, &mut a, traceme)), Some(Errno::EPERM), "A's TRACEME refused");
+        assert!(a.injected().is_empty(), "nothing of A's injected");
+        take_guest_bits();
+        // B's SIGSTOP of the process: B's swallow is not armed.
+        b.expect([ok0()]);
+        assert_eq!(dispatch(&tool, &mut b, self_stop()).ok(), Some(0), "B's kill");
+        let kinds: Vec<Sysno> = b.injected().iter().map(|(nr, _)| *nr).collect();
+        assert_eq!(kinds, vec![Sysno::kill], "B's self-stop is delivered, not swallowed");
+        // A's next self-stop: still armed.
+        assert_eq!(dispatch(&tool, &mut a, self_stop()).ok(), Some(0), "A's kill");
+        assert!(a.injected().is_empty(), "A's self-stop is swallowed");
+        take_guest_bits();
+        std::fs::remove_dir(&root).unwrap();
     }
 }

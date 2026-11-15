@@ -482,7 +482,7 @@ The same line is also written, outside the numbered triggers, for:
   from literoot's records, not the launcher's, and an open or execve of its own `exe` reaches its guest exe. Its own
   `root` is the guest root, and its own `cwd` and `fd/<n>` continue from the directory's guest path when it has one
   that leads back to the same directory (the own links have this identity check too: §4.9.8). Readlink
-  of its own links answers by owner, whatever the naming: `root` reads `/` (once the host rootfs path),
+  of its own links answers by owner, whatever the naming: `root` reads `/` (before this change, the host rootfs path),
   and `cwd`, `fd/<n>` and `map_files/<k>` read their guest paths. Every other per-process entry of its own
   (environ, maps, smaps, …) is the kernel's: it shows host values (launcher variables such as LD_PRELOAD with host
   paths, the host paths of mapped files). A guest process literoot does not own but that has a row in literoot's
@@ -702,6 +702,11 @@ Known limits:
   execve is injected (they are recorded first, for the new image) until the call returns: a sibling thread that
   reads /proc/self/exe or cmdline in that window sees the successor's. A failed execve restores the prior ones.
   Natively the old values hold until the exec's point of no return.
+- **Checks no unit pins.** Two checks have no unit that fails without them: openat2's access_ok range check at its
+  call site (its arithmetic has a unit; a dispatch case needs the last user page mapped, which another mapping can
+  hold) and the pool mapping's image guard (not reachable on the pinned Reverie). Two test gaps remain: an
+  unreadable status read at a probe is pinned at the admission record but not through a handler, and no unit
+  freezes the refusal wire tags 0-17 as golden bytes.
 - **openat2's open_how check on arm64.** The tracer's copy models access_ok with the top of user memory at 2^48,
   or 2^52 when a mapping above 2^48 succeeds; a kernel built for 52-bit addresses on 48-bit hardware, and the
   tagged-address ABI (a tagged open_how pointer), are not modelled: such a range can answer EFAULT where the kernel
