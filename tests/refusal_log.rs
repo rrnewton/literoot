@@ -594,10 +594,10 @@ fn fixture_preload(var: &str, what: &str) -> Option<PathBuf> {
 
 /// A preload built before the compatibility stamp (the pin parent 2dbd5c52
 /// installs the bare Tool under the same Reverie pin) is now refused at the
-/// stamp preflight, before anything runs: a non-zero exit, the named
-/// refusal as one whole stderr line, and a valid log whose only refusal is
-/// `launcher preload_stamp`, with no route line. `LITEROOT_STALE_PRELOAD`
-/// names such a preload.
+/// stamp preflight, before anything runs: the generic launcher-failure exit
+/// 125, the named refusal as one whole stderr line, and a valid log whose
+/// only refusal is `launcher preload_stamp`, with no route line.
+/// `LITEROOT_STALE_PRELOAD` names such a preload.
 #[test]
 fn a_preload_without_the_stamp_is_refused_before_the_run() {
     let Some(stale) = fixture_preload("LITEROOT_STALE_PRELOAD", "stale preload") else {
@@ -616,7 +616,7 @@ fn a_preload_without_the_stamp_is_refused_before_the_run() {
             .stdin(Stdio::null())
             .output()
             .expect("run literoot");
-        assert_ne!(out.status.code(), Some(0), "{backend}: the stamp refusal fails the run");
+        assert_eq!(out.status.code(), Some(125), "{backend}: the stamp refusal fails the run");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr
@@ -634,9 +634,9 @@ fn a_preload_without_the_stamp_is_refused_before_the_run() {
 /// A stamp-valid preload that never reports (the `reporter-off` fixture,
 /// built from this checkout's preload/ with `--features reporter-off`) runs
 /// the guest, and then the launcher fails the run by name, with or without
-/// the side log: a non-zero exit, `in-guest preload did not report` as one
-/// whole stderr line, and a log that ends `error reporter`, which the
-/// validator rejects. `LITEROOT_REPORTER_OFF_PRELOAD` names the fixture.
+/// the side log: exit 125, `in-guest preload did not report` as one whole
+/// stderr line, and a log that ends `error reporter`, which the validator
+/// rejects. `LITEROOT_REPORTER_OFF_PRELOAD` names the fixture.
 #[test]
 fn a_preload_that_never_reports_fails_the_run() {
     let Some(silent) = fixture_preload("LITEROOT_REPORTER_OFF_PRELOAD", "reporter-off preload")
@@ -665,7 +665,7 @@ fn a_preload_that_never_reports_fails_the_run() {
                 .stdin(Stdio::null())
                 .output()
                 .expect("run literoot");
-            assert_ne!(out.status.code(), Some(0), "{backend} (log {logged}): a hard failure");
+            assert_eq!(out.status.code(), Some(125), "{backend} (log {logged}): a hard failure");
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 stderr.lines().any(|l| l == "literoot: in-guest preload did not report"),

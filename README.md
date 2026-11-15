@@ -24,9 +24,10 @@ The build also builds literoot's in-guest preload and embeds it in the
 binary, so the in-guest backends need no second build step. Installing from
 crates.io is not supported. At launch literoot writes the preload to a
 private cache, `$XDG_CACHE_HOME/literoot/<sha256>/` (else
-`~/.cache/literoot/<sha256>/`), and checks its SHA-256 again just before the
-guest loads it. Other users cannot write there; a process of the same user
-could still replace the file between that check and the load. When the
+`~/.cache/literoot/<sha256>/`), and checks its SHA-256 again just before it
+hands the file's path to the launcher; the guest loads the file later, by
+that path. Other users cannot write there; a process of the same user could
+still replace the file between that check and the load. When the
 in-guest preload cannot be used, literoot refuses by name; it never falls back
 to ptrace. `LITEROOT_PRELOAD=<file>` runs a separately built preload instead,
 admitted only when its stamp matches this literoot.

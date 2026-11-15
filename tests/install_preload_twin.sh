@@ -4,17 +4,17 @@
 # Fixture: rootfs with a dynamically linked /bin/cat and /bin/true; /proc is
 # bound by -R, never assumed. umask 022 (a common user default) is set once,
 # after the checkout checks; every leg inherits it, so a cache that relies on
-# the umask for privacy fails T1-modes (plan 2.4). Signals NOTHING: no kill/pkill/timeout/pid
+# the umask for privacy fails T1-modes. Signals NOTHING: no kill/pkill/timeout/pid
 # arithmetic, foreground children only; the EXIT cleanup sends no signal.
 # NO STUB PRINTS PASS: every leg below is implemented end-to-end in this
 # script or delegated to a named Rust test invoked with --exact under a
-# valid identifier and checked for exactly 1 test run and passed (7.8).
+# valid identifier and checked for exactly 1 test run and passed.
 # A leg that cannot be induced FAILS loudly; nothing is skipped to green.
 set -u
 WORKROOT=${1:-}; CHECKOUT=${2:-}; HEADSHA=${3:-}; ROOTFS=${4:-}
 [ -n "$WORKROOT" ] && [ -n "$CHECKOUT" ] && [ -n "$HEADSHA" ] && [ -n "$ROOTFS" ] || { echo "FAIL: usage" >&2; exit 2; }
 [ ! -e "$CHECKOUT/target" ] || { echo "FAIL: checkout target exists" >&2; exit 1; }
-# HEADSHA must be the checkout HEAD and the tree clean (r7 N-8): --path legs
+# HEADSHA must be the checkout HEAD and the tree clean: --path legs
 # build the working tree while --git builds HEADSHA; different bytes = fail.
 ACTUALHEAD=$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null) || { echo "FAIL: cannot read checkout HEAD" >&2; exit 1; }
 [ "$ACTUALHEAD" = "$HEADSHA" ] || { echo "FAIL: HEADSHA differs from checkout HEAD" >&2; exit 1; }
@@ -23,10 +23,10 @@ umask 022
 WORK=$(mktemp -d "$WORKROOT/twin.XXXXXX") || exit 1
 WORK=$(readlink -f "$WORK") || { echo "FAIL: work dir canonical path" >&2; exit 1; }
 [ -n "$WORK" ] && [ -d "$WORK" ] || { echo "FAIL: work dir" >&2; exit 1; }
-# Fixture precondition (plan 7.1): a plain work root. Under a setgid one the
+# Fixture precondition: a plain work root. Under a setgid one the
 # cache directories inherit S_ISGID unless the implementation clears it, so
 # T1-modes could FAIL on the fixture rather than the code; refuse up front.
-[ ! -g "$WORK" ] || { echo "FAIL: setgid work dir; use a work root without the setgid bit (plan 7.1)" >&2; exit 1; }
+[ ! -g "$WORK" ] || { echo "FAIL: setgid work dir; use a work root without the setgid bit" >&2; exit 1; }
 KEEP=0
 cleanup() { if [ "$KEEP" = "0" ]; then rm -rf "$WORK"; else echo "logs kept: $WORK" >&2; fi; }
 trap cleanup EXIT
@@ -50,7 +50,7 @@ check_positive() {
 # check_refusal BIN LOG LOGLINE ERRLINE OUT: nonzero already checked. Own log
 # valid, validator lists exactly one refused line equal to LOGLINE, stderr
 # carries ERRLINE whole-line, no ptrace, guest produced NO output (preflight
-# refusals only; reporter legs use their own oracle, plan 7.7).
+# refusals only; the reporter legs N07/N08 use their own oracle).
 check_refusal() {
   "$1" --check-refusal-log "$2" >"$WORK/chk.txt" 2>&1 || { bad "refusal log invalid ($2)"; sed -n '1,20p' "$WORK/chk.txt" >&2; return 1; }
   STRIPPED=$(printf '%s' "$3" | sed 's/^literoot: //')
@@ -65,7 +65,7 @@ check_refusal() {
 }
 # run_rust_test bin|test NAME: in-binary seams via --bin literoot with full
 # path preload_materialize::tests::NAME; T6 via --test preload_cache_tamper.
-# --exact valid identifier; exactly 1 ran and passed; isolated dirs (B-3).
+# --exact valid identifier; exactly 1 ran and passed; own target and build dirs.
 run_rust_test() {
   if [ "$1" = "bin" ]; then
     CARGO_BUILD_BUILD_DIR="$WORK/build-unit" cargo test --manifest-path "$CHECKOUT/Cargo.toml" --target-dir "$WORK/target-unit" \
@@ -80,7 +80,7 @@ run_rust_test() {
   return 0
 }
 witness_run() { # $1=leg $2=root-suffix $3=log : initial cat only, -R binds /proc
-  "$WORK/root-$2/bin/literoot" -R "$ROOTFS" --backend liteinst --refusal-log "$3" \
+  "$WORK/root-$2/bin/literoot" -R "$ROOTFS" --backend "${WITNESS_BACKEND:-liteinst}" --refusal-log "$3" \
     -- /bin/cat /proc/self/maps >"$WORK/out-$1.txt" 2>"$WORK/err-$1.txt"; return $?
 }
 # receipt_for LEG: exactly one build receipt under this leg's build dir;
@@ -132,7 +132,7 @@ install_leg() { # $1=leg $2=path|git $3=extra cargo args $4=expected flavour
   legpass "$1"; return 0
 }
 install_leg T1 path "" liteinst || true
-# T1-modes: our cache is private under umask 022 (plan 2.1, 2.4): literoot/
+# T1-modes: our cache is private under umask 022: literoot/
 # and literoot/<sha>/ are 0700, the published file is 0500.
 LEGFAIL=0
 EXPM=$(cat "$WORK/receipt-T1.sha" 2>/dev/null || echo "")
@@ -145,10 +145,33 @@ legpass "T1-modes"
 install_leg T1g git "" liteinst || true
 # T2: exported offline config + closed-port proxies, fresh dirs; provenance is
 # this leg's own receipt (checked inside install_leg), never cache existence.
+# The caller's state of the five variables T2 sets (set, set but empty, or
+# unset) is saved first and restored after T2, so later legs (N10's
+# networked install) keep the caller's own network settings.
+T2_VARS="CARGO_NET_OFFLINE http_proxy https_proxy HTTPS_PROXY CARGO_HTTP_PROXY"
+t2_save() { for v in $T2_VARS; do if eval "[ -n \"\${$v+x}\" ]"; then eval "T2_SET_$v=1 T2_VAL_$v=\"\${$v}\""; else eval "T2_SET_$v=0 T2_VAL_$v="; fi; done; }
+t2_restore() { for v in $T2_VARS; do if eval "[ \"\$T2_SET_$v\" = 1 ]"; then eval "export $v=\"\$T2_VAL_$v\""; else unset "$v" || true; fi; done; }
+# The five variables as a child process sees them, read with printenv (not
+# with the save/restore code): "set <sha256 of the value>" or "unset" per
+# name; an empty value is set.
+t2_env_state() { for v in $T2_VARS; do if printenv "$v" >/dev/null 2>&1; then printf '%s set %s\n' "$v" "$(printenv "$v" | sha256sum | cut -d' ' -f1)"; else printf '%s unset\n' "$v"; fi; done; }
+T2_ENV_BEFORE=$(t2_env_state)
+t2_save
 export CARGO_NET_OFFLINE=true
 export http_proxy="http://127.0.0.1:9" https_proxy="http://127.0.0.1:9" HTTPS_PROXY="http://127.0.0.1:9" CARGO_HTTP_PROXY="http://127.0.0.1:9"
 install_leg T2 path "--offline" liteinst || true
-unset CARGO_NET_OFFLINE http_proxy https_proxy HTTPS_PROXY CARGO_HTTP_PROXY || true
+t2_restore
+# T2-env: after T2 each of the five variables is exactly as the caller had
+# it, as a child sees it; and the same save/restore pair keeps each of the
+# three states (set, set but empty, unset), shown on chosen values in a
+# subshell.
+LEGFAIL=0
+[ "$(t2_env_state)" = "$T2_ENV_BEFORE" ] || bad "T2-env caller variables not restored after T2"
+( export CARGO_NET_OFFLINE=caller http_proxy= HTTPS_PROXY='a b$c*'; unset https_proxy CARGO_HTTP_PROXY || true
+  before=$(t2_env_state)
+  t2_save; export CARGO_NET_OFFLINE=x http_proxy=x https_proxy=x HTTPS_PROXY=x CARGO_HTTP_PROXY=x; t2_restore
+  [ "$(t2_env_state)" = "$before" ] ) || bad "T2-env set, empty and unset round trip"
+legpass "T2-env"
 # T3b managed cache: corrupt THIS binary's (T1) entry; locked repair must run.
 LEGFAIL=0
 EXP=$(cat "$WORK/receipt-T1.sha" 2>/dev/null || echo "")
@@ -160,15 +183,17 @@ if [ -z "$EXP" ] || [ ! -f "$SO" ]; then bad "T3b no pinned cache entry"; else
   [ "$(sha256sum "$SO" | cut -d' ' -f1)" != "$EXP" ] || bad "T3b mutation no-op"
   witness_run T3b T1 "$WORK/log-T3b.txt"; rc=$?
   [ "$rc" = "0" ] || bad "T3b witness exit $rc"
-  # Detection record defined in plan 2.5/7.4; whole line, own stderr file.
+  # Detection record: the materializer prints this whole line on stderr when
+  # it publishes a damaged entry again; read from this run's own stderr file.
   grep -qxF "literoot: preload rematerialized" "$WORK/err-T3b.txt" || bad "T3b detection record missing"
   [ "$(sha256sum "$SO" | cut -d' ' -f1)" = "$EXP" ] || bad "T3b cache not rematerialized to embedded digest"
   CANON=$(readlink -f "$SO" 2>/dev/null || echo "")
-  # Witness of THIS run (out-T3b), binary T1: no stale T1 output (r7 N-2).
+  # Witness of THIS run (out-T3b), binary T1: never T1's earlier output.
   check_positive "$WORK/root-T1/bin/literoot" "$WORK/log-T3b.txt" "$WORK/out-T3b.txt" "$CANON" || true
 fi
 legpass "T3b"
-# T3c user-supplied files (A-6). Every case: own log, no ptrace, file intact.
+# T3c user-supplied files via LITEROOT_PRELOAD. Every case: own log, no ptrace,
+# file intact.
 USR="$WORK/user-preload.so"
 ART1=$(sed -n 's/^artifact=//p' "$WORK/receipt-T1.txt" 2>/dev/null || echo "")
 if [ -z "$ART1" ] || [ ! -f "$ART1" ]; then bad "T3c no T1 artifact"; legpass "T3c"; else
@@ -226,9 +251,9 @@ PYEOF
 fi
 if [ -n "$ART1" ] && [ -f "$ART1" ]; then
   BIN1="$WORK/root-T1/bin/literoot"; USRCANON=$(readlink -f "$USR" 2>/dev/null || echo "$USR")
-  # (pin legs removed in r12, lead ruling; see plan Out of scope)
+  # A user file is admitted by its stamp alone; no digest pin applies to it.
   # T3c5a unpinned compatible success. Full
-  # positive oracle with the USER file canonical path (r7 N-3), never rc-only.
+  # positive oracle with the USER file canonical path, never rc-only.
   LEGFAIL=0; cp "$ART1" "$USR" || bad "T3c5a copy"; export LITEROOT_PRELOAD="$USR"
   UB4=$(sha256sum "$USR" 2>/dev/null | cut -d' ' -f1); [ -n "$UB4" ] || bad "T3c5a before-hash"
   witness_run T3c5a T1 "$WORK/log-T3c5a.txt"; rc=$?
@@ -258,7 +283,8 @@ check_positive "$WORK/root-T1/bin/literoot" "$WORK/log-TTRAPU.txt" "$WORK/out-TT
 UAF=$(sha256sum "$USR" 2>/dev/null | cut -d' ' -f1); [ -n "$UAF" ] && [ "$UAF" = "$UB4" ] || bad "TTRAPU user file modified"
 unset LITEROOT_PRELOAD || true
 legpass "TTRAPU"
-# CTL ptrace control: must run, validated log, detector rejects (A-5).
+# CTL ptrace control: must run with a valid log, and the maps detector must
+# not find the preload in a ptrace run.
 LEGFAIL=0
 "$WORK/root-T1/bin/literoot" -R "$ROOTFS" --backend ptrace --refusal-log "$WORK/log-ctl.txt" \
   -- /bin/cat /proc/self/maps >"$WORK/out-ctl.txt" 2>"$WORK/err-ctl.txt"; rc=$?
@@ -281,14 +307,17 @@ chmod 0700 "$WORK/nowrite/cache" "$WORK/nowrite/home" || true
 legpass "N02"
 # Delegated unit seams (valid identifiers; --exact; exactly 1 passed).
 # N01 embedded digest, N03 cache write, N04 persistent mismatch, N06 final-file
-# probe, N02 noexec half, T6 freshness/invalidation. Absence FAILS loudly.
-for tst in n01_embedded_digest_refuses n03_cache_write_refuses n04_persistent_mismatch_refuses n06_final_probe_refuses n02_noexec_probe_refuses n16_flavour_mismatch_refuses lock_materialize_concurrent; do
+# probe, N02 noexec half, N16 flavour mismatch, the cache lock, a cache
+# directory with a setgid or sticky bit, a symlinked or non-regular final
+# path, a final file whose mode is not 0500, and T6 freshness/invalidation.
+# Absence FAILS loudly.
+for tst in n01_embedded_digest_refuses n03_cache_write_refuses n04_persistent_mismatch_refuses n06_final_probe_refuses n02_noexec_probe_refuses n16_flavour_mismatch_refuses lock_materialize_concurrent special_bits_dir_refuses symlinked_final_path_refuses non_regular_final_path_refuses widened_mode_republishes; do
   LEGFAIL=0; run_rust_test bin "$tst" || true; legpass "UNIT-$tst"
 done
-for tst in t6_semantic_change_changes_digest t6_touch_only_reruns_identical t6_lockfile_rev_changes_version; do
+for tst in t6_semantic_change_changes_digest t6_touch_only_reruns_build_script t6_lockfile_rev_changes_version; do
   LEGFAIL=0; run_rust_test test "$tst" || true; legpass "UNIT-$tst"
 done
-# N07/N08 reporter-off fixture: real preload, valid stamp, no ack (7.7).
+# N07/N08 reporter-off fixture: real preload, valid stamp, never reports.
 LEGFAIL=0
 FIXDIR="$WORK/fixture-reporter"; mkdir -p "$FIXDIR"
 CARGO_BUILD_BUILD_DIR="$FIXDIR/build" cargo build --locked --manifest-path "$CHECKOUT/preload/Cargo.toml" \
@@ -303,7 +332,7 @@ if [ "$LEGFAIL" = "0" ]; then
   witness_run N07 T1 "$WORK/log-N07.txt"; rc=$?
   [ "$rc" != "0" ] || bad "N07 run unexpectedly succeeded"
   grep -qxF "literoot: in-guest preload did not report" "$WORK/err-N07.txt" || bad "N07 stderr refusal missing"
-  # Expected-error oracle (plan 7.7): the validator must reject the log with
+  # Expected-error oracle: the validator must reject the log with
   # exit 1, no stdout and exactly its reporter-error message; any other
   # rejection FAILS. The exact-log check below binds the message to the pid.
   "$WORK/root-T1/bin/literoot" --check-refusal-log "$WORK/log-N07.txt" >"$WORK/chk-N07.out" 2>"$WORK/chk-N07.err"; crc=$?
@@ -378,5 +407,13 @@ for variant in missing unreadable; do
   [ "$variant" = "unreadable" ] && chmod 0600 "$WORK/noread.so" || true
   legpass "N11-$variant"
 done
+# TTH: a TrapHost-flavour install. A trap-only build (no default features,
+# inguest-trap) embeds the traphost preload: this leg's own receipt must say
+# traphost, and --backend trap must run that blob from the cache under the
+# full positive oracle. It runs last, so every leg above keeps the T1 cache
+# path in SO.
+WITNESS_BACKEND=trap
+install_leg TTH path "--no-default-features --features inguest-trap" traphost || true
+WITNESS_BACKEND=liteinst
 if [ "$FAILED" = "1" ]; then echo "RESULT: FAIL" >&2; exit 1; fi
 echo "ALL PASS"

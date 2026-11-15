@@ -20,15 +20,18 @@
 //! Cache mechanics. `literoot/` and `literoot/<sha>/` are created with
 //! mode 0700, set explicitly, never derived from the umask. A pre-existing
 //! one must be a directory owned by the effective uid with no group or
-//! other bits; the XDG root itself is not checked. A cache directory
-//! qualifies only if a one-page file created in it can be mapped
-//! PROT_EXEC. Under an exclusive lock (`<sha>/.lock`) an entry that is
-//! missing or whose bytes do not hash to the embedded digest is published
-//! again: an O_EXCL temporary file, written, fsynced, set to 0500, then
-//! renamed onto the final path. The final path is never opened for writing.
-//! The final canonical path is then checked for an LD_PRELOAD separator,
-//! mapped PROT_EXEC once, and hashed again immediately before it is handed
-//! to the launcher.
+//! other bits and no setuid, setgid or sticky bit; the XDG root itself is
+//! not checked. A cache directory qualifies only if a one-page file created
+//! in it can be mapped PROT_EXEC. Under an exclusive lock (`<sha>/.lock`)
+//! an entry that is missing, whose bytes do not hash to the embedded
+//! digest, or whose mode is not 0500 is published again: an O_EXCL
+//! temporary file, written, fsynced, set to 0500, then renamed onto the
+//! final path. The final path is never opened for writing. A final path
+//! that is a symlink or not a regular file refuses by name; it is never
+//! followed, read or replaced. The final canonical path is then checked for
+//! an LD_PRELOAD separator and mapped PROT_EXEC once; immediately before
+//! that path is handed to the launcher, the final path is checked again: a
+//! regular file, mode 0500, holding the embedded bytes.
 //!
 //! Boundary: between that last hash and the guest's ld.so opening the
 //! path, a writer with the same uid could replace the file. Same-uid
@@ -297,7 +300,8 @@ fn euid() -> u32 {
 }
 
 /// A directory we may use: a real directory (symlinks are not followed),
-/// owned by the effective uid, with no group or other bits.
+/// owned by the effective uid, with no group or other bits and no setuid,
+/// setgid or sticky bit.
 fn validate_private(dir: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if !meta.file_type().is_dir() {
@@ -314,6 +318,13 @@ fn validate_private(dir: &Path) -> Result<(), String> {
     if meta.mode() & 0o077 != 0 {
         return Err(format!(
             "{}: mode {:o} has group or other bits",
+            dir.display(),
+            meta.mode() & 0o7777
+        ));
+    }
+    if meta.mode() & 0o7000 != 0 {
+        return Err(format!(
+            "{}: mode {:o} has a setuid, setgid or sticky bit",
             dir.display(),
             meta.mode() & 0o7777
         ));
@@ -420,21 +431,59 @@ fn lock_entry(entry: &Path) -> Result<File, String> {
     }
 }
 
-/// Whether the entry's file holds exactly `blob`'s bytes.
+/// The state of an entry's final path.
 #[derive(PartialEq, Eq)]
 enum Entry {
     Absent,
+    /// A regular file, mode 0500, holding exactly the blob's bytes.
     Matches,
+    /// A regular file to publish again: other bytes, unreadable, larger
+    /// than the blob, or a mode other than 0500.
     Differs,
+    /// A symlink or another non-regular file: refused by name, never
+    /// followed, read or replaced.
+    Unusable(String),
 }
 
 fn entry_state(final_path: &Path, blob_len: usize, digest: &str) -> Entry {
-    match read_capped(final_path, blob_len as u64) {
-        Ok(bytes) if preload_stamp::sha256_hex(&bytes) == digest => Entry::Matches,
-        Ok(_) => Entry::Differs,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Entry::Absent,
-        Err(_) => Entry::Differs,
+    let symlink = || Entry::Unusable(format!("{}: a symlink, not a regular file", final_path.display()));
+    let not_regular = || Entry::Unusable(format!("{}: not a regular file", final_path.display()));
+    match std::fs::symlink_metadata(final_path) {
+        Ok(meta) if meta.file_type().is_symlink() => return symlink(),
+        Ok(meta) if !meta.file_type().is_file() => return not_regular(),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Entry::Absent,
+        Err(_) => return Entry::Differs,
     }
+    // O_NOFOLLOW and O_NONBLOCK: a symlink or FIFO swapped in after the
+    // check above is neither followed nor waited on.
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(final_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return symlink(),
+        Err(_) => return Entry::Differs,
+    };
+    let Ok(meta) = file.metadata() else {
+        return Entry::Differs;
+    };
+    if !meta.file_type().is_file() {
+        return not_regular();
+    }
+    let mut bytes = Vec::new();
+    if (&file)
+        .take(blob_len as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > blob_len
+        || preload_stamp::sha256_hex(&bytes) != digest
+        || meta.mode() & 0o7777 != 0o500
+    {
+        return Entry::Differs;
+    }
+    Entry::Matches
 }
 
 /// Materialize the embedded `blob` (whose recorded digest is `digest`)
@@ -479,6 +528,9 @@ pub(crate) fn materialize(
     (hooks.in_lock)();
     let final_path = entry.join(FILE_NAME);
     let state = entry_state(&final_path, blob.len(), digest);
+    if let Entry::Unusable(why) = &state {
+        return Err(refuse(CACHE_DIR, why.clone()));
+    }
     if state != Entry::Matches {
         publish(&entry, &final_path, blob, hooks).map_err(|e| refuse(CACHE_WRITE, e))?;
         (hooks.after_publish)(&final_path);
@@ -491,16 +543,21 @@ pub(crate) fn materialize(
         .map_err(|e| refuse(CACHE_WRITE, format!("{}: {e}", final_path.display())))?;
     check_separator(&canonical)?;
     final_probe(&canonical, hooks)?;
-    // Hashed at hand-over: the bytes at the final canonical path, after
-    // publication, immediately before the launcher gets the path.
-    if entry_state(&canonical, blob.len(), digest) != Entry::Matches {
-        return Err(refuse(
-            CACHE_DIGEST,
-            format!(
-                "{} does not hash to {digest} after rematerialization",
-                canonical.display()
-            ),
-        ));
+    // Checked at hand-over, after publication, immediately before the
+    // launcher gets the canonical path: the final path is still a regular
+    // file (not a symlink), mode 0500, holding the embedded bytes.
+    match entry_state(&final_path, blob.len(), digest) {
+        Entry::Matches => {}
+        Entry::Unusable(why) => return Err(refuse(CACHE_DIR, why)),
+        Entry::Absent | Entry::Differs => {
+            return Err(refuse(
+                CACHE_DIGEST,
+                format!(
+                    "{} does not hold the embedded bytes (sha256 {digest}) at mode 0500 after rematerialization",
+                    final_path.display()
+                ),
+            ));
+        }
     }
     drop(lock);
     Ok(canonical)
@@ -680,6 +737,102 @@ mod tests {
             "preload_probe",
             "preload cannot be mapped executable here",
         );
+    }
+
+    /// A pre-existing cache directory with a setgid or a sticky bit is not
+    /// private: it refuses by name and nothing is created in it.
+    #[test]
+    fn special_bits_dir_refuses() {
+        for bits in [0o2700, 0o1700] {
+            let scratch = Scratch::new("special");
+            let root = scratch.0.join("literoot");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(bits)).unwrap();
+            let mode = std::fs::symlink_metadata(&root).unwrap().mode() & 0o7777;
+            assert_eq!(mode, bits, "could not induce mode {bits:o} on the fixture directory");
+            let bytes = blob();
+            let digest = preload_stamp::sha256_hex(&bytes);
+            let r = assert_refusal(
+                materialize(&bytes, &digest, &[root.clone()], &SEAMS),
+                "cache_dir",
+                "no writable private cache directory for the in-guest preload",
+            );
+            assert!(
+                r.detail.as_deref().unwrap_or("").contains("setuid, setgid or sticky"),
+                "{r:?}"
+            );
+            assert!(!root.join(&digest).exists(), "nothing is created in it");
+        }
+    }
+
+    /// A cache hit needs a regular file: a symlink at the final path, even
+    /// to the same bytes at mode 0500, refuses by name and is neither
+    /// followed nor replaced.
+    #[test]
+    fn symlinked_final_path_refuses() {
+        let scratch = Scratch::new("symlink");
+        let root = scratch.0.join("literoot");
+        let bytes = blob();
+        let digest = preload_stamp::sha256_hex(&bytes);
+        materialize(&bytes, &digest, &[root.clone()], &SEAMS).unwrap();
+        let final_path = root.join(&digest).join(FILE_NAME);
+        let outside = scratch.0.join("outside.so");
+        std::fs::write(&outside, &bytes).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::remove_file(&final_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &final_path).unwrap();
+        let r = assert_refusal(
+            materialize(&bytes, &digest, &[root.clone()], &SEAMS),
+            "cache_dir",
+            "no writable private cache directory for the in-guest preload",
+        );
+        assert!(r.detail.as_deref().unwrap_or("").contains("a symlink"), "{r:?}");
+        assert!(
+            std::fs::symlink_metadata(&final_path).unwrap().file_type().is_symlink(),
+            "the symlink is not replaced"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), bytes, "the outside file is untouched");
+    }
+
+    /// A directory at the final path is not a regular file: it refuses by
+    /// name and is left in place.
+    #[test]
+    fn non_regular_final_path_refuses() {
+        let scratch = Scratch::new("nonregular");
+        let root = scratch.0.join("literoot");
+        let bytes = blob();
+        let digest = preload_stamp::sha256_hex(&bytes);
+        materialize(&bytes, &digest, &[root.clone()], &SEAMS).unwrap();
+        let final_path = root.join(&digest).join(FILE_NAME);
+        std::fs::remove_file(&final_path).unwrap();
+        std::fs::create_dir(&final_path).unwrap();
+        let r = assert_refusal(
+            materialize(&bytes, &digest, &[root.clone()], &SEAMS),
+            "cache_dir",
+            "no writable private cache directory for the in-guest preload",
+        );
+        assert!(r.detail.as_deref().unwrap_or("").contains("not a regular file"), "{r:?}");
+        assert!(std::fs::symlink_metadata(&final_path).unwrap().is_dir(), "left in place");
+    }
+
+    /// A cached file with the embedded bytes but a mode other than 0500 is
+    /// published again, as a new file at 0500, not trusted as found.
+    #[test]
+    fn widened_mode_republishes() {
+        let scratch = Scratch::new("mode");
+        let root = scratch.0.join("literoot");
+        let bytes = blob();
+        let digest = preload_stamp::sha256_hex(&bytes);
+        materialize(&bytes, &digest, &[root.clone()], &SEAMS).unwrap();
+        let final_path = root.join(&digest).join(FILE_NAME);
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = std::fs::symlink_metadata(&final_path).unwrap();
+        assert_eq!(before.mode() & 0o7777, 0o755, "could not induce mode 0755");
+        let path = materialize(&bytes, &digest, &[root.clone()], &SEAMS).unwrap();
+        let after = std::fs::symlink_metadata(&final_path).unwrap();
+        assert_eq!(after.mode() & 0o7777, 0o500, "published again at 0500");
+        assert_ne!(after.ino(), before.ino(), "a new file was renamed into place");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     /// A minimal ELF64 LE file with one PT_NOTE holding `note`.

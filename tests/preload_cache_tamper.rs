@@ -138,8 +138,11 @@ fn t6_semantic_change_changes_digest() {
     assert_ne!(before, after, "a change to src/translate.rs must change the embedded digest");
 }
 
+/// Invalidation only: the receipt is rewritten, so build.rs and its nested
+/// preload build ran again. Identical output bytes are permitted, not
+/// asserted, so the digests are not compared.
 #[test]
-fn t6_touch_only_reruns_identical() {
+fn t6_touch_only_reruns_build_script() {
     let scratch = scratch_copy("touch");
     build(&scratch);
     let (path, _, before) = receipt(&scratch);
