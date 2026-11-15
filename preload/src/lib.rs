@@ -72,6 +72,8 @@ mod prearm;
 mod reporting;
 #[path = "../../src/rootfs_tool.rs"]
 mod rootfs_tool;
+#[cfg_attr(all(feature = "mapped-successor", target_env = "musl"), allow(dead_code))]
+mod runtime_memfds;
 #[cfg(test)]
 #[path = "../../src/test_source.rs"]
 mod test_source;
@@ -230,6 +232,8 @@ unsafe extern "C" fn initialize(
         // or decodes: a launcher from another build is refused by name.
         let _ = std::hint::black_box(&WIRE_ID);
         let armed = wire_id::arm_with(bootstrap.tool_data, |selected| {
+            // Before installation: hide the shared memfds' numbers.
+            runtime_memfds::adopt_at_image_start();
             let armed = rootfs_tool::exec_watch_for_selector(selected)?;
             let socket = bootstrap.coordinator;
             match selected {
@@ -270,6 +274,8 @@ unsafe extern "C" fn initialize(
         // or decodes: a launcher from another build is refused by name.
         let _ = std::hint::black_box(&WIRE_ID);
         let armed = wire_id::arm_with(bootstrap.tool_data, |selected| {
+            // Before installation: hide the shared memfds' numbers.
+            runtime_memfds::adopt_at_image_start();
             // Watched mode is TrapHost-only: the liteinst runtime's
             // exec_watch knob is not reachable from literoot, so an
             // asserted watched launch against this flavour refuses

@@ -19,6 +19,7 @@
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::exec_state::ExecState;
@@ -540,11 +541,16 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Internal launcher-to-Tool environment variable carrying the
-/// shared-record memfd number. It follows the existing
-/// `LITEROOT_PROBE_GEN_FD` handoff shape: an inherited fd, not a
-/// guest-visible pathname or CLI option.
-pub const SHARED_RECORD_FD_ENV: &str = "LITEROOT_SHARED_RECORD_FD";
+/// Internal launcher-to-preload environment variable naming the
+/// shared-record memfd by file identity
+/// (`crate::translate::FdIdentity::encode`), never by descriptor
+/// number, as `crate::translate::PROBE_GEN_ID_ENV` does for the
+/// probe generation: each in-guest image finds its inherited copy
+/// by this identity and moves it to a number the runtime keeps the
+/// guest away from (the preload's runtime_memfds module). The
+/// identity protects against number reuse; it is not
+/// authentication. Not a guest-visible pathname or CLI option.
+pub const SHARED_RECORD_ID_ENV: &str = "LITEROOT_SHARED_RECORD_ID";
 
 const FRAME_MAGIC: &[u8; 4] = b"LRSF";
 const FRAME_VERSION: u16 = 2;
@@ -598,6 +604,13 @@ fn file_identity(file: &File) -> std::io::Result<FileIdentity> {
         dev: meta.dev(),
         ino: meta.ino(),
     })
+}
+
+fn meta_identity(meta: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
 }
 
 fn identity_of_fd(fd: RawFd) -> std::io::Result<FileIdentity> {
@@ -851,11 +864,12 @@ impl PendingRepairs {
 /// the handle was created/adopted. Closing or replacing this
 /// hosting process's number therefore fails closed to
 /// callers' process-local fallbacks rather than writing some
-/// other file. That is the in-guest guest-visible case; a
-/// ptrace guest has a separate descriptor table from the
-/// tracer-hosted Tool.
+/// other file. In-guest the number is one the runtime keeps the
+/// guest away from; it changes when a fork child re-places its
+/// inherited copy ([`SharedRecordFile::set_fd`]). A ptrace guest
+/// has a separate descriptor table from the tracer-hosted Tool.
 pub struct SharedRecordFile {
-    fd: RawFd,
+    fd: AtomicI32,
     identity: FileIdentity,
     pending: Mutex<PendingRepairs>,
     last_snapshot: Mutex<Option<SharedRecord>>,
@@ -864,7 +878,7 @@ pub struct SharedRecordFile {
 impl SharedRecordFile {
     fn from_fd_identity(fd: RawFd, identity: FileIdentity) -> Self {
         Self {
-            fd,
+            fd: AtomicI32::new(fd),
             identity,
             pending: Mutex::new(PendingRepairs::default()),
             last_snapshot: Mutex::new(None),
@@ -898,26 +912,37 @@ impl SharedRecordFile {
         Ok(store)
     }
 
-    pub fn from_env() -> Option<Self> {
-        let raw = std::env::var(SHARED_RECORD_FD_ENV).ok()?;
-        Self::from_env_value(Some(&raw))
-    }
-
-    fn from_env_value(raw: Option<&str>) -> Option<Self> {
-        let fd: RawFd = raw?.parse().ok()?;
+    /// Adopt the inherited store open at `fd` (in-guest preload,
+    /// before the guest runs). Establishing the file's identity
+    /// and reading a valid snapshot are part of adoption: a
+    /// malformed or replaced descriptor is absent, not a
+    /// partially trusted store.
+    pub fn from_fd(fd: RawFd) -> Option<Self> {
         if fd < 0 {
             return None;
         }
         let store = Self::from_fd_identity(fd, identity_of_fd(fd).ok()?);
-        // Establishing the expected file's identity is part of
-        // adoption: a malformed or replaced descriptor is
-        // absent, not a partially trusted store.
         store.snapshot().ok()?;
         Some(store)
     }
 
     pub fn fd(&self) -> RawFd {
-        self.fd
+        self.fd.load(Ordering::Acquire)
+    }
+
+    /// Whether `fd` is open on this store's file (`fstat`). The
+    /// in-guest preload checks a reopened copy with this before
+    /// placing it in place of the old number.
+    pub fn is_store_file(&self, fd: RawFd) -> bool {
+        identity_of_fd(fd).is_ok_and(|identity| identity == self.identity)
+    }
+
+    /// Use `fd`, another descriptor on the same file, from now on
+    /// (or -1: none, so every later operation fails closed to the
+    /// callers' process-local fallbacks). The in-guest preload
+    /// calls this after moving the descriptor.
+    pub fn set_fd(&self, fd: RawFd) {
+        self.fd.store(fd, Ordering::Release);
     }
 
     /// Keep this handle usable in the current (tracer) process
@@ -925,11 +950,11 @@ impl SharedRecordFile {
     pub fn set_close_on_exec(&self) -> std::io::Result<()> {
         // SAFETY: F_GETFD/F_SETFD only inspect and update this
         // descriptor's flags; ownership is unchanged.
-        let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFD) };
+        let flags = unsafe { libc::fcntl(self.fd(), libc::F_GETFD) };
         if flags < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let rc = unsafe { libc::fcntl(self.fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        let rc = unsafe { libc::fcntl(self.fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -971,21 +996,57 @@ impl SharedRecordFile {
     }
 
     fn open_locked_try(&self, exclusive: bool) -> std::io::Result<Option<LockedFile>> {
+        let fd = self.fd();
+        if fd < 0 {
+            return Err(invalid_data("shared-record: absent in this process"));
+        }
+        let path = format!("/proc/self/fd/{fd}");
+        // Check the number's file before opening anything there.
+        // In-guest, a guest dup2/dup3/F_DUPFD that takes the
+        // number makes the runtime close the store's copy
+        // (reverie-inguest relocate_runtime_fd), and the number
+        // then holds the guest's file, which this handle must
+        // never open, read or write. stat follows the magic link
+        // without opening the file.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta_identity(&meta) == self.identity => {}
+            Ok(_) => return Err(self.lose(fd, "now holds another file")),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.lose(fd, "is closed"));
+            }
+            Err(err) => return Err(err),
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(format!("/proc/self/fd/{}", self.fd))?;
-        // Check identity before locking/writing anything: a
-        // guest may have replaced the inherited number with a
-        // descriptor for an unrelated file.
+            .open(&path)?;
+        // Check identity again before locking/writing anything:
+        // the number could have changed between the two calls.
         if file_identity(&file)? != self.identity {
-            return Err(invalid_data("shared-record: file identity mismatch"));
+            return Err(self.lose(fd, "now holds another file"));
         }
         if try_lock_file(&file, exclusive)? {
             Ok(Some(LockedFile { file }))
         } else {
             Ok(None)
         }
+    }
+
+    /// The store's descriptor `fd` is gone from this process
+    /// (closed, or its number now names another file): forget the
+    /// number, so no later operation opens whatever it holds and
+    /// every one fails as absent, say so once with the reason, and
+    /// fail this operation. Callers then fall back to their
+    /// process-local state; a write also reports its refusal.
+    fn lose(&self, fd: RawFd, reason: &str) -> std::io::Error {
+        if self
+            .fd
+            .compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            eprintln!("literoot: shared record absent in this process: descriptor {fd} {reason}");
+        }
+        invalid_data("shared-record: descriptor gone from this process")
     }
 
     #[cfg(test)]
@@ -1390,21 +1451,42 @@ impl SharedRecordFile {
 
 static SHARED_RECORD_FILE: OnceLock<Option<SharedRecordFile>> = OnceLock::new();
 
+/// The in-guest preload's re-placement of the shared memfds in a
+/// fork child (preload/src/runtime_memfds.rs). Unset in the
+/// launcher and under ptrace.
+static FORK_CHILD_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Register the fork-child re-placement (in-guest preload, once,
+/// before the guest runs).
+pub fn set_fork_child_hook(hook: fn()) {
+    let _ = FORK_CHILD_HOOK.set(hook);
+}
+
+/// Run the registered fork-child re-placement, if any. Called from
+/// the Tool's `handle_thread_start`, the first Tool code a fork
+/// child runs; the hook itself decides whether this thread starts
+/// a fork child.
+pub fn run_fork_child_hook() {
+    if let Some(hook) = FORK_CHILD_HOOK.get() {
+        hook();
+    }
+}
+
 /// Register the launcher-created store in the launcher/tracer
 /// process. Returns false if a store was already registered.
 pub fn init_shared_record_file(store: SharedRecordFile) -> bool {
     SHARED_RECORD_FILE.set(Some(store)).is_ok()
 }
 
-/// The registered store, or the inherited env-named store in a
-/// successor process. Initialization captures the descriptor's
-/// file identity before ordinary guest execution; later close,
-/// replacement, or environment loss yields `None` on the next
-/// store call (or no store at all), never a guessed descriptor.
+/// The registered store: the launcher's own in the launcher or
+/// tracer process, and in an in-guest image the inherited copy its
+/// preload adopted by identity before the guest ran. Adoption
+/// captures the file identity before ordinary guest execution;
+/// later close or replacement of the number fails the next store
+/// call closed, never a guessed descriptor. With nothing
+/// registered there is no store at all.
 pub fn shared_record_file() -> Option<&'static SharedRecordFile> {
-    SHARED_RECORD_FILE
-        .get_or_init(SharedRecordFile::from_env)
-        .as_ref()
+    SHARED_RECORD_FILE.get_or_init(|| None).as_ref()
 }
 
 #[cfg(test)]
@@ -1756,15 +1838,12 @@ mod tests {
     }
 
     #[test]
-    fn file_store_adoption_rejects_missing_malformed_and_closed_env_fd() {
-        assert!(SharedRecordFile::from_env_value(None).is_none());
-        assert!(SharedRecordFile::from_env_value(Some("not-a-fd")).is_none());
-        assert!(SharedRecordFile::from_env_value(Some("-1")).is_none());
+    fn file_store_adoption_rejects_negative_malformed_and_closed_fd() {
+        assert!(SharedRecordFile::from_fd(-1).is_none());
 
         let store = SharedRecordFile::create().expect("create shared-record memfd");
         store.publish(row(42, 900, b"/bin/sh")).expect("publish");
-        let adopted = SharedRecordFile::from_env_value(Some(&store.fd().to_string()))
-            .expect("adopt valid env fd");
+        let adopted = SharedRecordFile::from_fd(store.fd()).expect("adopt valid fd");
         assert_eq!(
             adopted
                 .lookup(ProcessId::new(42, 900).unwrap())
@@ -1775,7 +1854,7 @@ mod tests {
         // A descriptor that is open but is not a framed snapshot
         // is absent, never a partially trusted store.
         let null = std::fs::File::open("/dev/null").expect("open /dev/null");
-        assert!(SharedRecordFile::from_env_value(Some(&null.as_raw_fd().to_string())).is_none());
+        assert!(SharedRecordFile::from_fd(null.as_raw_fd()).is_none());
 
         // Allocate the closed-fd probe above the ordinary
         // lowest-free range so another parallel test's ordinary
@@ -1790,7 +1869,115 @@ mod tests {
             std::io::Error::last_os_error()
         );
         assert_eq!(unsafe { libc::close(closed) }, 0);
-        assert!(SharedRecordFile::from_env_value(Some(&closed.to_string())).is_none());
+        assert!(SharedRecordFile::from_fd(closed).is_none());
+    }
+
+    #[test]
+    fn file_store_reads_absent_after_its_number_is_closed_and_reused_never_the_reuser() {
+        // In-guest the store sits at a number the runtime records.
+        // A guest dup2/dup3/F_DUPFD that takes that number makes
+        // the runtime close the store's copy (reverie-inguest
+        // relocate_runtime_fd), and the number then holds the
+        // guest's file. Model it: the store's number is closed and
+        // then reused for a guest file holding a valid, forged
+        // frame. The handle must read absent, never the forged
+        // row, and must never open the guest's file at all.
+        use std::os::unix::ffi::OsStrExt as _;
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.publish(row(44, 902, b"/bin/sh")).expect("publish");
+        let number = unsafe { libc::fcntl(store.fd(), libc::F_DUPFD_CLOEXEC, 640) };
+        assert!(number >= 640, "dup: {}", std::io::Error::last_os_error());
+        let handle = SharedRecordFile::from_fd(number).expect("adopt at the number");
+        assert_eq!(
+            handle.lookup(ProcessId::new(44, 902).unwrap()).expect("lookup before"),
+            Some(row(44, 902, b"/bin/sh"))
+        );
+
+        let forged = SharedRecordFile::create().expect("create forged store");
+        forged.publish(row(44, 902, b"/bin/evil")).expect("publish forged row");
+        let frame = std::fs::read(format!("/proc/self/fd/{}", forged.fd())).expect("read frame");
+        let path = std::env::temp_dir().join(format!(
+            "literoot-shared-record-reuse-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, &frame).expect("write guest file");
+        let guest = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open guest file");
+        // Every later open, read or write of the guest's file is
+        // reported here.
+        let watch = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(watch >= 0);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    watch,
+                    c_path.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS | libc::IN_MODIFY,
+                )
+            } >= 0
+        );
+
+        assert_eq!(unsafe { libc::close(number) }, 0);
+        assert_eq!(unsafe { libc::dup2(guest.as_raw_fd(), number) }, number);
+
+        let lookup = handle.lookup(ProcessId::new(44, 902).unwrap());
+        assert_eq!(
+            lookup.expect_err("a reused number must read absent").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(handle.fd(), -1, "the number is forgotten");
+        assert!(handle.uts().is_err());
+        assert!(handle.publish(row(45, 903, b"/bin/sh")).is_err());
+        assert!(handle.snapshot().is_err());
+
+        let mut events = [0u8; 256];
+        let read = unsafe { libc::read(watch, events.as_mut_ptr().cast(), events.len()) };
+        assert_eq!(read, -1, "the guest's file was opened, read or written");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert_eq!(std::fs::read(&path).expect("reread"), frame, "guest file unchanged");
+        // The store itself is intact for every holder that still has it.
+        assert_eq!(
+            store.lookup(ProcessId::new(44, 902).unwrap()).expect("store lookup"),
+            Some(row(44, 902, b"/bin/sh"))
+        );
+        unsafe {
+            libc::close(watch);
+            libc::close(number);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_store_follows_a_moved_descriptor_and_fails_closed_without_one() {
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.publish(row(43, 901, b"/bin/sh")).expect("publish");
+        let unrelated = SharedRecordFile::create().expect("create unrelated memfd");
+        assert!(store.is_store_file(store.fd()));
+        assert!(!store.is_store_file(unrelated.fd()));
+        assert!(!store.is_store_file(-1));
+        // The in-guest preload moves the descriptor and closes the
+        // old number; the handle keeps working at the new one.
+        let moved = unsafe { libc::fcntl(store.fd(), libc::F_DUPFD_CLOEXEC, 600) };
+        assert!(moved >= 600, "dup: {}", std::io::Error::last_os_error());
+        let old = store.fd();
+        store.set_fd(moved);
+        assert_eq!(unsafe { libc::close(old) }, 0);
+        assert_eq!(store.fd(), moved);
+        assert_eq!(
+            store.lookup(ProcessId::new(43, 901).unwrap()).expect("lookup after move"),
+            Some(row(43, 901, b"/bin/sh"))
+        );
+        // No descriptor: every operation fails, none guesses one.
+        store.set_fd(-1);
+        assert!(store.lookup(ProcessId::new(43, 901).unwrap()).is_err());
+        unsafe { libc::close(moved) };
     }
 
     #[test]
@@ -2272,7 +2459,7 @@ mod tests {
         // stands in for a new in-guest program image after
         // exec: its process-local state is new, but the frame
         // header counts are the session's.
-        let second = SharedRecordFile::from_env_value(Some(&first.fd().to_string()))
+        let second = SharedRecordFile::from_fd(first.fd())
             .expect("adopt same memfd in a fresh handle");
         let err = first
             .set_uts_nodename(Some(b"x".to_vec()))
@@ -2311,7 +2498,7 @@ mod tests {
             .expect("set initial domainname");
         let old = row(4242, 777, b"/bin/old");
         a.publish(old.clone()).expect("publish initial row");
-        let b = SharedRecordFile::from_env_value(Some(&a.fd().to_string()))
+        let b = SharedRecordFile::from_fd(a.fd())
             .expect("adopt same memfd as second handle");
         assert_eq!(
             b.uts().expect("second handle UTS").0,

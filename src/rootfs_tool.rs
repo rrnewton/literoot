@@ -2109,9 +2109,16 @@ impl Tool for RootfsTool {
         // children whose Tool construction path may not call
         // Tool::new.
         self.note_process_for_kill_on_exit(guest);
-        // Adopt and identity-check the shared descriptor at the
-        // first lifecycle hook, before ordinary guest execution
-        // gets an opportunity to close/replace the number.
+        // In-guest, a fork child first re-places its own copies of
+        // the shared memfds, which it inherited at numbers its
+        // parent recorded (preload/src/runtime_memfds.rs); a no-op
+        // for threads, for the process that placed them, and under
+        // ptrace, where no hook is registered.
+        crate::shared_record::run_fork_child_hook();
+        // The shared store is registered before ordinary guest
+        // execution: in-guest by the preload's identity-checked
+        // adoption, otherwise by the launcher. This only settles
+        // the registry, so no later lookup can register one.
         let _ = shared_record_file();
         // Fork-child restore: apply the inherited snapshot to the
         // child's fresh Tool before ordinary execution. Threads
@@ -3962,6 +3969,19 @@ impl Tool for RootfsTool {
             // init_thread_state/handle_thread_start). The parent
             // clears its own copy after inject — init clones it
             // to the child inside that inject.
+            //
+            // In-guest, the "process" arms below see only plain
+            // forks create a child. clone_is_process is just
+            // !CLONE_THREAD, but a process clone that shares the
+            // descriptor table or memory (CLONE_FILES, CLONE_VM) or
+            // takes a new stack is not one of Reverie's plain forks,
+            // and its inject refuses it with EOPNOTSUPP before any
+            // child exists (reverie-inguest host.rs: is_plain_fork,
+            // thread_flags_admission, and the ThreadCreation typed
+            // refusal). handle_thread_start's re-placement of the
+            // shared memfds relies on that: a child with its own
+            // descriptor table. Do not widen that claim to such
+            // clones without handling a shared table there.
             Syscall::Clone(clone) => {
                 let fam = reverie::syscalls::family::CloneFamily::Clone(clone);
                 let flags = fam.flags(&guest.memory()).bits();
