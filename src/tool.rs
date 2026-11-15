@@ -1105,32 +1105,48 @@ fn run_backend(
     in_guest: bool,
 ) -> Result<u8, String> {
     let kill_on_exit = cfg.kill_on_exit;
-    // Shared probe-cache generation (memfd inherited by the
-    // whole guest tree; translate.rs probe coherence).
+    // The two memfds the guest tree shares, both created here: the
+    // probe-cache generation (translate.rs probe coherence) and
+    // the cross-process facts record (shared_record.rs). An
+    // in-guest image is told each one's file identity, never its
+    // number: its preload finds the inherited copy by identity and
+    // moves it to a number the runtime keeps the guest away from
+    // (preload/src/runtime_memfds.rs). Under ptrace the Tools run
+    // in this process and the guest needs neither: no identity env,
+    // and no inherited copy of the store. Identity variables this
+    // launcher itself inherited are removed first, so no guest sees
+    // a stale one. Failure is a named absence: consumers retain
+    // today's process-local maps/statics.
+    cmd.env_remove(crate::translate::PROBE_GEN_ID_ENV);
+    cmd.env_remove(crate::shared_record::SHARED_RECORD_ID_ENV);
     let gen_fd = crate::translate::create_shared_gen_fd();
-    if gen_fd >= 0 {
-        cmd.env("LITEROOT_PROBE_GEN_FD", gen_fd.to_string());
-    }
-    // Cross-process facts memfd: the launcher owns creation
-    // and registers the handle for Tools in this process.
-    // Only an in-guest Tool needs the inherited descriptor
-    // number in its environment. Under ptrace, keep the store
-    // entirely tracer-side: no env var and no inherited copy
-    // for the guest. Failure is a named absence: consumers
-    // retain today's process-local maps/statics.
-    if !in_guest {
-        cmd.env_remove(crate::shared_record::SHARED_RECORD_FD_ENV);
+    if gen_fd >= 0 && in_guest {
+        match crate::translate::FdIdentity::of_fd(gen_fd) {
+            Ok(identity) => {
+                cmd.env(crate::translate::PROBE_GEN_ID_ENV, identity.encode());
+            }
+            Err(err) => {
+                eprintln!("literoot: probe generation identity unavailable: {err}");
+            }
+        }
     }
     match crate::shared_record::SharedRecordFile::create() {
         Ok(store) => {
-            let fd = store.fd();
+            let identity = crate::translate::FdIdentity::of_fd(store.fd());
             if !in_guest {
                 if let Err(err) = store.set_close_on_exec() {
                     eprintln!("literoot: shared record close-on-exec unavailable: {err}");
                 }
             }
             if crate::shared_record::init_shared_record_file(store) && in_guest {
-                cmd.env(crate::shared_record::SHARED_RECORD_FD_ENV, fd.to_string());
+                match identity {
+                    Ok(identity) => {
+                        cmd.env(crate::shared_record::SHARED_RECORD_ID_ENV, identity.encode());
+                    }
+                    Err(err) => {
+                        eprintln!("literoot: shared record identity unavailable: {err}");
+                    }
+                }
             }
         }
         Err(err) => {
