@@ -43,10 +43,11 @@
 //!   and `clock.rs` `rcb_clock`). A libc reopen would therefore close the
 //!   very copy it reopens. The gate's syscall instruction is allowed by
 //!   the runtime's filter and never traps (`trap.rs` `raw_syscall6`), so
-//!   no site there is ever patched. tests/runtime_memfds.rs pins this
-//!   order with a test-only mutant that reads the clock first
-//!   (`CLOCK_BEFORE_REOPEN_ENV`): the tree must then lose both memfds and
-//!   say so on stderr.
+//!   no site there is ever patched. tests/runtime_memfds.rs
+//!   `liteinst_clock_read_before_the_reopen_fails_loudly` is the twin of a
+//!   mutant, applied as a patch by the test runner and absent from this
+//!   tree, that reads the clock before the reopens: under it the tree must
+//!   lose both memfds in every fork child and say so on stderr.
 //!
 //! A failure leaves that memfd absent in that process, never an
 //! unprotected copy: the shared record falls back to the callers'
@@ -75,7 +76,7 @@
 //!   authentication: a guest can name any file it holds, which desyncs
 //!   only its own tree.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use reverie_inguest::guest::protect;
 use reverie_inguest::trap::raw_syscall6;
@@ -87,19 +88,6 @@ use crate::translate::{self, FdIdentity, PROBE_GEN_ID_ENV};
 /// nothing. A thread start in another pid is a fork child holding its
 /// parent's copies.
 static PLACED_BY: AtomicI32 = AtomicI32::new(0);
-
-/// Test-only mutant switch for tests/runtime_memfds.rs: with this variable
-/// set when an image starts, a fork child reads the runtime's RCB clock
-/// BEFORE it reopens its copies, as it would if Reverie ever ran a clock
-/// read ahead of the Tool's construction. That clock read closes the
-/// inherited copies, so the child must lose both memfds and say so.
-/// TEST-ONLY: production must never set this; a guest that sets it only
-/// loses its own tree's shared memfds, loudly.
-const CLOCK_BEFORE_REOPEN_ENV: &str = "LITEROOT_TEST_CLOCK_BEFORE_REOPEN";
-
-/// [`CLOCK_BEFORE_REOPEN_ENV`] as read at image start, so the fork-child
-/// path reads only memory.
-static CLOCK_BEFORE_REOPEN: AtomicBool = AtomicBool::new(false);
 
 /// This process's pid through the runtime's gate, the pid the runtime
 /// keys its records by.
@@ -162,10 +150,6 @@ fn inherited(name: &str, what: &str) -> Option<(i32, FdIdentity)> {
 /// installed: nothing traps yet, and no guest instruction has run.
 pub(crate) fn adopt_at_image_start() {
     PLACED_BY.store(raw_pid(), Ordering::Release);
-    CLOCK_BEFORE_REOPEN.store(
-        std::env::var_os(CLOCK_BEFORE_REOPEN_ENV).is_some(),
-        Ordering::Relaxed,
-    );
     if let Some((fd, identity)) = inherited(PROBE_GEN_ID_ENV, "probe generation") {
         if translate::adopt_shared_gen(fd, identity) {
             match place(fd) {
@@ -267,13 +251,6 @@ fn checked(
     ))
 }
 
-/// The test-only mutant (`CLOCK_BEFORE_REOPEN_ENV`): this thread's first
-/// RCB clock read in a fork child, before the reopens. Its value is
-/// ignored: in a fork child that read first closes the inherited records.
-fn clock_read_first() {
-    let _ = reverie_inguest::guest::clock::read_guest_rcb_clock();
-}
-
 /// Re-place a fork child's copies under its own pid. A no-op in the
 /// process that placed them (its own Tool construction and thread
 /// starts, and every call after the first in a child), and for a lineage
@@ -294,9 +271,6 @@ fn replace_in_fork_child() {
     let store = shared_record::shared_record_file().filter(|store| store.fd() >= 0);
     if probe.is_none() && store.is_none() {
         return;
-    }
-    if CLOCK_BEFORE_REOPEN.load(Ordering::Relaxed) {
-        clock_read_first();
     }
     // Both copies first, through the runtime's gate.
     let probe_copy = probe.map(|(fd, _)| reopen_raw(fd));

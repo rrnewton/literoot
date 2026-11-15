@@ -21,12 +21,15 @@
 //! which closes the inherited copies) instead of trapping: the condition
 //! under which a libc reopen in the child lost both memfds.
 //!
-//! The clock-first variant runs the same tree with the preload's
-//! test-only mutant switch (LITEROOT_TEST_CLOCK_BEFORE_REOPEN), which makes
-//! each fork child read the runtime's RCB clock before its reopen, as if
-//! Reverie had moved a clock read ahead of the Tool's construction. That
-//! tree must fail the bar above, and literoot must report both lost
-//! memfds on stderr without LITEROOT_DEBUG.
+//! `liteinst_clock_read_before_the_reopen_fails_loudly` runs the same
+//! LiteInst tree and passes on this tree. It is the twin of a mutant that
+//! the test runner applies as a patch, absent from this tree: each fork
+//! child reads the runtime's RCB clock before its reopen, as if Reverie had
+//! moved a clock read ahead of the Tool's construction. Under that patch
+//! the test must fail: the children hold no copy while the root holds one
+//! of each, and literoot prints both lost-memfd lines without
+//! LITEROOT_DEBUG. The test prints literoot's stderr lines so the runner
+//! can check that shape.
 //!
 //! There is no --kill-on-exit variant: in-guest backends refuse that flag
 //! by design, before any guest runs, and tests/kill_on_exit.rs
@@ -205,12 +208,12 @@ fn make_root(label: &str) -> PathBuf {
 /// Runs the guest under `backend` with fake root (sethostname) and the
 /// default binds, and returns its stdout and stderr.
 fn run(backend: &str) -> (String, String) {
-    run_with(backend, backend, &[])
+    run_with(backend, backend)
 }
 
-/// `run` with extra environment `envs`, in a root named after `label`.
-/// LITEROOT_DEBUG is always removed: the lost-memfd lines must not need it.
-fn run_with(backend: &str, label: &str, envs: &[(&str, &str)]) -> (String, String) {
+/// `run` in a root named after `label`. LITEROOT_DEBUG is always
+/// removed: the lost-memfd lines must not need it.
+fn run_with(backend: &str, label: &str) -> (String, String) {
     let root = make_root(label);
     let out = Command::new(literoot_bin())
         .args(["--backend", backend, "-0", "-R"])
@@ -218,8 +221,6 @@ fn run_with(backend: &str, label: &str, envs: &[(&str, &str)]) -> (String, Strin
         .arg("/bin/memfds")
         .env_remove("LITEROOT_PRELOAD")
         .env_remove("LITEROOT_DEBUG")
-        .env_remove("LITEROOT_TEST_CLOCK_BEFORE_REOPEN")
-        .envs(envs.iter().copied())
         .env("PATH", "/bin:/usr/bin")
         .output()
         .expect("spawn literoot");
@@ -276,41 +277,17 @@ fn liteinst_tree_holds_each_memfd_once_out_of_reach_by_number() {
     check("liteinst", &run("liteinst"), 1);
 }
 
-/// The mutant: a clock read before the reopen in every fork child must
-/// fail the twin's bar, loudly.
+/// The twin of the clock-first mutant (module docs): it passes on this
+/// tree and must fail, loudly, under the runner's patch. It prints
+/// literoot's stderr lines so the runner can check the failure's shape.
 #[cfg(feature = "in-guest")]
 #[test]
 fn liteinst_clock_read_before_the_reopen_fails_loudly() {
-    let out = run_with(
-        "liteinst",
-        "liteinst-clock-first",
-        &[("LITEROOT_TEST_CLOCK_BEFORE_REOPEN", "1")],
-    );
-    let (stdout, stderr) = &out;
-    assert!(
-        std::panic::catch_unwind(|| check("liteinst", &out, 1)).is_err(),
-        "the twin's bar held although each fork child read the clock first: {stdout} {stderr}"
-    );
-    assert!(
-        stdout
-            .lines()
-            .any(|l| l == "root count probe-gen=1 shared-record=1"),
-        "the root lost a memfd, so the mutant did not run in the children only: {stdout}"
-    );
-    for who in ["child", "grandchild"] {
-        let line = format!("{who} count probe-gen=0 shared-record=0");
-        assert!(
-            stdout.lines().any(|l| l == line),
-            "expected {line:?} under the mutant: {stdout}"
-        );
+    let out = run_with("liteinst", "liteinst-clock-first");
+    for line in out.1.lines().filter(|l| l.starts_with("literoot: ")) {
+        println!("liteinst-clock-first stderr: {line}");
     }
-    for what in ["probe generation", "shared record"] {
-        let prefix = format!("literoot: {what} unavailable in this process: ");
-        assert!(
-            stderr.lines().any(|l| l.starts_with(&prefix)),
-            "no {prefix:?} line without LITEROOT_DEBUG: {stderr}"
-        );
-    }
+    check("liteinst", &out, 1);
 }
 
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
