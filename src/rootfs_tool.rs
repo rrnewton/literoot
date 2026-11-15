@@ -284,6 +284,11 @@ impl GlobalTool for LiterootGlobal {
     }
 }
 
+/// Size of each per-process guest scratch page (`ProcState::scratch`,
+/// `ProcState::getcwd_scratch`): one page, which is also PATH_MAX, the
+/// kernel's bound on a getcwd answer (its length counts the NUL).
+const SCRATCH_PAGE: usize = 4096;
+
 /// Per-process replicated state (design §6).
 /// Fields are `pub(crate)` so `crate::exec_state` can snapshot and
 /// restore the exec-continuity subset (B4) without a second copy
@@ -312,6 +317,10 @@ pub(crate) struct ProcState {
     /// caller's frame in interp-route processes (measured
     /// EFAULT on second execve, test-execve-eacces-enoexec).
     pub(crate) scratch: Option<usize>,
+    /// A second scratch page, for getcwd alone: the kernel writes its
+    /// answer there (up to a whole page) and the Tool reads it back
+    /// after the inject, so it must not share a page with path staging.
+    pub(crate) getcwd_scratch: Option<usize>,
     /// Guest path of the current program image (for
     /// /proc/self/exe de-translation; seeded from Config).
     pub(crate) exe_guest: PathBuf,
@@ -531,6 +540,7 @@ impl Default for RootfsTool {
                 bootstrapped: false,
                 root_override: None,
                 scratch: None,
+                getcwd_scratch: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
                 fake_fs: None,
@@ -1424,6 +1434,7 @@ impl Tool for RootfsTool {
             st.bootstrapped = true;
             // New image: any previous scratch mapping is gone.
             st.scratch = None;
+            st.getcwd_scratch = None;
             // A pending self-stop swallow does not survive exec.
             st.swallow_next_self_stop = false;
             // The kernel resets the filesystem ids to the effective ids.
@@ -1437,7 +1448,7 @@ impl Tool for RootfsTool {
             if needs {
                 let mmap = reverie::syscalls::Mmap::new()
                     .with_addr(None)
-                    .with_len(4096)
+                    .with_len(SCRATCH_PAGE)
                     .with_prot(
                         reverie::syscalls::ProtFlags::PROT_READ
                             | reverie::syscalls::ProtFlags::PROT_WRITE,
@@ -2938,25 +2949,44 @@ impl Tool for RootfsTool {
                 // getcwd (rename/rmdir of ancestors then reports
                 // correctly, incl. ENOENT on removed cwd) and
                 // reverse-translate the host path to guest.
-                let buf = getcwd.buf();
-                let size = getcwd.size();
-                let ret = guest.inject(getcwd).await?;
-                let Some(buf) = buf else {
-                    return Ok(ret);
+                //
+                // The kernel writes into getcwd's own scratch page,
+                // never into the guest's buffer: the host path must
+                // not reach guest memory, and whether the answer
+                // fits is a property of the guest path, not the
+                // host one. The page is 4096 bytes, and the
+                // kernel's answer, NUL included, is at most
+                // PATH_MAX (4096), so any cwd it can return fits.
+                // The page is not the path-staging one: the answer
+                // is read back after the inject, and path staging
+                // could otherwise overwrite it in between.
+                let Some(buf) = getcwd.buf() else {
+                    return Ok(guest.inject(getcwd).await?);
                 };
+                let size = getcwd.size();
+                use reverie::syscalls::MemoryAccess as _;
+                use std::os::unix::ffi::OsStringExt as _;
+                let scratch = self.getcwd_page(guest).await?;
+                let ret = guest
+                    .inject(
+                        getcwd
+                            .with_buf(reverie::syscalls::AddrMut::from_ptr(
+                                scratch as *const libc::c_char,
+                            ))
+                            .with_size(SCRATCH_PAGE),
+                    )
+                    .await?;
                 if ret <= 0 {
                     return Ok(ret);
                 }
-                use reverie::syscalls::MemoryAccess as _;
-                use std::os::unix::ffi::OsStringExt as _;
                 let mut mem = guest.memory();
+                let scratch_addr: reverie::syscalls::Addr<u8> =
+                    unsafe { reverie::syscalls::Addr::from_raw_unchecked(scratch) };
+                let n = (ret as usize).saturating_sub(1).min(SCRATCH_PAGE);
+                let mut stored = vec![0u8; n];
+                mem.read_exact(scratch_addr, &mut stored)?;
                 let addr: reverie::syscalls::AddrMut<u8> =
                     unsafe { std::mem::transmute_copy(&buf) };
-                let n = (ret as usize).saturating_sub(1).min(size);
-                let mut stored = vec![0u8; n];
-                if mem.read(addr, &mut stored).is_err() {
-                    return Ok(ret);
-                }
                 let cfg = self.config(guest);
                 let host_path = PathBuf::from(
                     std::ffi::OsString::from_vec(stored),
@@ -3687,13 +3717,41 @@ impl RootfsTool {
         offset: usize,
     ) -> Result<usize, Error> {
         use reverie::syscalls::MemoryAccess as _;
-        let existing = self.state.lock().unwrap().scratch;
+        let base = self.scratch_page(guest).await?;
+        let mut mem = guest.memory();
+        let addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(base + offset) };
+        mem.write(addr, bytes)?;
+        Ok(base + offset)
+    }
+
+    /// Guest address of the per-process path-staging scratch page
+    /// (`SCRATCH_PAGE` bytes), mapping it on first use.
+    async fn scratch_page<T: Guest<Self>>(&self, guest: &mut T) -> Result<usize, Error> {
+        self.cached_page(guest, |st| &mut st.scratch).await
+    }
+
+    /// Guest address of getcwd's own scratch page (`SCRATCH_PAGE`
+    /// bytes), mapping it on first use.
+    async fn getcwd_page<T: Guest<Self>>(&self, guest: &mut T) -> Result<usize, Error> {
+        self.cached_page(guest, |st| &mut st.getcwd_scratch).await
+    }
+
+    /// The page cached in `slot`, or a new anonymous mapping stored
+    /// there. The state lock is held only to read and to store, never
+    /// across the inject.
+    async fn cached_page<T: Guest<Self>>(
+        &self,
+        guest: &mut T,
+        slot: fn(&mut ProcState) -> &mut Option<usize>,
+    ) -> Result<usize, Error> {
+        let existing = *slot(&mut self.state.lock().unwrap());
         let base = match existing {
             Some(b) => b,
             None => {
                 let mmap = reverie::syscalls::Mmap::new()
                     .with_addr(None)
-                    .with_len(4096)
+                    .with_len(SCRATCH_PAGE)
                     .with_prot(
                         reverie::syscalls::ProtFlags::PROT_READ
                             | reverie::syscalls::ProtFlags::PROT_WRITE,
@@ -3705,15 +3763,11 @@ impl RootfsTool {
                     .with_fd(-1)
                     .with_offset(0);
                 let addr = guest.inject(mmap).await? as usize;
-                self.state.lock().unwrap().scratch = Some(addr);
+                *slot(&mut self.state.lock().unwrap()) = Some(addr);
                 addr
             }
         };
-        let mut mem = guest.memory();
-        let addr: reverie::syscalls::AddrMut<u8> =
-            unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(base + offset) };
-        mem.write(addr, bytes)?;
-        Ok(base + offset)
+        Ok(base)
     }
 
     /// Exec `guest_prog` through the rootfs interp `interp_guest`:
@@ -5714,6 +5768,7 @@ mod tests {
         assert_eq!(st.exe_guest, PathBuf::from("/bin/sh"));
         assert!(st.bootstrapped);
         assert_eq!(st.scratch, None);
+        assert_eq!(st.getcwd_scratch, None);
     }
 
     #[test]
