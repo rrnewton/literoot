@@ -710,7 +710,11 @@ fn gone(path: &Path) -> bool {
 /// A child cgroup's `error` is dropped only when the child is confirmed
 /// gone; otherwise (it exists, or cannot be inspected) the error stands.
 fn skip_if_gone(sub: &Path, error: String) -> Result<(), String> {
-    if gone(sub) { Ok(()) } else { Err(error) }
+    if gone(sub) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 /// The child cgroups of `dir` (its subdirectories).
