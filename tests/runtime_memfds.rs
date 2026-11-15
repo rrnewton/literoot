@@ -15,6 +15,23 @@
 //! resolved with a real directory (the probe generation). The root must
 //! see both.
 //!
+//! The root opens a file before it forks. Under LiteInst that has the
+//! guest's own open() site patched, so a libc open from literoot's
+//! runtime in a fork child enters the runtime's hook (and its clock,
+//! which closes the inherited copies) instead of trapping: the condition
+//! under which a libc reopen in the child lost both memfds.
+//!
+//! The clock-first variant runs the same tree with the preload's
+//! test-only mutant switch (LITEROOT_TEST_CLOCK_BEFORE_REOPEN), which makes
+//! each fork child read the runtime's RCB clock before its reopen, as if
+//! Reverie had moved a clock read ahead of the Tool's construction. That
+//! tree must fail the bar above, and literoot must report both lost
+//! memfds on stderr without LITEROOT_DEBUG.
+//!
+//! There is no --kill-on-exit variant: in-guest backends refuse that flag
+//! by design, before any guest runs, and tests/kill_on_exit.rs
+//! `inguest_kill_on_exit_refused_by_name` pins the refusal.
+//!
 //! The guest also prints, as an observation only, whether an open by
 //! path of each runtime-range descriptor succeeds: Reverie's own sockets
 //! and anonymous inodes cannot be reopened by path (ENXIO), and the
@@ -186,14 +203,23 @@ fn make_root(label: &str) -> PathBuf {
 }
 
 /// Runs the guest under `backend` with fake root (sethostname) and the
-/// default binds, and returns its stdout.
-fn run(backend: &str) -> String {
-    let root = make_root(backend);
+/// default binds, and returns its stdout and stderr.
+fn run(backend: &str) -> (String, String) {
+    run_with(backend, backend, &[])
+}
+
+/// `run` with extra environment `envs`, in a root named after `label`.
+/// LITEROOT_DEBUG is always removed: the lost-memfd lines must not need it.
+fn run_with(backend: &str, label: &str, envs: &[(&str, &str)]) -> (String, String) {
+    let root = make_root(label);
     let out = Command::new(literoot_bin())
         .args(["--backend", backend, "-0", "-R"])
         .arg(&root)
         .arg("/bin/memfds")
         .env_remove("LITEROOT_PRELOAD")
+        .env_remove("LITEROOT_DEBUG")
+        .env_remove("LITEROOT_TEST_CLOCK_BEFORE_REOPEN")
+        .envs(envs.iter().copied())
         .env("PATH", "/bin:/usr/bin")
         .output()
         .expect("spawn literoot");
@@ -206,13 +232,13 @@ fn run(backend: &str) -> String {
     );
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
     println!("{backend} stdout:\n{stdout}");
-    stdout
+    (stdout, stderr)
 }
 
 /// Every process of the tree saw `count` copies of each memfd, and every
 /// copy it saw refused fcntl by number; the grandchild's hostname and
-/// directory reached the root.
-fn check(backend: &str, stdout: &str, count: usize) {
+/// directory reached the root; and literoot reported no lost memfd.
+fn check(backend: &str, (stdout, stderr): &(String, String), count: usize) {
     for who in ["root", "child", "grandchild"] {
         let line = format!("{who} count probe-gen={count} shared-record={count}");
         assert!(
@@ -238,12 +264,53 @@ fn check(backend: &str, stdout: &str, count: usize) {
         stdout.lines().any(|l| l == "root link-file=from-realdir"),
         "{backend}: the grandchild's directory did not reach the root (probe generation): {stdout}"
     );
+    assert!(
+        !stderr.contains("unavailable in this process"),
+        "{backend}: literoot lost a shared memfd: {stderr}"
+    );
 }
 
 #[cfg(feature = "in-guest")]
 #[test]
 fn liteinst_tree_holds_each_memfd_once_out_of_reach_by_number() {
     check("liteinst", &run("liteinst"), 1);
+}
+
+/// The mutant: a clock read before the reopen in every fork child must
+/// fail the twin's bar, loudly.
+#[cfg(feature = "in-guest")]
+#[test]
+fn liteinst_clock_read_before_the_reopen_fails_loudly() {
+    let out = run_with(
+        "liteinst",
+        "liteinst-clock-first",
+        &[("LITEROOT_TEST_CLOCK_BEFORE_REOPEN", "1")],
+    );
+    let (stdout, stderr) = &out;
+    assert!(
+        std::panic::catch_unwind(|| check("liteinst", &out, 1)).is_err(),
+        "the twin's bar held although each fork child read the clock first: {stdout} {stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "root count probe-gen=1 shared-record=1"),
+        "the root lost a memfd, so the mutant did not run in the children only: {stdout}"
+    );
+    for who in ["child", "grandchild"] {
+        let line = format!("{who} count probe-gen=0 shared-record=0");
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "expected {line:?} under the mutant: {stdout}"
+        );
+    }
+    for what in ["probe generation", "shared record"] {
+        let prefix = format!("literoot: {what} unavailable in this process: ");
+        assert!(
+            stderr.lines().any(|l| l.starts_with(&prefix)),
+            "no {prefix:?} line without LITEROOT_DEBUG: {stderr}"
+        );
+    }
 }
 
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
