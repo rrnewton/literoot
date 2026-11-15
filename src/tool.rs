@@ -698,26 +698,67 @@ pub fn launch_failed() -> bool {
     LAUNCH_FAILED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Set when an in-guest run finished while the side log was open and no
-/// preload process had reported (`rootfs_tool::REPORTER_ACKNOWLEDGED`):
-/// the preload predates the refusal side log, so the launcher ends its log
-/// `error reporter`, which no test name can count.
+/// Set when an in-guest run finished and no preload process had reported
+/// (`rootfs_tool::REPORTER_ACKNOWLEDGED`): the guest ran, but nothing shows
+/// that it ran with the tool, so the run fails by name with or without the
+/// side log. This flag, never `LAUNCH_FAILED`, carries that failure: main
+/// writes `end ... error launch` in preference to `error reporter`, and a
+/// missing reporter must end the log `error reporter`, which no test name
+/// can count.
 static REPORTER_MISSING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// The exit status of an in-guest run whose preload never reported.
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+const REPORTER_MISSING_EXIT: u8 = 125;
 
 #[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
 fn check_reporter(preload: &Path) {
     use std::sync::atomic::Ordering;
-    if crate::refusal_log::is_open()
-        && !crate::rootfs_tool::REPORTER_ACKNOWLEDGED.load(Ordering::SeqCst)
-    {
+    if !crate::rootfs_tool::REPORTER_ACKNOWLEDGED.load(Ordering::SeqCst) {
         REPORTER_MISSING.store(true, Ordering::SeqCst);
+        eprintln!("literoot: in-guest preload did not report");
         eprintln!(
-            "literoot: --refusal-log: the preload {} sent no refusal report; it \
-             predates the refusal side log (rebuild it from this literoot)",
+            "literoot: the preload {} sent no report, so this run's refusals cannot \
+             be seen (rebuild the preload from this literoot)",
             preload.display()
         );
     }
+}
+
+/// The guest's exit status, unless its preload never reported.
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+fn in_guest_exit(status: std::process::ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    if reporter_missing() {
+        return REPORTER_MISSING_EXIT;
+    }
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8
+}
+
+/// The side-log token of a preload refusal, recorded before
+/// `run_guest` returns the refusal, so main keys the log by the refusal
+/// itself, never by its text.
+static PRELOAD_REFUSAL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The token of the preload refusal this run made, if any.
+pub fn preload_refusal_token() -> Option<&'static str> {
+    PRELOAD_REFUSAL.get().copied()
+}
+
+fn refuse_preload(token: &'static str, text: String) -> String {
+    let _ = PRELOAD_REFUSAL.set(token);
+    text
+}
+
+/// The in-guest preload for `flavour`: `LITEROOT_PRELOAD` admitted by its
+/// stamp, else the embedded blob materialized into the private cache, else
+/// a named refusal. Never a fallback to ptrace.
+#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
+fn select_preload(flavour: crate::preload_materialize::Flavour) -> Result<PathBuf, String> {
+    crate::preload_materialize::select(flavour).map_err(|r| refuse_preload(r.token, r.text()))
 }
 
 /// Whether an in-guest run finished without a reporter.
@@ -1101,9 +1142,13 @@ fn run_backend(
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
-    // The launch route, for the refusal side log: in-guest backends start
-    // their initial program through the preload today.
-    crate::side_log::route(if in_guest { "preload" } else { "ptrace" });
+    // The launch route, for the refusal side log. An in-guest route is
+    // written only after its preload was selected and verified, just
+    // before the launch, so `route preload` means the launch started; a
+    // preload refusal carries no route line.
+    if !in_guest {
+        crate::side_log::route("ptrace");
+    }
     if in_guest {
         // --kill-on-exit is ptrace-only today: an in-guest
         // tree kill needs a launcher-side descent proof the
@@ -1134,12 +1179,8 @@ fn run_backend(
         // site patching off, exactly as before.
         #[cfg(feature = "inguest-trap")]
         if backend == "trap" {
-            let preload = find_preload().ok_or(
-                "literoot preload not found (libliteroot_preload.so beside the \
-                 literoot binary, or LITEROOT_PRELOAD=<path>). Build it with: \
-                 cargo build --release --manifest-path literoot/preload/Cargo.toml \
-                 --no-default-features --features inguest-trap",
-            )?;
+            let preload = select_preload(crate::preload_materialize::Flavour::TrapHost)?;
+            crate::side_log::route("preload");
             let (output, _global) = runtime.block_on(async {
                 reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
                     RootfsTool,
@@ -1150,18 +1191,16 @@ fn run_backend(
             check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
-            use std::os::unix::process::ExitStatusExt;
-            let status = output.status;
-            return Ok(status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-                as u8);
+            return Ok(in_guest_exit(output.status));
         }
         #[cfg(not(feature = "in-guest"))]
         {
-            return Err(format!(
-                "backend {backend:?} unavailable: in-guest backends compiled out \
-                 (ptrace-only build; rebuild with default features)"
+            return Err(refuse_preload(
+                "not_built",
+                format!(
+                    "in-guest not built into this binary\nliteroot: backend {backend:?} \
+                     needs the in-guest feature (rebuild with default features)"
+                ),
             ));
         }
         #[cfg(feature = "in-guest")]
@@ -1170,11 +1209,8 @@ fn run_backend(
                 reverie_liteinst::SITE_PATCHING_ENV,
                 if backend == "trap" { "0" } else { "1" },
             );
-            let preload = find_preload().ok_or(
-                "literoot preload not found (libliteroot_preload.so beside the \
-                 literoot binary, or LITEROOT_PRELOAD=<path>). Build it with: \
-                 cargo build --release --manifest-path literoot/preload/Cargo.toml",
-            )?;
+            let preload = select_preload(crate::preload_materialize::Flavour::Liteinst)?;
+            crate::side_log::route("preload");
             let (output, _global) = runtime.block_on(async {
                 reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
                     cmd,
@@ -1188,12 +1224,7 @@ fn run_backend(
             check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
-            use std::os::unix::process::ExitStatusExt;
-            let status = output.status;
-            return Ok(status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
-                as u8);
+            return Ok(in_guest_exit(output.status));
         }
     }
 
@@ -1625,27 +1656,6 @@ fn classify_kill_wait_error(error: &reverie::Error) -> KillWaitErrorClass {
         _ => None,
     };
     classify_primary_error(typed_errno, &primary_error_text(error))
-}
-
-/// Locate `libliteroot_preload.so`: `$LITEROOT_PRELOAD`, else beside
-/// the running binary.
-#[cfg(any(feature = "in-guest", feature = "inguest-trap"))]
-fn find_preload() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("libliteroot_preload.so");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
 }
 
 /// Resolve a guest program path to a host executable, following

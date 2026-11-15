@@ -44,8 +44,9 @@ use crate::refusal_log;
 /// open after the root guest exits. `connections_open` is in the grammar
 /// for a launcher that can tell that case apart; this one cannot by type,
 /// so it writes `launch`. `reporter`, an in-guest run in which no preload
-/// process acknowledged refusal reporting (a preload built before this
-/// log, which runs the guest but reports nothing).
+/// process acknowledged refusal reporting: the launcher fails such a run
+/// whether or not this log is open, and writes `reporter` only when the
+/// launch itself did not fail (`launch` wins, src/main.rs).
 pub const END_ERRORS: &[&str] = &["log_write", "connections_open", "launch", "reporter"];
 /// `route` labels.
 pub const ROUTES: &[&str] = &["preload", "static_m2", "ptrace"];
@@ -82,6 +83,15 @@ pub const LAUNCHER: &[&str] = &[
     "static_pie",
     "kill_on_exit",
     "refusal_log_repeated",
+    // The in-guest preload's named refusals (src/preload_materialize.rs).
+    "preload_digest",
+    "cache_dir",
+    "cache_write",
+    "preload_stamp",
+    "preload_probe",
+    "preload_separator",
+    "preload_missing",
+    "not_built",
     "other",
 ];
 

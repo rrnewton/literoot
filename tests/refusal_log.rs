@@ -578,22 +578,29 @@ fn a_raw_execveat_is_keyed_in_guest_and_runs_under_ptrace() {
     }
 }
 
-/// A preload that predates the side log runs the guest but reports nothing:
-/// the pin parent 2dbd5c52 installs the bare Tool under the same Reverie
-/// pin, configuration and selector. The launcher must end its log
-/// `error reporter` and say why on stderr, so no test name counts a run
-/// whose refusals could not be seen (review of g2 38e83d31,
-/// finding P1-2). `LITEROOT_STALE_PRELOAD` names such a preload; unset,
-/// this is a skip, never a pass, and under LITEROOT_REQUIRE_FIXTURES a
-/// failure.
-#[test]
-fn a_preload_without_the_reporter_ends_the_log_in_error() {
-    let Some(stale) = std::env::var_os("LITEROOT_STALE_PRELOAD") else {
+/// The fixture named by `var`, or `None` after the conventional skip line
+/// (never a pass); under LITEROOT_REQUIRE_FIXTURES an unset fixture fails.
+fn fixture_preload(var: &str, what: &str) -> Option<PathBuf> {
+    let Some(path) = std::env::var_os(var) else {
         assert!(
             std::env::var_os("LITEROOT_REQUIRE_FIXTURES").is_none(),
-            "LITEROOT_STALE_PRELOAD is unset under LITEROOT_REQUIRE_FIXTURES"
+            "{var} is unset under LITEROOT_REQUIRE_FIXTURES"
         );
-        eprintln!("stale preload: SKIP (not a pass): LITEROOT_STALE_PRELOAD is unset");
+        eprintln!("{what}: SKIP (not a pass): {var} is unset");
+        return None;
+    };
+    Some(PathBuf::from(path))
+}
+
+/// A preload built before the compatibility stamp (the pin parent 2dbd5c52
+/// installs the bare Tool under the same Reverie pin) is now refused at the
+/// stamp preflight, before anything runs: a non-zero exit, the named
+/// refusal as one whole stderr line, and a valid log whose only refusal is
+/// `launcher preload_stamp`, with no route line. `LITEROOT_STALE_PRELOAD`
+/// names such a preload.
+#[test]
+fn a_preload_without_the_stamp_is_refused_before_the_run() {
+    let Some(stale) = fixture_preload("LITEROOT_STALE_PRELOAD", "stale preload") else {
         return;
     };
     let Some((scratch, _guest)) = scratch("stale") else {
@@ -609,11 +616,64 @@ fn a_preload_without_the_reporter_ends_the_log_in_error() {
             .stdin(Stdio::null())
             .output()
             .expect("run literoot");
-        assert_eq!(out.status.code(), Some(0), "{backend}: the guest still runs");
+        assert_ne!(out.status.code(), Some(0), "{backend}: the stamp refusal fails the run");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("sent no refusal report"), "{backend}: {stderr}");
+        assert!(
+            stderr
+                .lines()
+                .any(|l| l == "literoot: preload stamp mismatch: rebuild the preload"),
+            "{backend}: {stderr}"
+        );
+        let refused = check(&log).expect("the side log is valid");
+        assert_eq!(refused, ["refused launcher preload_stamp"], "{backend}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains("literoot: route "), "{backend}: no launch, no route: {text}");
+    }
+}
+
+/// A stamp-valid preload that never reports (the `reporter-off` fixture,
+/// built from this checkout's preload/ with `--features reporter-off`) runs
+/// the guest, and then the launcher fails the run by name, with or without
+/// the side log: a non-zero exit, `in-guest preload did not report` as one
+/// whole stderr line, and a log that ends `error reporter`, which the
+/// validator rejects. `LITEROOT_REPORTER_OFF_PRELOAD` names the fixture.
+#[test]
+fn a_preload_that_never_reports_fails_the_run() {
+    let Some(silent) = fixture_preload("LITEROOT_REPORTER_OFF_PRELOAD", "reporter-off preload")
+    else {
+        return;
+    };
+    let Some((scratch, _guest)) = scratch("silent") else {
+        return;
+    };
+    // With inguest-trap, --backend trap dispatches to the TrapHost flavour,
+    // which this liteinst fixture is not; there only liteinst is checked.
+    let backends: &[&str] = if cfg!(feature = "inguest-trap") {
+        &["liteinst"]
+    } else {
+        &["liteinst", "trap"]
+    };
+    for &backend in backends {
+        let log = scratch.0.join(format!("logs/{backend}"));
+        let mut with_log = Command::new(literoot_bin());
+        with_log.arg("--refusal-log").arg(&log);
+        let mut without_log = Command::new(literoot_bin());
+        for (cmd, logged) in [(&mut with_log, true), (&mut without_log, false)] {
+            let out = cmd
+                .args(["--backend", backend, "/bin/true"])
+                .env("LITEROOT_PRELOAD", &silent)
+                .stdin(Stdio::null())
+                .output()
+                .expect("run literoot");
+            assert_ne!(out.status.code(), Some(0), "{backend} (log {logged}): a hard failure");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.lines().any(|l| l == "literoot: in-guest preload did not report"),
+                "{backend} (log {logged}): {stderr}"
+            );
+        }
         let invalid = check(&log).expect_err("the side log must not be valid");
-        assert!(invalid.contains("error reporter"), "{backend}: {invalid}");
+        assert!(invalid.contains("ended with error reporter"), "{backend}: {invalid}");
     }
 }
 

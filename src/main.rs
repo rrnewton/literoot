@@ -32,6 +32,11 @@ mod runtime_package;
 mod shared_record;
 #[cfg(feature = "tool")]
 mod tool;
+// The in-guest preload: its compatibility stamp and its private cache.
+#[cfg(all(feature = "tool", any(feature = "in-guest", feature = "inguest-trap")))]
+mod preload_materialize;
+#[cfg(all(feature = "tool", any(feature = "in-guest", feature = "inguest-trap")))]
+mod preload_stamp;
 mod translate;
 
 use std::path::{Path, PathBuf};
@@ -650,7 +655,11 @@ fn launch(argv: Vec<String>) -> ExitCode {
             Err(e) => {
                 let code = launcher_error_exit_code(&e);
                 if !tool::command_was_not_runnable() {
-                    side_log::refused_launcher(launcher_token(&e));
+                    // A preload refusal is keyed by its own token, never by
+                    // the text of the error.
+                    side_log::refused_launcher(
+                        tool::preload_refusal_token().unwrap_or_else(|| launcher_token(&e)),
+                    );
                 }
                 eprintln!("literoot: {e}");
                 ExitCode::from(code)

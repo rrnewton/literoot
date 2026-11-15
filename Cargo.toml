@@ -32,10 +32,12 @@ tool = ["dep:reverie", "dep:libc", "dep:serde", "dep:tokio"]
 # (reverie-liteinst / reverie-inguest / liteinst) are compiled, so it
 # builds on architectures the in-guest stack does not serve yet.
 run = ["tool", "dep:reverie-ptrace"]
-in-guest = ["dep:reverie-liteinst"]
+# sha2: the embedded preload's digest and the user preload's stamp
+# (src/preload_materialize.rs, src/preload_stamp.rs).
+in-guest = ["dep:reverie-liteinst", "dep:sha2"]
 # Trap-only in-guest: Reverie's TrapHost API, zero ptrace, and no
 # reverie-ptrace or reverie-liteinst anywhere in the graph.
-inguest-trap = ["tool", "dep:reverie-inguest"]
+inguest-trap = ["tool", "dep:reverie-inguest", "dep:sha2"]
 ptrace-only = ["run"]
 # Watched exec (W6a spawn swap): allows this launcher build to
 # assert watched mode to an exec-watch preload. Default off;
@@ -68,6 +70,10 @@ serde = { version = "1.0.219", features = ["derive"], optional = true }
 tokio = { version = "1.52.4", features = ["rt", "macros"], optional = true }
 serde_json = { version = "1.0.154", optional = true }
 sha2 = { version = "0.10.9", optional = true }
+
+[build-dependencies]
+# build.rs: the preload stamp's protocol_version and the embedded digest.
+sha2 = "0.10.9"
 
 [profile.release]
 lto = "thin"
