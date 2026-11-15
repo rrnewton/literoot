@@ -7,7 +7,10 @@
 //! directory delegated to this user, with no controller enabled in its
 //! subtree, on the cgroup v2 file system mounted at /sys/fs/cgroup, named
 //! by LITEROOT_TEST_CGROUP; they panic without it unless
-//! LITEROOT_ALLOW_SKIP_CGROUP=1 skips them explicitly.
+//! LITEROOT_ALLOW_SKIP_CGROUP=1 skips them explicitly. A run refuses a
+//! root whose subtree holds any process, so only one run per root at a
+//! time: the cgroup tests take turns (one static mutex), and the test
+//! runner itself must run outside LITEROOT_TEST_CGROUP.
 
 #![cfg(feature = "tool")]
 
@@ -63,6 +66,20 @@ fn cgroup_or_skip() -> Option<PathBuf> {
         "run_stats: set LITEROOT_TEST_CGROUP to a delegated cgroup v2 directory, \
          or LITEROOT_ALLOW_SKIP_CGROUP=1 to skip explicitly"
     );
+}
+
+/// The cgroup tests share LITEROOT_TEST_CGROUP, where one run's
+/// `lr-<pid>` makes another's admission refuse: they take turns.
+#[allow(dead_code)]
+static CGROUP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// This test's turn at the delegated cgroup (a test that panicked while
+/// holding it does not stop the next one).
+#[allow(dead_code)]
+fn cgroup_turn() -> std::sync::MutexGuard<'static, ()> {
+    CGROUP_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A fresh directory under the test temp dir.
@@ -497,10 +514,7 @@ fn cgroup_descendant_is_measured(backend: &str, preload: Option<&Path>, root: &P
     let cg = &record["cgroup"];
     assert_eq!(cg["guest_cpu_state"], "COMPLETE", "{cg}");
     let children = int(&record, "/cgroup/children_since_move_us");
-    assert!(
-        children <= int(&record, "/cgroup/guest_cpu_us/1"),
-        "{cg}"
-    );
+    assert!(children <= int(&record, "/cgroup/guest_cpu_us/1"), "{cg}");
     assert!(children >= 1_000, "the loop's CPU was reaped: {cg}");
 }
 
@@ -530,6 +544,7 @@ fn ptrace_cgroup_split_and_refusals() {
     let Some(root) = cgroup_or_skip() else {
         return;
     };
+    let _turn = cgroup_turn();
     cgroup_split("ptrace", None, &root);
     cgroup_escape_is_not_complete("ptrace", None, &root);
     cgroup_descendant_is_measured("ptrace", None, &root);
@@ -572,6 +587,7 @@ fn trap_cgroup_split() {
     let (Some(root), Some(preload)) = (cgroup_or_skip(), preload_or_skip()) else {
         return;
     };
+    let _turn = cgroup_turn();
     cgroup_split("trap", Some(&preload), &root);
     cgroup_escape_is_not_complete("trap", Some(&preload), &root);
 }

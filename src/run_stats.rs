@@ -85,12 +85,12 @@
 //!   that its workloads write no cgroup files.
 //!
 //!   Then the launcher moves itself, and any process still in the subtree,
-//!   back to `<dir>` (a process is moved only while `/proc/<p>/cgroup`
-//!   still names this subtree, so an exited process's reused pid is never
-//!   moved; the move needs write access to a common ancestor, which bounds
-//!   the remaining race, a pid freed and reused between that check and the
-//!   write, to the cgroups this user may write: its delegated systemd
-//!   subtree), removes the
+//!   back to `<dir>` (a pid is written only after `/proc/<p>/cgroup` was
+//!   seen to name this subtree, so another process's pid is moved only if
+//!   it was freed and reused between that check and the write; the move
+//!   needs write access to a common ancestor, which bounds that race to
+//!   the cgroups this user may write: its delegated systemd subtree),
+//!   removes the
 //!   subtree's cgroups, and checks they are gone. Cleanup counts as done
 //!   only once the directory is verified absent; any failure is reported
 //!   and ends the run as a stats failure. The guest can see the cgroup
@@ -558,9 +558,9 @@ impl RunCgroup {
         if self.exists.get() {
             self.evacuate()?;
             remove_tree(&self.dir)?;
-            if self.dir.exists() {
+            if !gone(&self.dir) {
                 return Err(format!(
-                    "{CGROUP_ENV}: {} still exists after removal",
+                    "{CGROUP_ENV}: {} is not confirmed absent after removal",
                     self.tail
                 ));
             }
@@ -694,11 +694,23 @@ fn subtree_procs(dir: &Path) -> Result<Vec<(PathBuf, u32)>, String> {
         match subtree_procs(&sub) {
             Ok(procs) => all.extend(procs),
             // A guest may remove its own child cgroup while it is read.
-            Err(_) if !sub.exists() => {}
-            Err(e) => return Err(e),
+            Err(e) => skip_if_gone(&sub, e)?,
         }
     }
     Ok(all)
+}
+
+/// `path` is confirmed absent: `try_exists` reports `Ok(false)` only for
+/// a typed NotFound, so a permission or other metadata error is not
+/// mistaken for a disappearance.
+fn gone(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
+/// A child cgroup's `error` is dropped only when the child is confirmed
+/// gone; otherwise (it exists, or cannot be inspected) the error stands.
+fn skip_if_gone(sub: &Path, error: String) -> Result<(), String> {
+    if gone(sub) { Ok(()) } else { Err(error) }
 }
 
 /// The child cgroups of `dir` (its subdirectories).
@@ -717,11 +729,9 @@ fn child_cgroups(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// Removes `dir`'s cgroup and its descendants, deepest first.
 fn remove_tree(dir: &Path) -> Result<(), String> {
     for sub in child_cgroups(dir)? {
-        match remove_tree(&sub) {
-            Ok(()) => {}
+        if let Err(e) = remove_tree(&sub) {
             // Gone already (a guest removed its own child cgroup).
-            Err(_) if !sub.exists() => {}
-            Err(e) => return Err(e),
+            skip_if_gone(&sub, e)?;
         }
     }
     std::fs::remove_dir(dir)
@@ -941,14 +951,20 @@ mod tests {
         let root = scratch("cg-reader");
         let dir = root.join("lr-stand-in");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        let stat = "usage_usec 1000000\nuser_usec 600000\nsystem_usec 400000\n";
+        // The fixture's "move" happens here: this process's CPU is sampled around
+        // it, as admit() does, so the launcher term covers only this
+        // test's span; usage (1,000 s) exceeds any CPU the test process
+        // (every test thread) can spend in that span.
+        let stat = "usage_usec 1000000000\nuser_usec 600000000\nsystem_usec 400000000\n";
         std::fs::write(dir.join("cpu.stat"), stat).unwrap();
         let pid = std::process::id();
+        let a = self_cpu_us().unwrap();
+        let b = self_cpu_us().unwrap();
         let cg = RunCgroup {
             root: root.clone(),
             dir: dir.clone(),
             tail: "cg-reader/lr-stand-in".into(),
-            moved: (0, 0),
+            moved: (a, b),
             children_at_move: children_cpu_us().unwrap(),
             inside: Cell::new(false),
             exists: Cell::new(false),
@@ -959,6 +975,9 @@ mod tests {
         std::fs::write(dir.join("sub/cgroup.procs"), "").unwrap();
         let seen = cg.read_until(short()).unwrap();
         assert_eq!(seen["guest_cpu_state"], "COMPLETE", "{seen}");
+        let guest = &seen["guest_cpu_us"];
+        assert!(guest[0].as_i64().unwrap() > 0, "{seen}");
+        assert!(guest[1].as_i64().unwrap() <= 1_000_000_000, "{seen}");
         // Another process in the cgroup itself.
         std::fs::write(dir.join("cgroup.procs"), format!("{pid}\n4194999\n")).unwrap();
         let seen = cg.read_until(short()).unwrap();
@@ -971,6 +990,51 @@ mod tests {
         let seen = cg.read_until(short()).unwrap();
         assert_eq!(seen["guest_cpu_state"], "INCOMPLETE", "{seen}");
         assert!(seen["guest_cpu_us"].is_null());
+        drop(cg);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A child cgroup's error is skipped only for a confirmed absence: a
+    /// child that cannot be inspected (here its parent is not searchable,
+    /// so its metadata read fails with permission denied) keeps the error,
+    /// and a child's error fails the whole read, so it is never COMPLETE.
+    #[test]
+    fn an_uninspectable_child_cgroup_is_never_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("cg-uninspectable");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("sub")).unwrap();
+        let mode = |m| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(m));
+        mode(0o600).unwrap();
+        let held = skip_if_gone(&locked.join("sub"), "denied".into());
+        mode(0o700).unwrap();
+        // Unprivileged, the metadata read fails; with a DAC override it
+        // succeeds and the child exists. Neither is an absence.
+        assert_eq!(held, Err("denied".to_string()));
+        assert_eq!(skip_if_gone(&root.join("absent"), "gone".into()), Ok(()));
+
+        // The read: an error from a child that still exists (its
+        // cgroup.procs cannot be read) fails it; no state is published.
+        let dir = root.join("lr-stand-in");
+        std::fs::create_dir_all(dir.join("odd/cgroup.procs")).unwrap();
+        let stat = "usage_usec 1000000000\nuser_usec 600000000\nsystem_usec 400000000\n";
+        std::fs::write(dir.join("cpu.stat"), stat).unwrap();
+        let pid = std::process::id();
+        std::fs::write(dir.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let a = self_cpu_us().unwrap();
+        let cg = RunCgroup {
+            root: root.clone(),
+            dir: dir.clone(),
+            tail: "cg-uninspectable/lr-stand-in".into(),
+            moved: (a, a),
+            children_at_move: children_cpu_us().unwrap(),
+            inside: Cell::new(false),
+            exists: Cell::new(false),
+        };
+        let error = cg
+            .read_until(Instant::now() + Duration::from_millis(200))
+            .expect_err("a child's error fails the read");
+        assert!(error.contains("odd/cgroup.procs"), "{error}");
         drop(cg);
         std::fs::remove_dir_all(&root).unwrap();
     }
