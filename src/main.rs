@@ -687,7 +687,13 @@ fn launch(argv: Vec<String>) -> ExitCode {
         match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command, cli.kill_on_exit) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
-                let code = launcher_error_exit_code(&e);
+                // A stats failure (the measurement cgroup's cleanup after
+                // this error) has the stats status, whatever the error.
+                let code = if stats_record_failed() {
+                    STATS_FAILURE_EXIT
+                } else {
+                    launcher_error_exit_code(&e)
+                };
                 if !tool::command_was_not_runnable() {
                     side_log::refused_launcher(launcher_token(&e));
                 }
@@ -763,9 +769,13 @@ mod kill_on_exit_parse_tests {
     #[test]
     fn a_stats_failure_outranks_every_other_end_token() {
         use super::end_error;
-        assert_eq!(end_error(true, true, true), Some("stats_record"));
-        assert_eq!(end_error(true, false, true), Some("stats_record"));
+        for launch in [false, true] {
+            for reporter in [false, true] {
+                assert_eq!(end_error(true, launch, reporter), Some("stats_record"));
+            }
+        }
         assert_eq!(end_error(false, true, true), Some("launch"));
+        assert_eq!(end_error(false, true, false), Some("launch"));
         assert_eq!(end_error(false, false, true), Some("reporter"));
         assert_eq!(end_error(false, false, false), None);
     }

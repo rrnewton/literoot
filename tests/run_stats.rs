@@ -97,7 +97,8 @@ impl Run<'_> {
         let _ = std::fs::remove_file(&log);
         let mut cmd = Command::new(literoot_bin());
         cmd.arg("--refusal-log").arg(&log);
-        cmd.args(["--backend", self.backend, "-r", "/"]).args(self.argv);
+        cmd.args(["--backend", self.backend, "-r", "/"])
+            .args(self.argv);
         for v in ["LITEROOT_STATS", "LITEROOT_EXIT_RECORD", "LITEROOT_CGROUP"] {
             cmd.env_remove(v);
         }
@@ -161,10 +162,15 @@ fn assert_common(record: &serde_json::Value, backend: &str, mode: &str, log: &[S
             "voluntary_ctxt_switches",
             "involuntary_ctxt_switches",
         ] {
-            assert!(record[side][key].is_i64(), "{side}.{key} missing from the record");
+            assert!(
+                record[side][key].is_i64(),
+                "{side}.{key} missing from the record"
+            );
         }
     }
-    assert!(log.iter().any(|l| l.ends_with(" ok") && l.starts_with("literoot: end ")));
+    assert!(log
+        .iter()
+        .any(|l| l.ends_with(" ok") && l.starts_with("literoot: end ")));
     if mode == "counting" {
         assert_eq!(count(record, "/dispatch/schema_version"), 1);
     }
@@ -213,14 +219,23 @@ fn ptrace_record_counts_stops_by_kind() {
     let seccomp = count(&record, "/ptrace/seccomp_stops");
     assert!(seccomp > 0);
     assert!(stops >= seccomp, "every seccomp stop is a stop event");
-    assert!(count(&record, "/ptrace/tracees_started") >= 3, "sh and two children");
+    assert!(
+        count(&record, "/ptrace/tracees_started") >= 3,
+        "sh and two children"
+    );
     assert!(count(&record, "/ptrace/exited_tracees") >= 3);
-    assert!(count(&record, "/ptrace/exec_stops") >= 2, "two children exec /bin/true");
+    assert!(
+        count(&record, "/ptrace/exec_stops") >= 2,
+        "two children exec /bin/true"
+    );
     let forks = count(&record, "/ptrace/fork_stops")
         + count(&record, "/ptrace/vfork_stops")
         + count(&record, "/ptrace/clone_stops");
     assert!(forks >= 2, "sh creates two children");
-    assert_eq!(count(&record, "/dispatch/counters/ptrace_seccomp_stops"), seccomp);
+    assert_eq!(
+        count(&record, "/dispatch/counters/ptrace_seccomp_stops"),
+        seccomp
+    );
     assert_eq!(count(&record, "/dispatch/counters/signal_traps"), 0);
     assert_eq!(count(&record, "/dispatch/counters/patched_direct_calls"), 0);
     assert_eq!(record["cgroup"]["guest_cpu_state"], "UNAVAILABLE");
@@ -270,8 +285,14 @@ fn unwritable_record_ends_with_its_own_status_and_token() {
         "the record failure's fixed text is missing from stderr"
     );
     let pid = begin_pid(&log);
-    assert!(log.contains(&format!("literoot: end {pid} error stats_record")), "{log:?}");
-    assert!(!log.iter().any(|l| l.starts_with("literoot: refused")), "{log:?}");
+    assert!(
+        log.contains(&format!("literoot: end {pid} error stats_record")),
+        "{log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("literoot: refused")),
+        "{log:?}"
+    );
 }
 
 /// None of the three variables reaches the guest, on any backend (a
@@ -387,7 +408,10 @@ fn cgroup_run(
     let record = one_record(&rec);
     std::fs::remove_dir_all(&dir).unwrap();
     let pid = begin_pid(&log);
-    assert!(!root.join(format!("lr-{pid}")).exists(), "the run's cgroup was removed");
+    assert!(
+        !root.join(format!("lr-{pid}")).exists(),
+        "the run's cgroup was removed"
+    );
     (status, record, log)
 }
 
@@ -399,8 +423,9 @@ fn int(record: &serde_json::Value, pointer: &str) -> i64 {
 }
 
 /// A COMPLETE split: its arithmetic holds, it captured the guest (the
-/// CPU of the reaped children, a lower bound on the guest's, lies in the
-/// guest interval within 1 ms: `/bin/cat` leaves no orphan), its interval
+/// CPU of the reaped children, a lower bound on the guest's, is at most
+/// the interval's upper bound, and since `/bin/cat` leaves no orphan it is
+/// no more than 1 ms under the lower bound), its interval
 /// is narrow (two getrusage calls wide), and the launcher's samples are
 /// real (it used CPU inside the cgroup, and its final SELF is at least
 /// the last sample).
@@ -423,12 +448,15 @@ fn cgroup_split(backend: &str, preload: Option<&Path>, root: &Path) {
     assert!(ghi - glo <= 5_000, "a narrow interval: {cg}");
     let children = int(&record, "/cgroup/children_since_move_us");
     assert!(
-        glo - 1_000 <= children && children <= ghi + 1_000,
+        glo - 1_000 <= children && children <= ghi,
         "children within the guest interval: {cg}"
     );
     let d = int(&record, "/cgroup/self_at_read_us/1");
     let self_total = int(&record, "/rusage_self/user_us") + int(&record, "/rusage_self/sys_us");
-    assert!(self_total >= d, "the final SELF is at least the last sample: {cg}");
+    assert!(
+        self_total >= d,
+        "the final SELF is at least the last sample: {cg}"
+    );
     // With the cgroup set, still nothing reaches the guest.
     let probe = [
         "/bin/sh",
@@ -436,7 +464,10 @@ fn cgroup_split(backend: &str, preload: Option<&Path>, root: &Path) {
         "test -z \"${LITEROOT_STATS+x}${LITEROOT_EXIT_RECORD+x}${LITEROOT_CGROUP+x}\"",
     ];
     let (status, _, log) = cgroup_run(backend, preload, root, &probe);
-    assert_eq!(status, 0, "{backend}: a record variable reached the guest: {log:?}");
+    assert_eq!(
+        status, 0,
+        "{backend}: a record variable reached the guest: {log:?}"
+    );
 }
 
 /// A shell loop that uses some CPU and makes no syscall.
@@ -466,7 +497,10 @@ fn cgroup_descendant_is_measured(backend: &str, preload: Option<&Path>, root: &P
     let cg = &record["cgroup"];
     assert_eq!(cg["guest_cpu_state"], "COMPLETE", "{cg}");
     let children = int(&record, "/cgroup/children_since_move_us");
-    assert!(children <= int(&record, "/cgroup/guest_cpu_us/1") + 1_000, "{cg}");
+    assert!(
+        children <= int(&record, "/cgroup/guest_cpu_us/1"),
+        "{cg}"
+    );
     assert!(children >= 1_000, "the loop's CPU was reaped: {cg}");
 }
 
@@ -483,7 +517,10 @@ fn refused_before_launch(vars: Vec<(&str, PathBuf)>, dir: &Path) {
     };
     let (status, log) = run.go(dir);
     assert_eq!(status, 5, "{log:?}");
-    assert!(log.contains(&"literoot: refused launcher stats_cgroup".to_owned()), "{log:?}");
+    assert!(
+        log.contains(&"literoot: refused launcher stats_cgroup".to_owned()),
+        "{log:?}"
+    );
     assert!(!marker.exists(), "the guest did not start");
 }
 
@@ -509,12 +546,19 @@ fn ptrace_cgroup_split_and_refusals() {
         ],
         &dir,
     );
-    assert_eq!(std::fs::read_dir(&plain).unwrap().count(), 0, "nothing was created in it");
+    assert_eq!(
+        std::fs::read_dir(&plain).unwrap().count(),
+        0,
+        "nothing was created in it"
+    );
     // A directory that does not exist.
     refused_before_launch(
         vec![
             ("LITEROOT_EXIT_RECORD", dir.join("e.jsonl")),
-            ("LITEROOT_CGROUP", PathBuf::from("/nonexistent-literoot-cgroup")),
+            (
+                "LITEROOT_CGROUP",
+                PathBuf::from("/nonexistent-literoot-cgroup"),
+            ),
         ],
         &dir,
     );

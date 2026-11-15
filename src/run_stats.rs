@@ -49,7 +49,9 @@
 //!   this field says only `"guest_cpu_state": "UNAVAILABLE"` with its
 //!   reason (on a host without delegation, for example). With it, before
 //!   the backend starts, the launcher checks that `<dir>` is on a cgroup v2
-//!   file system (statfs), creates `<dir>/lr-<pid>` (it must not exist),
+//!   file system (statfs) and that its subtree holds no process (a
+//!   dedicated parent, with nothing left from an earlier run), creates
+//!   `<dir>/lr-<pid>` (it must not exist),
 //!   checks that the kernel gave it a `cpu.stat` with `usage_usec`, writes
 //!   its pid to the existing `cgroup.procs` (never creating one), and
 //!   requires that `cgroup.procs` then holds only its pid and that
@@ -68,7 +70,8 @@
 //!   - COMPLETE: no other process anywhere in the subtree, and the CPU of
 //!     the children reaped since the move (every one was born in the
 //!     cgroup, so a lower bound on the guest's CPU) is at most the guest
-//!     interval's upper bound plus 1 ms;
+//!     interval's upper bound: an interval that its own lower bound
+//!     contradicts is never published, with no allowance;
 //!   - INCOMPLETE: a process was still in the subtree after the wait;
 //!   - INCONSISTENT: the reaped children used more CPU than the cgroup can
 //!     account for, so guest CPU left the cgroup (a process that moved
@@ -84,8 +87,10 @@
 //!   Then the launcher moves itself, and any process still in the subtree,
 //!   back to `<dir>` (a process is moved only while `/proc/<p>/cgroup`
 //!   still names this subtree, so an exited process's reused pid is never
-//!   moved; the move needs write access to a common delegated ancestor,
-//!   which bounds any such race to this delegated tree), removes the
+//!   moved; the move needs write access to a common ancestor, which bounds
+//!   the remaining race, a pid freed and reused between that check and the
+//!   write, to the cgroups this user may write: its delegated systemd
+//!   subtree), removes the
 //!   subtree's cgroups, and checks they are gone. Cleanup counts as done
 //!   only once the directory is verified absent; any failure is reported
 //!   and ends the run as a stats failure. The guest can see the cgroup
@@ -143,10 +148,6 @@ pub(crate) const STATS_RECORD_EXIT: u8 = 5;
 /// statfs `f_type` of a cgroup v2 file system (linux/magic.h).
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
-/// Slack, in microseconds, for comparing reaped children's CPU with the
-/// cgroup's guest interval (both are microsecond-rounded sums).
-const CHILDREN_SLACK_US: i64 = 1_000;
-
 /// How long the exit read waits for the guest to leave the cgroup.
 const EXIT_WAIT: Duration = Duration::from_secs(10);
 
@@ -178,11 +179,12 @@ impl RunStats {
         cmd.env_remove(STATS_ENV);
         cmd.env_remove(EXIT_ENV);
         cmd.env_remove(CGROUP_ENV);
-        let mut stats =
-            Self::from_values(std::env::var_os(STATS_ENV), std::env::var_os(EXIT_ENV));
+        let mut stats = Self::from_values(std::env::var_os(STATS_ENV), std::env::var_os(EXIT_ENV));
         if let Some(root) = std::env::var_os(CGROUP_ENV).filter(|v| !v.is_empty()) {
             if stats.path.is_none() {
-                return Err(format!("{CGROUP_ENV}: set without {STATS_ENV} or {EXIT_ENV}"));
+                return Err(format!(
+                    "{CGROUP_ENV}: set without {STATS_ENV} or {EXIT_ENV}"
+                ));
             }
             stats.cgroup = Some(RunCgroup::enter(PathBuf::from(root))?);
             // The interval starts inside the cgroup.
@@ -228,7 +230,10 @@ impl RunStats {
     }
 
     /// Whether backend counting was requested (the `*_and_stats` calls).
-    #[cfg_attr(not(any(feature = "in-guest", feature = "inguest-trap")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "in-guest", feature = "inguest-trap")),
+        allow(dead_code)
+    )]
     pub(crate) fn counting(&self) -> bool {
         self.counting
     }
@@ -262,14 +267,16 @@ impl RunStats {
     }
 
     /// The error that ends a run on a launcher error (no record): the
-    /// run's cgroup is cleaned up first, and a cleanup failure replaces the
-    /// error, keeps it in its text, and counts as a stats failure.
+    /// run's cgroup is cleaned up first. A cleanup failure is added to the
+    /// error's text and counts as a stats failure (status 5 and the
+    /// `stats_record` end token); the error keeps its own launcher token,
+    /// since the guest may already have run.
     pub(crate) fn abandon(&self, error: String) -> String {
         match self.cgroup.as_ref().map_or(Ok(()), RunCgroup::leave) {
             Ok(()) => error,
             Err(cleanup) => {
                 RECORD_FAILED.store(true, Ordering::SeqCst);
-                format!("{cleanup} (after the launcher error: {error})")
+                format!("{error} (then {cleanup})")
             }
         }
     }
@@ -369,7 +376,7 @@ fn split(usage: i64, moved: (i64, i64), read: (i64, i64), others: usize, childre
         };
     }
     let (lo, hi) = (usage - (d - a), usage - (c - b));
-    if children > hi + CHILDREN_SLACK_US {
+    if children > hi {
         return Split {
             state: "INCONSISTENT",
             guest: None,
@@ -404,13 +411,24 @@ impl RunCgroup {
     fn enter(root: PathBuf) -> Result<Self, String> {
         let pid = std::process::id();
         require_cgroup2(&root)?;
+        let strays = subtree_procs(&root)?.len();
+        if strays > 0 {
+            return Err(format!(
+                "{CGROUP_ENV}: {} holds {strays} process(es); it must be a dedicated parent",
+                root.display()
+            ));
+        }
         let name = format!("lr-{pid}");
         let Some(root_name) = root.file_name() else {
-            return Err(format!("{CGROUP_ENV}: {} has no final component", root.display()));
+            return Err(format!(
+                "{CGROUP_ENV}: {} has no final component",
+                root.display()
+            ));
         };
         let tail = format!("{}/{name}", root_name.to_string_lossy());
         let dir = root.join(&name);
-        std::fs::create_dir(&dir).map_err(|e| format!("{CGROUP_ENV}: cannot create {name}: {e}"))?;
+        std::fs::create_dir(&dir)
+            .map_err(|e| format!("{CGROUP_ENV}: cannot create {name}: {e}"))?;
         let mut cg = Self {
             root,
             dir,
@@ -449,7 +467,10 @@ impl RunCgroup {
             ));
         }
         if !own_cgroup()?.ends_with(&format!("/{}", self.tail)) {
-            return Err(format!("{CGROUP_ENV}: /proc/self/cgroup does not name {}", self.tail));
+            return Err(format!(
+                "{CGROUP_ENV}: /proc/self/cgroup does not name {}",
+                self.tail
+            ));
         }
         Ok(())
     }
@@ -480,10 +501,17 @@ impl RunCgroup {
     /// The split at exit, after waiting (until [`EXIT_WAIT`]) for the
     /// guest to leave the subtree.
     fn read(&self) -> Result<serde_json::Value, String> {
+        self.read_until(Instant::now() + EXIT_WAIT)
+    }
+
+    /// [`Self::read`], waiting until `deadline`.
+    fn read_until(&self, deadline: Instant) -> Result<serde_json::Value, String> {
         let pid = std::process::id();
-        let deadline = Instant::now() + EXIT_WAIT;
         let others = loop {
-            let others = subtree_procs(&self.dir)?.iter().filter(|(_, p)| *p != pid).count();
+            let others = subtree_procs(&self.dir)?
+                .iter()
+                .filter(|(_, p)| *p != pid)
+                .count();
             let now = Instant::now();
             if others == 0 || now >= deadline {
                 break others;
@@ -520,7 +548,10 @@ impl RunCgroup {
             write_pid(&self.root, std::process::id())
                 .map_err(|e| format!("{CGROUP_ENV}: cannot leave {}: {e}", self.tail))?;
             if own_cgroup()?.ends_with(&format!("/{}", self.tail)) {
-                return Err(format!("{CGROUP_ENV}: still in {} after leaving", self.tail));
+                return Err(format!(
+                    "{CGROUP_ENV}: still in {} after leaving",
+                    self.tail
+                ));
             }
             self.inside.set(false);
         }
@@ -528,7 +559,10 @@ impl RunCgroup {
             self.evacuate()?;
             remove_tree(&self.dir)?;
             if self.dir.exists() {
-                return Err(format!("{CGROUP_ENV}: {} still exists after removal", self.tail));
+                return Err(format!(
+                    "{CGROUP_ENV}: {} still exists after removal",
+                    self.tail
+                ));
             }
             self.exists.set(false);
         }
@@ -555,12 +589,16 @@ impl RunCgroup {
             for (dir, p) in left {
                 self.move_out(&dir, p)?;
             }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
     /// Moves pid `p` from `dir` (in the subtree) to the root, only while
     /// `/proc/<p>/cgroup` still names `dir`: an exited process (whose pid
-    /// may be reused) or one that moved itself is left alone.
+    /// may be reused) or one that moved itself is left alone. A pid freed
+    /// and reused between that check and the write is the remaining race;
+    /// the kernel lets the write move only a process in a cgroup this user
+    /// may write (its delegated systemd subtree).
     fn move_out(&self, dir: &Path, p: u32) -> Result<(), String> {
         let rest = dir.strip_prefix(&self.dir).unwrap_or(Path::new(""));
         let want = if rest.as_os_str().is_empty() {
@@ -578,14 +616,18 @@ impl RunCgroup {
         match write_pid(&self.root, p) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            Err(e) => Err(format!("{CGROUP_ENV}: cannot move pid {p} out of {}: {e}", self.tail)),
+            Err(e) => Err(format!(
+                "{CGROUP_ENV}: cannot move pid {p} out of {}: {e}",
+                self.tail
+            )),
         }
     }
 }
 
 impl Drop for RunCgroup {
-    /// Every path concludes or abandons explicitly; this runs the cleanup
-    /// only if one did not (a panic), and reports its failure loudly.
+    /// Every path concludes or abandons explicitly, so this finds work only
+    /// when that cleanup failed (it then tries once more) or after a panic;
+    /// a failure here is reported loudly and counts as a stats failure.
     fn drop(&mut self) {
         if self.inside.get() || self.exists.get() {
             if let Err(e) = self.leave() {
@@ -611,7 +653,10 @@ fn require_cgroup2(path: &Path) -> Result<(), String> {
     #[allow(clippy::unnecessary_cast)]
     let magic = st.f_type as u64;
     if magic != CGROUP2_SUPER_MAGIC {
-        return Err(format!("{CGROUP_ENV}: {} is not a cgroup v2 directory", path.display()));
+        return Err(format!(
+            "{CGROUP_ENV}: {} is not a cgroup v2 directory",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -625,19 +670,33 @@ fn write_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
 }
 
 fn read_procs(dir: &Path) -> Result<Vec<u32>, String> {
-    let text = std::fs::read_to_string(dir.join("cgroup.procs"))
-        .map_err(|e| format!("{CGROUP_ENV}: cannot read {}/cgroup.procs: {e}", dir.display()))?;
+    let text = std::fs::read_to_string(dir.join("cgroup.procs")).map_err(|e| {
+        format!(
+            "{CGROUP_ENV}: cannot read {}/cgroup.procs: {e}",
+            dir.display()
+        )
+    })?;
     text.split_whitespace()
-        .map(|p| p.parse().map_err(|_| format!("{CGROUP_ENV}: bad cgroup.procs entry")))
+        .map(|p| {
+            p.parse()
+                .map_err(|_| format!("{CGROUP_ENV}: bad cgroup.procs entry"))
+        })
         .collect()
 }
 
 /// Every process in `dir`'s cgroup and its descendant cgroups.
 fn subtree_procs(dir: &Path) -> Result<Vec<(PathBuf, u32)>, String> {
-    let mut all: Vec<(PathBuf, u32)> =
-        read_procs(dir)?.into_iter().map(|p| (dir.to_owned(), p)).collect();
+    let mut all: Vec<(PathBuf, u32)> = read_procs(dir)?
+        .into_iter()
+        .map(|p| (dir.to_owned(), p))
+        .collect();
     for sub in child_cgroups(dir)? {
-        all.extend(subtree_procs(&sub)?);
+        match subtree_procs(&sub) {
+            Ok(procs) => all.extend(procs),
+            // A guest may remove its own child cgroup while it is read.
+            Err(_) if !sub.exists() => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(all)
 }
@@ -658,7 +717,12 @@ fn child_cgroups(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// Removes `dir`'s cgroup and its descendants, deepest first.
 fn remove_tree(dir: &Path) -> Result<(), String> {
     for sub in child_cgroups(dir)? {
-        remove_tree(&sub)?;
+        match remove_tree(&sub) {
+            Ok(()) => {}
+            // Gone already (a guest removed its own child cgroup).
+            Err(_) if !sub.exists() => {}
+            Err(e) => return Err(e),
+        }
     }
     std::fs::remove_dir(dir)
         .map_err(|e| format!("{CGROUP_ENV}: cannot remove {}: {e}", dir.display()))
@@ -710,7 +774,10 @@ fn rusage(who: libc::c_int, var: &str) -> Result<serde_json::Value, String> {
     // SAFETY: getrusage writes only into the zeroed struct we own.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(who, &mut usage) } != 0 {
-        return Err(format!("{var}: getrusage: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "{var}: getrusage: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // time_t and suseconds_t are both i64 on 64-bit Linux.
     let micros = |t: libc::timeval| t.tv_sec * 1_000_000 + t.tv_usec;
@@ -820,14 +887,23 @@ mod tests {
         let error = stats
             .append::<NoSnapshot>(backend(), 0, None, None, None, None)
             .unwrap_err();
-        assert!(error.starts_with("LITEROOT_STATS: cannot append"), "{error}");
+        assert!(
+            error.starts_with("LITEROOT_STATS: cannot append"),
+            "{error}"
+        );
         let exit = RunStats::new(Some(PathBuf::from("/nonexistent-dir/exit.jsonl")), false);
         let error = exit
             .append::<NoSnapshot>(backend(), 0, None, None, None, None)
             .unwrap_err();
-        assert!(error.starts_with("LITEROOT_EXIT_RECORD: cannot append"), "{error}");
+        assert!(
+            error.starts_with("LITEROOT_EXIT_RECORD: cannot append"),
+            "{error}"
+        );
         assert!(!record_failed());
-        assert_eq!(stats.conclude::<NoSnapshot>(backend(), 0, None, None), STATS_RECORD_EXIT);
+        assert_eq!(
+            stats.conclude::<NoSnapshot>(backend(), 0, None, None),
+            STATS_RECORD_EXIT
+        );
         assert!(record_failed());
         // A written (or unrequested) record keeps the guest's status.
         let none = RunStats::new(None, false);
@@ -842,11 +918,14 @@ mod tests {
         assert_eq!(complete.state, "COMPLETE");
         assert_eq!(complete.guest, Some((1_000 - 12, 1_000 - 10)));
         assert!(complete.reason.is_none());
-        // The children bound with its slack: equal passes, one more fails.
-        assert_eq!(split(1_000, moved, read, 0, 990 + CHILDREN_SLACK_US).state, "COMPLETE");
-        let escaped = split(1_000, moved, read, 0, 991 + CHILDREN_SLACK_US);
+        // The children's CPU is a lower bound on the guest's: at the upper
+        // bound passes, one microsecond more contradicts the interval.
+        assert_eq!(split(1_000, moved, read, 0, 990).state, "COMPLETE");
+        let escaped = split(1_000, moved, read, 0, 991);
         assert_eq!(escaped.state, "INCONSISTENT");
         assert!(escaped.guest.is_none() && escaped.reason.is_some());
+        // Children far above [988, 990] are never COMPLETE.
+        assert_eq!(split(1_000, moved, read, 0, 1_990).state, "INCONSISTENT");
         // A cgroup that captured nothing of a guest that used CPU.
         assert_eq!(split(11, moved, read, 0, 50_000).state, "INCONSISTENT");
         let left = split(1_000, moved, read, 1, 0);
@@ -854,10 +933,54 @@ mod tests {
         assert!(left.guest.is_none() && left.reason.is_some());
     }
 
+    /// The real reader on a stand-in tree (plain files where the kernel's
+    /// would be) with a short deadline: a process left in the cgroup, or in
+    /// a child cgroup, at the read gives INCOMPLETE and no number.
+    #[test]
+    fn the_reader_sees_a_leftover_anywhere_in_the_subtree() {
+        let root = scratch("cg-reader");
+        let dir = root.join("lr-stand-in");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let stat = "usage_usec 1000000\nuser_usec 600000\nsystem_usec 400000\n";
+        std::fs::write(dir.join("cpu.stat"), stat).unwrap();
+        let pid = std::process::id();
+        let cg = RunCgroup {
+            root: root.clone(),
+            dir: dir.clone(),
+            tail: "cg-reader/lr-stand-in".into(),
+            moved: (0, 0),
+            children_at_move: children_cpu_us().unwrap(),
+            inside: Cell::new(false),
+            exists: Cell::new(false),
+        };
+        let short = || Instant::now() + Duration::from_millis(200);
+        // Only this process: COMPLETE.
+        std::fs::write(dir.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        std::fs::write(dir.join("sub/cgroup.procs"), "").unwrap();
+        let seen = cg.read_until(short()).unwrap();
+        assert_eq!(seen["guest_cpu_state"], "COMPLETE", "{seen}");
+        // Another process in the cgroup itself.
+        std::fs::write(dir.join("cgroup.procs"), format!("{pid}\n4194999\n")).unwrap();
+        let seen = cg.read_until(short()).unwrap();
+        assert_eq!(seen["guest_cpu_state"], "INCOMPLETE", "{seen}");
+        assert_eq!(seen["procs_left"], 1);
+        assert!(seen["guest_cpu_us"].is_null());
+        // Another process only in a child cgroup.
+        std::fs::write(dir.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        std::fs::write(dir.join("sub/cgroup.procs"), "4194998\n").unwrap();
+        let seen = cg.read_until(short()).unwrap();
+        assert_eq!(seen["guest_cpu_state"], "INCOMPLETE", "{seen}");
+        assert!(seen["guest_cpu_us"].is_null());
+        drop(cg);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn a_plain_directory_is_refused_before_anything_is_created() {
         let root = scratch("cg-plain");
-        let error = RunCgroup::enter(root.clone()).err().expect("a plain directory is refused");
+        let error = RunCgroup::enter(root.clone())
+            .err()
+            .expect("a plain directory is refused");
         assert!(error.contains("is not a cgroup v2 directory"), "{error}");
         let lr = root.join(format!("lr-{}", std::process::id()));
         assert!(!lr.exists(), "nothing was created");
@@ -883,7 +1006,10 @@ mod tests {
         let first = cg.leave().unwrap_err();
         assert!(first.contains("cannot remove"), "{first}");
         let second = cg.leave().unwrap_err();
-        assert!(second.contains("cannot remove"), "a retry does the work again: {second}");
+        assert!(
+            second.contains("cannot remove"),
+            "a retry does the work again: {second}"
+        );
         assert!(cg.exists.get(), "not marked removed");
         // Hand the stand-in back to the test, so drop has nothing to do.
         cg.exists.set(false);
