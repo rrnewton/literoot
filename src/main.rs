@@ -19,6 +19,8 @@ mod exec_state;
 mod fake_creds;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
+#[cfg(feature = "tool")]
+mod run_stats;
 #[cfg(all(feature = "private-runtime", feature = "tool"))]
 #[cfg_attr(not(test), allow(dead_code))] // Row e/f's launcher is the first non-test caller.
 mod initial_packet;
