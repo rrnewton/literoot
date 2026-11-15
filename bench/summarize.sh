@@ -76,9 +76,15 @@ function checkspec(spec, what,    parts, n, i, kv) {
     if (!(kv[2] in runner)) bad = bad what " runner " kv[2] " is not in the run; "
   }
 }
-function rcname(rc) {
+# rcname(rc, refused): a name for a nonzero exit. timeout(1) exits 125 when
+# it cannot run its command, but it also passes on the exit 125 of the
+# command itself, and 125 is the exit literoot gives a refused launch. A run
+# whose refusal.log recorded a "literoot: refused" line (a TOKEN*N word in
+# the refused column) is named for the refusal; 125 alone names both causes.
+function rcname(rc, refused) {
   if (rc == 124) return " (timeout)"
-  if (rc == 125) return " (timeout failed)"
+  if (rc == 125 && refused ~ /(^|;)[^;:]+[*][0-9]+(;|$)/) return " (literoot refused)"
+  if (rc == 125) return " (timeout(1) could not run the command, or the command exited 125)"
   if (rc == 126) return " (cannot execute)"
   if (rc == 127) return " (not found or exec failed)"
   if (rc > 128) return " (signal " (rc - 128) ")"
@@ -117,7 +123,7 @@ FNR == 1 { next }
     # included, fails the pair in both sets: correctness does not depend
     # on host load.
     fail[key]++; if ($3 == 0) wfail[key]++
-    cls = ($9 == "rc") ? "rc=" $4 rcname($4) : $9
+    cls = ($9 == "rc") ? "rc=" $4 rcname($4, $13) : $9
     if ($13 != "-" && $13 != "") cls = cls "[" $13 "]"
     if (!((key, cls) in fcnt)) { fcls[key] = fcls[key] SUBSEP cls; fhead[key, cls] = $15 }
     fcnt[key, cls]++

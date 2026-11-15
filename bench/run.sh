@@ -4,7 +4,7 @@
 #
 # usage: bench/run.sh --runners FILE --workloads FILE --out DIR --seed N
 #                     --bin-host DIR [--rootfs NAME=DIR]... [--assets DIR]
-#                     [--quiet-cmd CMD]
+#                     [--quiet-cmd CMD] [--preload-ids FILE]
 #
 # --runners FILE    tab-separated: NAME  MODE  KIND  ENV  PREFIX
 #                   MODE is "translate" (the runner maps guest paths; the
@@ -55,6 +55,12 @@
 #                   (it still runs). Without it, every round is recorded
 #                   as "unchecked", never as quiet. The 1-minute load
 #                   average is recorded at the start and end of every round.
+# --preload-ids FILE  tab-separated: PRELOAD  SHA256  BUILD_LOG  SOURCE  [TARGET]
+#                   one line per preload a liteinst or trap row names (its
+#                   LITEROOT_PRELOAD), all paths absolute: the sha256 recorded
+#                   when it was built, that build's cargo -v log, the literoot
+#                   checkout it was built from, and the target triple if not
+#                   the host. Required when there is a liteinst or trap row.
 #
 # Runner kinds:
 #   native, other     no check, but a name starting with literoot or proot
@@ -70,12 +76,17 @@
 #                     each row names its own preload. A trap row needs a
 #                     literoot built with the inguest-trap feature (without
 #                     it, --backend trap silently runs the liteinst preload
-#                     with site patching off) and an inguest-trap preload:
-#                     the binary must contain the text only that feature
-#                     compiles in, and the preload must not contain
-#                     "reverie-liteinst"; a liteinst row's preload must.
-#                     These are identity checks on embedded text, made to
-#                     catch a swapped file, not proofs of the build.
+#                     with site patching off): the binary must contain the
+#                     text only that feature compiles in (an identity check
+#                     on embedded text, made to catch a swapped file). Each
+#                     liteinst and trap row's preload must pass
+#                     bench/preload-identity.sh for its kind, with its line
+#                     from --preload-ids: the preload graph (T1), the
+#                     recorded sha256 and build log (T2) and the linked
+#                     symbols (T3). A failed or UNAVAILABLE check stops the
+#                     run. (A search for the text "reverie-liteinst" told
+#                     the two preloads apart before; reverie-inguest's own
+#                     strings carry that name, so both preloads have it.)
 #                     proot and literoot rows may not start with "env".
 #                     Every literoot row passes --refusal-log {REFUSAL_LOG}.
 #                     After each run, the log must exist, name the one route
@@ -99,7 +110,8 @@
 # their sha256, bench.sha256 (this directory's files, the dlopen list
 # included), runner-ids.tsv
 # (each runner's resolved binary and preload with sha256), bin-host.sha256,
-# rootfs-<NAME>-bench-bin.sha256, and assets.SHA256SUMS.
+# rootfs-<NAME>-bench-bin.sha256, assets.SHA256SUMS, and with
+# --preload-ids, preload-ids.tsv and preload-identity.txt (each check's line).
 #
 # run.sh does not set CPU, memory, nice or I/O limits or an outer time
 # limit; run it inside one bounded unit that applies the same treatment
@@ -114,7 +126,7 @@ set -uo pipefail
 die() { echo "run.sh: $*" >&2; exit 2; }
 
 ARGV=("$@")
-RUNNERS="" WORKLOADS="" OUT="" SEED="" BIN_HOST="" QUIET_CMD="" ASSETS=""
+RUNNERS="" WORKLOADS="" OUT="" SEED="" BIN_HOST="" QUIET_CMD="" ASSETS="" PRELOAD_IDS=""
 declare -A ROOTFS=()
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || die "$1 needs a value"
@@ -128,6 +140,7 @@ while [ $# -gt 0 ]; do
               ROOTFS[${2%%=*}]=${2#*=} ;;
     --assets) ASSETS=$2 ;;
     --quiet-cmd) QUIET_CMD=$2 ;;
+    --preload-ids) PRELOAD_IDS=$2 ;;
     *) die "unknown argument $1" ;;
   esac
   shift 2
@@ -144,6 +157,22 @@ BENCH=$(cd "$(dirname "$0")" && pwd -P) || die "cannot resolve the bench directo
 for v in "$OUT" "$BIN_HOST" "$ASSETS" "$BENCH" "${ROOTFS[@]}"; do
   [[ "$v" =~ ^[A-Za-z0-9._/+-]*$ ]] || die "path $v: use only letters, digits and . _ / + -"
 done
+# --preload-ids: one identity line per preload path.
+declare -A ID_SHA=() ID_LOG=() ID_SRC=() ID_TGT=()
+if [ -n "$PRELOAD_IDS" ]; then
+  [ -f "$PRELOAD_IDS" ] || die "--preload-ids must be a file"
+  while IFS=$'\t' read -r ipl isha ilog isrc itgt || [ -n "$ipl" ]; do
+    [ -z "$ipl" ] || [ "${ipl:0:1}" = "#" ] && continue
+    for v in "$ipl" "$ilog" "$isrc"; do
+      [[ "$v" == /* && "$v" =~ ^[A-Za-z0-9._/+-]*$ ]] || die "--preload-ids: $v must be an absolute path of letters, digits and . _ / + -"
+    done
+    [[ "$isha" =~ ^[0-9a-f]{64}$ ]] || die "--preload-ids: $ipl: bad sha256"
+    [[ "$itgt" =~ ^[A-Za-z0-9._-]*$ ]] || die "--preload-ids: $ipl: bad target"
+    [ -z "${ID_SHA[$ipl]:-}" ] || die "--preload-ids: $ipl listed twice"
+    ID_SHA[$ipl]=$isha ID_LOG[$ipl]=$ilog ID_SRC[$ipl]=$isrc ID_TGT[$ipl]=$itgt
+  done < "$PRELOAD_IDS"
+fi
+declare -a ID_OUT=()
 # The escape checks rely on these fixtures existing only inside a rootfs.
 for f in /bench-marker /bench-link /bench-tree; do
   if [ -e "$f" ] || [ -L "$f" ]; then die "$f exists on the host; the escape checks need it absent"; fi
@@ -226,9 +255,13 @@ for r in "${!R_NAME[@]}"; do
       fi
       if [ "$backend" = trap ]; then
         grep -qaF -- "$TRAP_MARK" "$first" || die "runner $name: $first is not an inguest-trap build"
-        ! grep -qaF reverie-liteinst "$preload" || die "runner $name: $preload is a liteinst preload, not an inguest-trap one"
-      elif [ "$backend" = liteinst ]; then
-        grep -qaF reverie-liteinst "$preload" || die "runner $name: $preload has no reverie-liteinst"
+      fi
+      if [ "$backend" != ptrace ]; then
+        [ -n "${ID_SHA[$preload]:-}" ] || die "runner $name: $preload has no --preload-ids line"
+        idout=$("$BENCH/preload-identity.sh" "$backend" "$preload" "${ID_SHA[$preload]}" \
+          "${ID_LOG[$preload]}" "${ID_SRC[$preload]}" ${ID_TGT[$preload]:+"${ID_TGT[$preload]}"} 2>&1) \
+          || die "runner $name: $preload is not a $backend preload by bench/preload-identity.sh: $idout"
+        ID_OUT+=("runner $name ($backend, $preload):" "$idout")
       fi ;;
     *) die "runner $name: unknown kind $kind" ;;
   esac
@@ -291,6 +324,10 @@ printf '%s\n' "${BASE_ENV[@]}" > "$OUT/env-base.txt" || die "write failed"
     esac
   done ) > "$OUT/env-caller.txt" || die "write failed"
 cp "$RUNNERS" "$OUT/runners.tsv" && cp "$WORKLOADS" "$OUT/workloads.tsv" || die "cannot copy the input files"
+if [ -n "$PRELOAD_IDS" ]; then
+  cp "$PRELOAD_IDS" "$OUT/preload-ids.tsv" || die "cannot copy --preload-ids"
+  printf '%s\n' "${ID_OUT[@]}" > "$OUT/preload-identity.txt" || die "write failed"
+fi
 (cd "$OUT" && sha256sum runners.tsv workloads.tsv > inputs.sha256) || die "write failed"
 (cd "$BENCH" && find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum) > "$OUT/bench.sha256" \
   || die "cannot hash $BENCH"

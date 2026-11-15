@@ -80,6 +80,14 @@ run.sh checks before round 0:
   `inguest-trap` feature. A literoot built without it runs
   `--backend trap` as the liteinst preload with site patching off,
   silently.
+- Every liteinst and trap preload needs a `--preload-ids` line: its
+  sha256 as recorded at build time, that build's `cargo -v` log, the
+  literoot checkout it was built from and, if not the host, its target.
+  `bench/preload-identity.sh` then checks the preload graph (T1), the
+  sha256 and the crates the log compiled (T2) and the linked symbols (T3)
+  for the row's kind; a failed or UNAVAILABLE check stops the run. Text in
+  the file does not tell the two preloads apart: reverie-inguest's own
+  strings say "reverie-liteinst", so both preloads contain it.
 - Every literoot row passes `--refusal-log {REFUSAL_LOG}`. Each run's log
   must name the route the kind implies (in-guest or ptrace; it does not
   tell liteinst from trap, which rests on the build checks above), must
