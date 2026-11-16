@@ -405,7 +405,7 @@ launcher only waits and forwards the exit status/signals).
 | cwd (guest path) | Per-process mutable | Initialised from `-w`, updated by translated `chdir`, copied on `fork`, preserved on `execve` |
 | fd → guest-path table | Per-process mutable | Recorded on `open*`/`dup*`/`socket`, dropped on `close`, `O_CLOEXEC` entries dropped on `execve`, lazy `/proc/self/fd` recovery for unknown fds (§4.3) |
 | io_uring ring records | Per-process mutable | Created at `io_uring_setup`, dropped at ring fd close |
-| Scratch path buffers | Per-thread | Preallocated, reused; no allocator on the hot path |
+| Scratch path buffers | Per-thread | One 4096-byte slot per thread. The post-exec handler of a successful `execve` maps a pool of 16 slots in one injected anonymous mmap of 64 KiB: the exec'ing thread takes the first, and new threads take the others, or an exited thread's slot of the same image, zeroed before use; a new thread maps another 16-slot pool (one mmap) only when none is free. A `fork` child keeps the caller's copy, a `vfork` child shares the suspended caller's, a thread or other `CLONE_VM` child gets its own; a staged write never runs past the slot. On a 64 KiB kernel the 16 slots share one kernel page with no guard page between them, so the explicit length checks are what bound every staged write. Image numbers are unique in the process (one counter), so a slot of another image is never reused. Earlier the code kept ONE slot per process despite this row, so one thread's staging could overwrite another's before the kernel read it (reachable on ptrace) |
 
 Handoff mechanism: the launcher stages the immutable blob in the
 Tool region before first instruction (A-stop) or via an inherited

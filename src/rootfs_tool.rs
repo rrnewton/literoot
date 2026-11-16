@@ -284,11 +284,6 @@ impl GlobalTool for LiterootGlobal {
     }
 }
 
-/// Size of each per-process guest scratch page (`ProcState::scratch`,
-/// `ProcState::getcwd_scratch`): one page, which is also PATH_MAX, the
-/// kernel's bound on a getcwd answer (its length counts the NUL).
-const SCRATCH_PAGE: usize = 4096;
-
 /// Per-process replicated state (design §6).
 /// Fields are `pub(crate)` so `crate::exec_state` can snapshot and
 /// restore the exec-continuity subset (B4) without a second copy
@@ -312,12 +307,19 @@ pub(crate) struct ProcState {
     pub(crate) bootstrapped: bool,
     /// Emulated chroot: host directory acting as the new root.
     pub(crate) root_override: Option<PathBuf>,
-    /// Guest scratch page (injected mmap) for execve path
-    /// staging: guest-stack staging corrupts the execve
-    /// caller's frame in interp-route processes (measured
-    /// EFAULT on second execve, test-execve-eacces-enoexec).
-    pub(crate) scratch: Option<usize>,
-    /// A second scratch page, for getcwd alone: the kernel writes its
+    /// The current image's number, for the scratch pages: each thread
+    /// stages in a page of its own ([`RootfsThreadState::scratch`]),
+    /// tagged with the image it was mapped in. Exec draws a new one, so a
+    /// page of the old image is never reused. Numbers come from one
+    /// process-wide counter ([`next_scratch_image`]), so no two images
+    /// share one: on ptrace a fork child's fresh state would otherwise
+    /// count from 0 again and match the tag of the page it inherited.
+    pub(crate) scratch_image: u64,
+    /// Scratch pages of this image's exited threads, for the next new
+    /// thread (zeroed before reuse): thread churn reuses pages rather
+    /// than mapping one per thread ever created. Cleared at exec.
+    pub(crate) free_scratch: Vec<usize>,
+    /// A scratch page of its own, for getcwd alone: the kernel writes its
     /// answer there (up to a whole page) and the Tool reads it back
     /// after the inject, so it must not share a page with path staging.
     pub(crate) getcwd_scratch: Option<usize>,
@@ -428,6 +430,17 @@ pub(crate) struct DirStream {
 }
 
 impl ProcState {
+    /// Exec's new image for the scratch pages: the number advances, so a
+    /// page of the old image (a thread exec killed holds one) is never
+    /// queued, and the queued ones, unmapped now, are dropped.
+    pub(crate) fn new_scratch_image(&mut self) {
+        self.scratch_image = next_scratch_image();
+        self.free_scratch.clear();
+        // getcwd's page is of the old image too.
+        self.getcwd_scratch = None;
+    }
+
+
     /// The fd-number state of table `files` (empty if it has none yet).
     pub(crate) fn fdt(&self, files: FilesId) -> &FdTable {
         static EMPTY: std::sync::LazyLock<FdTable> = std::sync::LazyLock::new(FdTable::default);
@@ -539,7 +552,8 @@ impl Default for RootfsTool {
                 next_stream: 0,
                 bootstrapped: false,
                 root_override: None,
-                scratch: None,
+                scratch_image: next_scratch_image(),
+                free_scratch: Vec::new(),
                 getcwd_scratch: None,
                 exe_guest: PathBuf::new(),
                 fake: None,
@@ -573,6 +587,30 @@ pub struct RootfsThreadState {
     /// or MAIN_FILES of a new process. Cleared after the inject.
     #[serde(default)]
     pub child_files: Option<FilesId>,
+    /// This thread's scratch page, where it stages the paths, names and
+    /// arguments of its injections. One per thread: a page shared by the
+    /// process's threads let one thread's staging overwrite another's
+    /// before that one's call read it. None until first used.
+    #[serde(default)]
+    pub scratch: Option<ScratchPage>,
+    /// Staged by a clone handler for the task it creates: the caller's
+    /// page for a new process that cannot run while the caller stages
+    /// (fork's copy is the child's own; a vfork caller is suspended until
+    /// the child execs or exits), else none, as for a thread or a
+    /// CLONE_VM process. Cleared after the inject.
+    #[serde(default)]
+    pub child_scratch: Option<ScratchPage>,
+}
+
+/// A thread's scratch slot (4096 bytes of an injected anonymous mmap) and
+/// the image it was mapped in ([`ProcState::scratch_image`]). On a 64 KiB
+/// kernel the 16 slots of one mmap share one kernel page with no guard page
+/// between them, so the explicit length checks are what bound every staged
+/// write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchPage {
+    pub addr: usize,
+    pub image: u64,
 }
 
 // A wrapping Tool with the same thread state forwards its guest to
@@ -898,6 +936,18 @@ impl RootfsTool {
     /// without it gets a copy, as the kernel copies the table.
     fn stage_child_files<T: Guest<Self>>(&self, guest: &mut T, flags: u64) {
         let own = files_of(guest);
+        // A vfork child shares the caller's page. A caller without one takes
+        // a free page first: otherwise the child, on ptrace a new process
+        // with a fresh Tool and no free pages, maps a whole pool in the
+        // shared address space on every spawn, which the caller's process
+        // never reuses. With no page free (or a failed zeroing) the caller
+        // stays without one and the child maps its own, as before.
+        let vm_vfork = (libc::CLONE_VM | libc::CLONE_VFORK) as u64;
+        if clone_is_process(flags) && flags & vm_vfork == vm_vfork && guest.thread_state().scratch.is_none() {
+            let _ = self.take_free_page(guest);
+        }
+        let page = guest.thread_state().scratch;
+        guest.thread_state_mut().child_scratch = child_scratch(flags, page);
         let child = if clone_is_process(flags) {
             MAIN_FILES
         } else if flags & libc::CLONE_FILES as u64 != 0 {
@@ -914,6 +964,7 @@ impl RootfsTool {
     /// After a clone inject: drop the staged id, and the copy made for a
     /// thread that was never created.
     fn end_child_files<T: Guest<Self>>(&self, guest: &mut T, created: bool) {
+        guest.thread_state_mut().child_scratch = None;
         let Some(child) = guest.thread_state_mut().child_files.take() else {
             return;
         };
@@ -1184,6 +1235,24 @@ fn clone_is_process(flags: u64) -> bool {
     flags & (libc::CLONE_THREAD as u64) == 0
 }
 
+/// The scratch page the task a clone with `flags` starts with, given the
+/// caller's `page`. A new process without CLONE_VM keeps it: fork copies
+/// the mapping, so the child's copy is its own. A vfork child
+/// (CLONE_VM | CLONE_VFORK) shares it: the caller is suspended until the
+/// child execs or exits, with nothing staged (its clone handler stages no
+/// slot), and the child writes every slot before reading it. A thread or
+/// any other CLONE_VM process gets none and maps or reuses its own, as two
+/// tasks that run at once must never stage in one page.
+fn child_scratch(flags: u64, page: Option<ScratchPage>) -> Option<ScratchPage> {
+    let vm = flags & libc::CLONE_VM as u64 != 0;
+    let vfork = flags & libc::CLONE_VFORK as u64 != 0;
+    if clone_is_process(flags) && (!vm || vfork) {
+        page
+    } else {
+        None
+    }
+}
+
 // Reverie's ptrace guest-stack arena is ~896 bytes total; stage at
 // most 768 bytes of translated path (POC limit — the in-guest
 // backend uses Tool-region scratch instead, design §6).
@@ -1375,6 +1444,8 @@ impl Tool for RootfsTool {
                 pending: parent.pending.clone(),
                 files: parent.child_files.unwrap_or(parent.files),
                 child_files: None,
+                scratch: parent.child_scratch,
+                child_scratch: None,
             },
             None => RootfsThreadState::default(),
         }
@@ -1410,6 +1481,27 @@ impl Tool for RootfsTool {
         Ok(())
     }
 
+    async fn on_exit_thread<G: GlobalRPC<LiterootGlobal>>(
+        &self,
+        _tid: reverie::Tid,
+        _global_state: &G,
+        thread_state: RootfsThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        let mut st = self.state.lock().unwrap();
+        // Its scratch page, for the next new thread: only a page of this
+        // image (a thread that exec killed held a page of the old one, now
+        // unmapped), and never twice (a vfork child shares its caller's
+        // page, but a vfork child is another process, with its own state).
+        if let Some(page) = thread_state.scratch {
+            if page.image == st.scratch_image && !st.free_scratch.contains(&page.addr) {
+                st.free_scratch.push(page.addr);
+            }
+        }
+        drop(st);
+        Ok(())
+    }
+
     async fn handle_post_exec<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -1432,38 +1524,20 @@ impl Tool for RootfsTool {
         {
             let mut st = self.state.lock().unwrap();
             st.bootstrapped = true;
-            // New image: any previous scratch mapping is gone.
-            st.scratch = None;
-            st.getcwd_scratch = None;
+            // New image: every previous scratch mapping is gone.
+            st.new_scratch_image();
             // A pending self-stop swallow does not survive exec.
             st.swallow_next_self_stop = false;
             // The kernel resets the filesystem ids to the effective ids.
             st.fake_fs = None;
         }
-        // Pre-allocate the execve scratch page here: injecting
-        // an mmap between a guest's two execve calls was
-        // measured to make the second fail EFAULT.
-        {
-            let needs = self.state.lock().unwrap().scratch.is_none();
-            if needs {
-                let mmap = reverie::syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(SCRATCH_PAGE)
-                    .with_prot(
-                        reverie::syscalls::ProtFlags::PROT_READ
-                            | reverie::syscalls::ProtFlags::PROT_WRITE,
-                    )
-                    .with_flags(
-                        reverie::syscalls::MapFlags::MAP_PRIVATE
-                            | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
-                    )
-                    .with_fd(-1)
-                    .with_offset(0);
-                if let Ok(addr) = guest.inject(mmap).await {
-                    self.state.lock().unwrap().scratch = Some(addr as usize);
-                }
-            }
-        }
+        guest.thread_state_mut().scratch = None;
+        // Pre-allocate the exec'ing thread's scratch page here, with the
+        // pool for this image's new threads: injecting an mmap between a
+        // guest's two execve calls was measured to make the second fail
+        // EFAULT, and a new thread then maps nothing until the pool is used
+        // up.
+        let _ = self.map_scratch(guest).await;
         self.publish_self_shared(guest);
         // Setuid/setgid exec under fake identity: euid/suid take
         // the file owner's fake id (owner == real caller maps to
@@ -3698,10 +3772,10 @@ impl RootfsTool {
         register_guest_pid(guest.pid().as_raw());
     }
 
-    /// Stage bytes in the per-process guest scratch page
-    /// (injected anonymous mmap, allocated once). Returns the
-    /// guest address. Used for execve paths, where guest-stack
-    /// staging is unsafe (see ProcState::scratch).
+    /// Stage bytes at offset 0 of the calling thread's guest scratch page
+    /// ([`Self::scratch_write_at`]). Returns the guest address. Used for
+    /// execve paths, where guest-stack staging is unsafe (see
+    /// [`RootfsThreadState::scratch`]).
     async fn scratch_write<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -3710,6 +3784,11 @@ impl RootfsTool {
         self.scratch_write_at(guest, bytes, 0).await
     }
 
+    /// Stage `bytes` at `offset` in the calling thread's scratch page: its
+    /// own, else a free page of this image (a pooled one or an exited
+    /// thread's, zeroed first), else the first page of a new pool
+    /// ([`Self::map_scratch`]). A write that would end past the page is
+    /// ENAMETOOLONG. Returns the guest address.
     async fn scratch_write_at<T: Guest<Self>>(
         &self,
         guest: &mut T,
@@ -3717,18 +3796,24 @@ impl RootfsTool {
         offset: usize,
     ) -> Result<usize, Error> {
         use reverie::syscalls::MemoryAccess as _;
-        let base = self.scratch_page(guest).await?;
+        // Never past the thread's page (the next may be another thread's):
+        // every caller is bounded below this, and this makes it so.
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > SCRATCH_PAGE) {
+            return Err(reverie::syscalls::Errno::ENAMETOOLONG.into());
+        }
+        let base = match guest.thread_state().scratch {
+            Some(page) => page.addr,
+            None => match self.take_free_page(guest)? {
+                Some(addr) => addr,
+                None => self.map_scratch(guest).await?,
+            },
+        };
         let mut mem = guest.memory();
         let addr: reverie::syscalls::AddrMut<u8> =
             unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(base + offset) };
-        mem.write(addr, bytes)?;
+        // All of it or an error, never a truncated argument.
+        mem.write_exact(addr, bytes)?;
         Ok(base + offset)
-    }
-
-    /// Guest address of the per-process path-staging scratch page
-    /// (`SCRATCH_PAGE` bytes), mapping it on first use.
-    async fn scratch_page<T: Guest<Self>>(&self, guest: &mut T) -> Result<usize, Error> {
-        self.cached_page(guest, |st| &mut st.scratch).await
     }
 
     /// Guest address of getcwd's own scratch page (`SCRATCH_PAGE`
@@ -3768,6 +3853,61 @@ impl RootfsTool {
             }
         };
         Ok(base)
+    }
+
+    /// A free page of this image (a pooled one or an exited thread's) for
+    /// the calling thread, zeroed before the thread owns it, so nothing it
+    /// left is ever read. Ok(None) when none is free. A zeroing that fails
+    /// is the error, and that page is lost (never queued again).
+    fn take_free_page<T: Guest<Self>>(&self, guest: &mut T) -> Result<Option<usize>, Error> {
+        use reverie::syscalls::MemoryAccess as _;
+        let page = {
+            let mut st = self.state.lock().unwrap();
+            let image = st.scratch_image;
+            st.free_scratch.pop().map(|addr| ScratchPage { addr, image })
+        };
+        let Some(page) = page else {
+            return Ok(None);
+        };
+        let addr: reverie::syscalls::AddrMut<u8> =
+            unsafe { reverie::syscalls::AddrMut::from_raw_unchecked(page.addr) };
+        guest.memory().write_exact(addr, &[0u8; SCRATCH_PAGE])?;
+        guest.thread_state_mut().scratch = Some(page);
+        Ok(Some(page.addr))
+    }
+
+    /// Map a pool of [`SCRATCH_POOL`] scratch pages (one injected anonymous
+    /// mmap, zero-filled by the kernel): the calling thread takes the
+    /// first, tagged with the current image, and the rest go on the free
+    /// list for the next new threads. The image is read before the mmap: if
+    /// an exec started a new one meanwhile, the pool is of the old address
+    /// space and nothing is queued (on the pinned Reverie a thread an exec
+    /// kills never resumes its handler, so this is a guard, not a path).
+    async fn map_scratch<T: Guest<Self>>(&self, guest: &mut T) -> Result<usize, Error> {
+        let image = self.state.lock().unwrap().scratch_image;
+        let mmap = reverie::syscalls::Mmap::new()
+            .with_addr(None)
+            .with_len(SCRATCH_PAGE * SCRATCH_POOL)
+            .with_prot(
+                reverie::syscalls::ProtFlags::PROT_READ
+                    | reverie::syscalls::ProtFlags::PROT_WRITE,
+            )
+            .with_flags(
+                reverie::syscalls::MapFlags::MAP_PRIVATE
+                    | reverie::syscalls::MapFlags::MAP_ANONYMOUS,
+            )
+            .with_fd(-1)
+            .with_offset(0);
+        let addr = guest.inject(mmap).await? as usize;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.scratch_image == image {
+                // Popped from the end: the lowest pages go first.
+                st.free_scratch.extend((1..SCRATCH_POOL).rev().map(|i| addr + i * SCRATCH_PAGE));
+            }
+        }
+        guest.thread_state_mut().scratch = Some(ScratchPage { addr, image });
+        Ok(addr)
     }
 
     /// Exec `guest_prog` through the rootfs interp `interp_guest`:
@@ -5312,6 +5452,21 @@ fn task_dir<T: Guest<RootfsTool>>(guest: &T) -> String {
     )
 }
 
+/// The size of a thread's scratch page.
+const SCRATCH_PAGE: usize = 4096;
+
+/// Scratch pages mapped at once, by one injected mmap: at post-exec (the
+/// exec'ing thread takes the first, the rest wait for new threads), and
+/// when a new thread finds none free. A new thread maps nothing until the
+/// pool is used up.
+const SCRATCH_POOL: usize = 16;
+
+/// A new scratch image number, never handed out before in this process.
+fn next_scratch_image() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// True when `path` is the same file (device and inode) as `live`.
 fn same_file(path: &Path, live: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -5767,7 +5922,8 @@ mod tests {
         assert_eq!(st.fake, Some([1000, 0, 0, 100, 0, 100]));
         assert_eq!(st.exe_guest, PathBuf::from("/bin/sh"));
         assert!(st.bootstrapped);
-        assert_eq!(st.scratch, None);
+        assert!(st.free_scratch.is_empty());
+        assert_ne!(st.scratch_image, 0, "a number drawn from the counter");
         assert_eq!(st.getcwd_scratch, None);
     }
 

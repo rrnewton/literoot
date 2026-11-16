@@ -10,8 +10,9 @@
 //! The payload describes guest-semantic state only — raw OS path
 //! bytes, never pointers or host addresses (the chroot override is
 //! host directory bytes, re-validated against the launch config
-//! on restore). `scratch`, `getcwd_scratch` and the per-dispatch memos
-//! never cross.
+//! on restore). The scratch pages (each thread's, the image number
+//! and the reuse list), getcwd's page (`getcwd_scratch`) and the
+//! per-dispatch memos never cross.
 //! Shared cross-process facts (PID exe/argv directory, UTS names,
 //! immutable config) are explicitly not part of this payload.
 //!
@@ -244,8 +245,9 @@ impl ExecState {
     /// before mutating: on error `st` is unchanged and the caller
     /// must fail admission by name rather than fall back to
     /// launch-config seeding. Forces `bootstrapped = true`;
-    /// leaves `scratch`, `getcwd_scratch` and the per-dispatch memos untouched
-    /// (callers start from a default state where they are empty).
+    /// leaves the scratch-page fields (`getcwd_scratch` too) and the
+    /// per-dispatch memos untouched (callers start from a default state
+    /// where they are empty).
     pub fn apply_to(&self, st: &mut ProcState, cfg: &RootConfig) -> Result<(), ExecStateError> {
         // Validate everything before mutating: a failed restore is
         // a fatal admission error, never a partial apply.
@@ -693,7 +695,8 @@ mod tests {
             next_stream: 0,
             bootstrapped: true,
             root_override: None,
-            scratch: Some(0x1000),
+            scratch_image: 3,
+            free_scratch: vec![0x1000],
             getcwd_scratch: Some(0x2000),
             exe_guest: PathBuf::from("/bin/sh"),
             argv: vec![b"sh".to_vec()],
