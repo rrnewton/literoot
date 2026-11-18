@@ -193,6 +193,7 @@ fn assert_common(record: &serde_json::Value, backend: &str, mode: &str, log: &[S
     }
 }
 
+#[cfg(feature = "run")]
 const PTRACE_KEYS: [&str; 12] = [
     "tracees_started",
     "stop_events",
