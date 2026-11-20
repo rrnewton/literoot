@@ -460,10 +460,16 @@ The same line is also written, outside the numbered triggers, for:
   outside literoot can set a guest task's mode with PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG. On ptrace, Reverie holds
   every guest task's tracer slot. In-guest, an outside tracer is not seen.
 - **The preload's OFF call** (LD_PRELOAD route, before arming):
-  - x86_64: EINVAL counts as "dispatch absent" only on a release below 5.11 with no release-altering persona bit. A
-    distro backport with an old release string is a backport risk. An x86 7.3+ kernel built with
-    CONFIG_SYSCALL_USER_DISPATCH=n answers EINVAL legitimately and gets the named failure. Tracked follow-up: accept "absent" when
-    the kernel's own config, where readable (/proc/config.gz or /boot/config-<release>), says the option is not set.
+  - x86_64: EINVAL counts as "dispatch absent" on a release below 5.11 with no release-altering persona bit. A
+    distro backport with an old release string is a backport risk. From 5.11 to 7.2 EINVAL is the named failure: x86
+    always builds dispatch in there, so EINVAL means a denial. From v7.3-rc1 the kernel can be built without it
+    (CONFIG_SYSCALL_USER_DISPATCH, default y; only x86 selects it). There, EINVAL counts as absent only when
+    /boot/config-<release>, with the release from the same uname read, holds the exact line
+    `# CONFIG_SYSCALL_USER_DISPATCH is not set`. That source is ADVISORY: a rebuild with the same release string, or a
+    container's own /boot, can disagree with the running kernel. So that decision is written as
+    `literoot: note sud_absent_boot_config_advisory`, never as plain `sud_absent`, and a stale /boot's false "absent" is in
+    the side log. `=y`, an unreadable, oversized or symlinked file, or any other form keeps the named failure. Tracked next
+    slice: /proc/config.gz (authoritative) ahead of /boot, through an allocation-free inflate.
   - arm64: EINVAL counts as "dispatch absent" with no release bound. Through v7.3-rc6 only x86 selects it. If a future
     arm64 kernel gains dispatch, a host policy's EINVAL there would be misread as absent. Tracked follow-up: bound this acceptance
     once arm64 selects GENERIC_ENTRY and syscall user dispatch.

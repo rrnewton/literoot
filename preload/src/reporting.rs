@@ -106,6 +106,10 @@ fn drained() -> Vec<Refusal> {
     if crate::prearm::take_sud_absent() {
         found.push(Refusal::Note(crate::rootfs_tool::Note::SudAbsent));
     }
+    // ... or absent on /boot/config-<release>'s advisory word (once).
+    if crate::prearm::take_sud_absent_advisory() {
+        found.push(Refusal::Note(crate::rootfs_tool::Note::SudAbsentBootConfigAdvisory));
+    }
     found
 }
 

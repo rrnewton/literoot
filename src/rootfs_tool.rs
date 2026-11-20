@@ -177,6 +177,10 @@ pub enum Note {
     /// The constructor's dispatch OFF call answered EINVAL where that is
     /// independent evidence that the kernel has no syscall user dispatch.
     SudAbsent,
+    /// The constructor's dispatch OFF call answered EINVAL on x86_64 >= 7.3
+    /// and /boot/config-<release> says CONFIG_SYSCALL_USER_DISPATCH is not
+    /// set: ADVISORY evidence of absence (/boot may be stale).
+    SudAbsentBootConfigAdvisory,
 }
 
 /// A process's exit summaries. `pid` is the pid as the Tool sees it (local
@@ -395,6 +399,9 @@ impl Refusal {
                 "literoot: guest seccomp filter install attempted".into()
             }
             Refusal::Note(Note::SudAbsent) => "literoot: note sud_absent".into(),
+            Refusal::Note(Note::SudAbsentBootConfigAdvisory) => {
+                "literoot: note sud_absent_boot_config_advisory".into()
+            }
             Refusal::Summary(s) => {
                 s.line(*receipt.get_or_insert_with(crate::refusal_log::next_summary_receipt))
             }

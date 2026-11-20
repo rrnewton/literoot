@@ -32,7 +32,9 @@
 //! - `literoot: refused seccomp_install probes_in_flight in_flight=<k>`, k
 //!   in decimal (a guest seccomp filter install refused at once)
 //! - `literoot: guest seccomp filter install attempted`,
-//!   `literoot: note sud_absent`, and `literoot: sud config read
+//!   `literoot: note sud_absent`, `literoot: note
+//!   sud_absent_boot_config_advisory` (absent on /boot/config-<release>'s
+//!   word: advisory, /boot may be stale), and `literoot: sud config read
 //!   unavailable errno=<e>`, e in [`SUD_FALLBACK_ERRNOS`] (notes, not
 //!   refusals)
 //! - `literoot: guest seccomp filter summary pid=<p> receipt_id=<r>
@@ -466,9 +468,9 @@ pub fn parse(line: &str) -> Result<Line, String> {
         {
             Ok(Line::Refused(rest.to_owned()))
         }
-        ["guest", "seccomp", "filter", "install", "attempted"] | ["note", "sud_absent"] => {
-            Ok(Line::Note(rest.to_owned()))
-        }
+        ["guest", "seccomp", "filter", "install", "attempted"]
+        | ["note", "sud_absent"]
+        | ["note", "sud_absent_boot_config_advisory"] => Ok(Line::Note(rest.to_owned())),
         ["sud", "config", "read", "unavailable", e]
             if e.strip_prefix("errno=").is_some_and(|e| one_of(e, SUD_FALLBACK_ERRNOS)) =>
         {
@@ -1000,7 +1002,7 @@ mod tests {
             assert!(matches!(parse(&line), Ok(Line::Answered(_))), "{line}");
         }
         use crate::rootfs_tool::Note as N;
-        for note in [N::FilterInstallAttempted, N::SudAbsent] {
+        for note in [N::FilterInstallAttempted, N::SudAbsent, N::SudAbsentBootConfigAdvisory] {
             let line = R::Note(note).line();
             assert!(matches!(parse(&line), Ok(Line::Note(_))), "{line}");
         }
@@ -1149,6 +1151,7 @@ mod tests {
         for ok in [
             "literoot: guest seccomp filter install attempted",
             "literoot: note sud_absent",
+            "literoot: note sud_absent_boot_config_advisory",
             "literoot: refused seccomp_install probes_in_flight in_flight=1",
             "literoot: refused seccomp_install probes_in_flight in_flight=0",
             "literoot: refused guest syscall_user_dispatch",
@@ -1164,6 +1167,7 @@ mod tests {
             "literoot: guest seccomp filter installed".to_owned(),
             "literoot: guest seccomp filter install attempted ".to_owned(),
             "literoot: note sud_absent yes".to_owned(),
+            "literoot: note sud_absent_boot_config_advisory yes".to_owned(),
             "literoot: sud config read unavailable errno=EPERM".to_owned(),
             "literoot: sud config read unavailable EIO".to_owned(),
             "literoot: sud config read unavailable errno=EIO x".to_owned(),

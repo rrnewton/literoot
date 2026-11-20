@@ -320,12 +320,13 @@ fn refusal_tag(refusal: Refusal) -> u8 {
         Refusal::Summary(Summary::Probe { .. }) => 31,
         Refusal::InstallRefused { .. } => 32,
         Refusal::Path(PathRefusal::SyntheticFileUnavailable) => 33,
+        Refusal::Note(Note::SudAbsentBootConfigAdvisory) => 34,
     }
 }
 
 /// One `Refused` request per `Refusal` variant and nested kind, in
-/// [`refusal_tag`] order, plus one Seccomp summary per `FlagState` (34
-/// logical tags, 36 payload samples): the request type `LiterootGlobal`
+/// [`refusal_tag`] order, plus one Seccomp summary per `FlagState` (35
+/// logical tags, 37 payload samples): the request type `LiterootGlobal`
 /// sends as positional bincode outside `LiterootConfig`.
 pub fn canonical_refusals() -> Vec<Refused> {
     let all = [
@@ -400,6 +401,7 @@ pub fn canonical_refusals() -> Vec<Refused> {
         }),
         Refusal::InstallRefused { in_flight: 8 },
         Refusal::Path(PathRefusal::SyntheticFileUnavailable),
+        Refusal::Note(Note::SudAbsentBootConfigAdvisory),
     ];
     debug_assert!(all.windows(2).all(|w| refusal_tag(w[1]) - refusal_tag(w[0]) <= 1));
     all.into_iter().map(|r| Refused(vec![r])).collect()
@@ -1265,10 +1267,10 @@ mod tests {
     #[test]
     fn canonical_corpus_covers_every_variant_and_nested_kind() {
         let all = canonical_refusals();
-        assert_eq!(all.len(), 36, "34 logical tags, 36 payload samples");
+        assert_eq!(all.len(), 37, "35 logical tags, 37 payload samples");
         let mut tags: Vec<u8> = all.iter().map(|r| refusal_tag(r.0[0])).collect();
         tags.dedup();
-        assert_eq!(tags, (0..34).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..35).collect::<Vec<u8>>());
         let flags: Vec<FlagState> = all
             .iter()
             .filter_map(|r| match r.0[0] {
@@ -1329,7 +1331,7 @@ mod tests {
         }
         let mut tags: Vec<u8> = batch.iter().map(|&r| refusal_tag(r)).collect();
         tags.dedup();
-        assert_eq!(tags, (0..=33).collect::<Vec<u8>>(), "every tag, in order");
+        assert_eq!(tags, (0..=34).collect::<Vec<u8>>(), "every tag, in order");
         let back: Refused = codec::decode(&encoded(&Refused(batch.clone()))).unwrap();
         assert_eq!(back.0, batch);
     }
@@ -1387,6 +1389,8 @@ mod tests {
                 Refusal::Path(PathRefusal::SyntheticFileUnavailable) => return None,
                 Refusal::Path(k) => SeqRefusal::Path(k),
                 Refusal::Answered(k) => SeqRefusal::Answered(k),
+                // Not in the seq era: added with revision 4.
+                Refusal::Note(Note::SudAbsentBootConfigAdvisory) => return None,
                 Refusal::Note(n) => SeqRefusal::Note(n),
                 Refusal::Summary(Summary::Seccomp {
                     pid,
