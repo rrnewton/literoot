@@ -2638,4 +2638,287 @@ mod tests {
             Err(SharedRecordError::UnsortedOrDuplicateProcess)
         );
     }
+
+    #[test]
+    fn pending_guard_overlay_shows_another_handles_newer_write_under_a_held_lock() {
+        // While any other handle holds a shared lock, A's
+        // opportunistic repair cannot take the exclusive lock, so
+        // A's pending guards stay and every read below goes
+        // through the overlay's exact-match check itself. A guard
+        // hides only the exact value A last saw; B's newer values
+        // must show.
+        let a = SharedRecordFile::create().expect("create shared-record memfd");
+        a.set_uts_nodename(Some(b"first".to_vec()))
+            .expect("set initial nodename");
+        a.set_uts_domainname(Some(b"dom".to_vec()))
+            .expect("set initial domainname");
+        let old = row(4242, 777, b"/bin/old");
+        a.publish(old.clone()).expect("publish initial row");
+        let b = SharedRecordFile::from_fd(a.fd())
+            .expect("adopt same memfd as second handle");
+
+        let a_lock = a
+            .open_locked_try(false)
+            .expect("try shared lock")
+            .expect("shared lock is free");
+        let err = a
+            .set_uts_nodename_with_timeout(
+                Some(b"second".to_vec()),
+                std::time::Duration::from_millis(25),
+            )
+            .expect_err("A UTS write must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        let err = a
+            .set_uts_domainname_with_timeout(
+                Some(b"second-dom".to_vec()),
+                std::time::Duration::from_millis(25),
+            )
+            .expect_err("A domainname write must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        let mut a_replacement = old.clone();
+        a_replacement.exe_guest = b"/bin/a-new".to_vec();
+        let err = a
+            .publish_with_timeout(a_replacement, std::time::Duration::from_millis(25))
+            .expect_err("A publish must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        drop(a_lock);
+
+        b.set_uts_nodename(Some(b"third".to_vec()))
+            .expect("B writes a newer nodename");
+        b.set_uts_domainname(Some(b"third-dom".to_vec()))
+            .expect("B writes a newer domainname");
+        let mut b_row = old.clone();
+        b_row.exe_guest = b"/bin/b-new".to_vec();
+        b.publish(b_row.clone()).expect("B publishes a newer row");
+
+        let b_lock = b
+            .open_locked_try(false)
+            .expect("try shared lock on B")
+            .expect("shared lock is free");
+        assert!(
+            !a.pending_repairs().is_empty(),
+            "A's guards must be pending before the reads"
+        );
+        assert_eq!(
+            a.uts().expect("A reads UTS under B's shared lock"),
+            (Some(b"third".to_vec()), Some(b"third-dom".to_vec())),
+            "a guard must hide only the exact value A last saw"
+        );
+        assert_eq!(
+            a.lookup(old.id).expect("A looks up under B's shared lock"),
+            Some(b_row),
+            "a row guard must hide only the exact row A last saw"
+        );
+        assert!(
+            !a.pending_repairs().is_empty(),
+            "the reads ran the overlay, not a repair: the guards must still be pending"
+        );
+        drop(b_lock);
+    }
+
+    /// The store's memfd reopened read-write through /proc/self/fd.
+    fn reopen_store_file(store: &SharedRecordFile) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/self/fd/{}", store.fd()))
+            .expect("reopen memfd")
+    }
+
+    /// Replace the store's whole file with `bytes`.
+    fn write_raw_frame(store: &SharedRecordFile, bytes: &[u8]) {
+        use std::os::unix::fs::FileExt;
+
+        let file = reopen_store_file(store);
+        file.set_len(0).expect("truncate frame");
+        file.write_all_at(bytes, 0).expect("write raw frame");
+    }
+
+    fn read_raw_frame(store: &SharedRecordFile) -> Vec<u8> {
+        std::fs::read(format!("/proc/self/fd/{}", store.fd())).expect("read raw frame")
+    }
+
+    /// A v1 frame for `record`: an 8-byte little-endian payload
+    /// length, then the payload. Returns the frame and the payload.
+    fn v1_frame(record: &SharedRecord) -> (Vec<u8>, Vec<u8>) {
+        let payload = record.encode().expect("encode v1 payload");
+        let mut frame = (payload.len() as u64).to_le_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        (frame, payload)
+    }
+
+    /// `raw` is a whole v2 frame: the 40-byte header with these
+    /// refusal counts (publish, nodename, domainname), then
+    /// exactly `payload`.
+    fn assert_v2_frame(raw: &[u8], payload: &[u8], counts: [u64; 3], context: &str) {
+        let field = |at: usize| u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        assert_eq!(
+            raw.len(),
+            FRAME_HEADER_BYTES + payload.len(),
+            "{context}: frame length"
+        );
+        assert_eq!(&raw[..4], FRAME_MAGIC.as_slice(), "{context}: v2 magic");
+        assert_eq!(
+            u16::from_le_bytes(raw[4..6].try_into().unwrap()),
+            FRAME_VERSION,
+            "{context}: frame version"
+        );
+        assert_eq!(
+            u16::from_le_bytes(raw[6..8].try_into().unwrap()) as usize,
+            FRAME_HEADER_BYTES,
+            "{context}: header length"
+        );
+        assert_eq!(field(8), payload.len() as u64, "{context}: payload_len");
+        assert_eq!(
+            [field(16), field(24), field(32)],
+            counts,
+            "{context}: refusal counts"
+        );
+        assert_eq!(
+            &raw[FRAME_HEADER_BYTES..],
+            payload,
+            "{context}: the payload must be unchanged"
+        );
+    }
+
+    #[test]
+    fn v1_frame_reads_back_and_a_refused_write_migrates_it_unchanged() {
+        // A refused write that finds a v1 frame must rewrite the
+        // whole frame as v2, the header plus the unchanged payload,
+        // and never put a 40-byte header over the 8-byte one. Each
+        // of the three refusal paths is driven once.
+        let record = sample().canonical();
+        let (frame, payload) = v1_frame(&record);
+        for (case, counts) in [
+            ("nodename", [0, 1, 0]),
+            ("domainname", [0, 0, 1]),
+            ("publish", [1, 0, 0]),
+        ] {
+            let store = SharedRecordFile::create().expect("create shared-record memfd");
+            write_raw_frame(&store, &frame);
+            assert_eq!(
+                store.snapshot().expect("a v1 frame reads back"),
+                record,
+                "{case}"
+            );
+            let err = match case {
+                "nodename" => store
+                    .set_uts_nodename(Some(vec![b'n'; MAX_UTS_BYTES + 1]))
+                    .expect_err("an overlong nodename must refuse"),
+                "domainname" => store
+                    .set_uts_domainname(Some(vec![b'd'; MAX_UTS_BYTES + 1]))
+                    .expect_err("an overlong domainname must refuse"),
+                _ => store
+                    .publish(row(99, 1, b"relative/exe"))
+                    .expect_err("a relative exe must refuse"),
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{case}");
+            assert_eq!(
+                err.refusal_count(),
+                Some(1),
+                "{case}: the refusal is counted in the migrated header"
+            );
+            assert_v2_frame(&read_raw_frame(&store), &payload, counts, case);
+            assert_eq!(
+                store.snapshot().expect("the migrated frame reads back"),
+                record,
+                "{case}"
+            );
+        }
+
+        // A first, successful write directly on a v1 frame also leaves a whole
+        // v2 frame: no counts, and the old record plus the new value.
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        write_raw_frame(&store, &frame);
+        store
+            .set_uts_domainname(Some(b"d2".to_vec()))
+            .expect("a valid domainname on a v1 frame");
+        let mut first = record.clone();
+        first.uts_domainname = Some(b"d2".to_vec());
+        let first_payload = first.encode().expect("encode the first-write payload");
+        assert_v2_frame(
+            &read_raw_frame(&store),
+            &first_payload,
+            [0, 0, 0],
+            "first write on a v1 frame",
+        );
+        assert_eq!(store.snapshot().expect("the written frame reads back"), first);
+
+        // A later successful write keeps the migrated count.
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        write_raw_frame(&store, &frame);
+        store
+            .set_uts_nodename(Some(vec![b'n'; MAX_UTS_BYTES + 1]))
+            .expect_err("an overlong nodename must refuse");
+        store
+            .set_uts_nodename(Some(b"ok".to_vec()))
+            .expect("a valid nodename after the refusal");
+        let mut expected = record.clone();
+        expected.uts_nodename = Some(b"ok".to_vec());
+        let expected_payload = expected.encode().expect("encode expected payload");
+        assert_v2_frame(
+            &read_raw_frame(&store),
+            &expected_payload,
+            [0, 1, 0],
+            "write after migration",
+        );
+    }
+
+    #[test]
+    fn exact_cap_v1_frame_migrates_to_a_readable_v2_file() {
+        // At the cap the migrated file is FRAME_HEADER_BYTES +
+        // MAX_ENCODED_BYTES = 1,048,616 bytes, and still reads.
+        let mut record = SharedRecord::new();
+        let mut big = row(1, 1, b"/bin/big");
+        big.argv = vec![Vec::new()];
+        record.publish(big.clone()).expect("publish boundary row");
+        let overhead = record.encode().expect("encode boundary base").len();
+        big.argv[0] = vec![b'x'; MAX_ENCODED_BYTES - overhead];
+        record.publish(big).expect("publish exact cap row");
+        let (frame, payload) = v1_frame(&record);
+        assert_eq!(payload.len(), MAX_ENCODED_BYTES);
+        assert_eq!(frame.len(), 1_048_584);
+
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        write_raw_frame(&store, &frame);
+        assert_eq!(
+            store.snapshot().expect("an exact-cap v1 frame reads back"),
+            record
+        );
+        let err = store
+            .set_uts_nodename(Some(vec![b'n'; MAX_UTS_BYTES + 1]))
+            .expect_err("an overlong nodename must refuse");
+        assert_eq!(err.refusal_count(), Some(1));
+        let raw = read_raw_frame(&store);
+        assert_eq!(raw.len(), 1_048_616, "the migrated exact-cap file");
+        assert_v2_frame(&raw, &payload, [0, 1, 0], "exact cap");
+        assert_eq!(
+            store.snapshot().expect("the migrated exact-cap file reads back"),
+            record
+        );
+    }
+
+    #[test]
+    fn v2_header_payload_len_over_cap_is_rejected() {
+        // The v2 header's payload_len (bytes 8..16) is checked
+        // against the cap itself, not taken from the file length.
+        use std::os::unix::fs::FileExt;
+
+        let store = SharedRecordFile::create().expect("create shared-record memfd");
+        store.replace(&sample()).expect("store good snapshot");
+        let file = reopen_store_file(&store);
+        let mut magic = [0u8; 4];
+        file.read_exact_at(&mut magic, 0).expect("read frame magic");
+        assert_eq!(&magic, FRAME_MAGIC, "the store writes v2 frames");
+        file.write_all_at(&((MAX_ENCODED_BYTES + 1) as u64).to_le_bytes(), 8)
+            .expect("write an over-cap payload_len");
+        let err = store
+            .snapshot()
+            .expect_err("an over-cap v2 payload_len must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("snapshot payload over cap"),
+            "unexpected over-cap error: {err}"
+        );
+    }
 }

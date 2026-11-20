@@ -268,6 +268,95 @@ static int capfill(void) {
     return 0;
 }
 
+/* Run one child that sets the hostname (and the domainname unless NULL),
+   and wait for it; its sethostname must succeed locally even when the
+   shared write is refused. Stores the child's pid in *child unless NULL. */
+static int run_uts_child(const char *host, const char *domain, pid_t *child) {
+    pid_t pid = fork();
+    if (pid < 0) return 710;
+    if (pid == 0) {
+        if (sethostname(host, strlen(host)) != 0) _exit(711);
+        if (domain != NULL && setdomainname(domain, strlen(domain)) != 0) _exit(712);
+        _exit(0);
+    }
+    if (child != NULL) *child = pid;
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 713;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 714;
+    return 0;
+}
+
+/* Fill the store to just under the cap with fork rows, no exec (liteinst
+   refuses a guest exec without exec-native-injection): this process runs
+   as `/bin/sr <fill>`, and each of SR_FILL_FORKS children publishes one
+   row of that exe and argv, which stays after it exits. Then SR_KIDS
+   children set a longer hostname and domainname, which no longer fit.
+   Then two controls bracket the headroom: SR_CTL_OVER must be refused
+   and SR_CTL_FIT must fit; the parent prints the shared hostname after
+   each. It prints kid 1's pid: kid 1's own row must be the first refused
+   publish. */
+static int uts_kids(void) {
+    const char *host = getenv("SR_HOST");
+    const char *fills_text = getenv("SR_FILL_FORKS");
+    const char *kids_text = getenv("SR_KIDS");
+    const char *over = getenv("SR_CTL_OVER");
+    const char *fit = getenv("SR_CTL_FIT");
+    if (host == NULL || fills_text == NULL || kids_text == NULL || over == NULL || fit == NULL) return 702;
+    if (sethostname(host, strlen(host)) != 0) return 701;
+    int fills = atoi(fills_text);
+    if (fills < 1 || fills > 64) return 703;
+    for (int i = 0; i < fills; i++) {
+        pid_t pid = fork();
+        if (pid < 0) return 704;
+        if (pid == 0) _exit(0);
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) return 705;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 706;
+    }
+    int kids = atoi(kids_text);
+    if (kids < 1 || kids > 64) return 707;
+    pid_t kid1 = 0;
+    for (int i = 0; i < kids; i++) {
+        pid_t kid = 0;
+        int rc = run_uts_child("second-longer-name", "second-longer-domain", &kid);
+        if (rc != 0) return rc;
+        if (i == 0) kid1 = kid;
+    }
+    printf("uts-kids=%d\n", kids);
+    printf("kid1-pid=%d\n", (int)kid1);
+    struct utsname uts;
+    int rc = run_uts_child(over, NULL, NULL);
+    if (rc != 0) return rc;
+    if (uname(&uts) != 0) return 708;
+    printf("ctl-over=%s\n", uts.nodename);
+    rc = run_uts_child(fit, NULL, NULL);
+    if (rc != 0) return rc;
+    if (uname(&uts) != 0) return 709;
+    printf("ctl-fit=%s\n", uts.nodename);
+    fflush(stdout);
+    return 0;
+}
+
+/* Overlong UTS names without fake root: the kernel decides. */
+static int uts_eperm(void) {
+    char node65[66];
+    char domain65[66];
+    memset(node65, 'N', 65);
+    node65[65] = '\0';
+    memset(domain65, 'D', 65);
+    domain65[65] = '\0';
+    errno = 0;
+    int rc_node = sethostname(node65, 65);
+    int errno_node = errno;
+    errno = 0;
+    int rc_domain = setdomainname(domain65, 65);
+    int errno_domain = errno;
+    printf("rc_node=%d errno_node=%d rc_domain=%d errno_domain=%d\n",
+           rc_node, errno_node, rc_domain, errno_domain);
+    fflush(stdout);
+    return 0;
+}
+
 int main(void) {
     if (getenv("SR_CHILD_IMAGE") != NULL) return child_image();
     const char *mode = getenv("SR_MODE");
@@ -277,6 +366,8 @@ int main(void) {
     if (strcmp(mode, "uts-length") == 0) return uts_length();
     if (strcmp(mode, "uts-observe") == 0) return uts_observe();
     if (strcmp(mode, "capfill") == 0) return capfill();
+    if (strcmp(mode, "uts-kids") == 0) return uts_kids();
+    if (strcmp(mode, "uts-eperm") == 0) return uts_eperm();
     if (strcmp(mode, "filler") == 0) return 0;
     return 99;
 }
@@ -304,13 +395,19 @@ fn literoot_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_literoot"))
 }
 
-fn preload_path() -> Option<PathBuf> {
+/// The release preload for the in-guest cases of `test`. Missing, it fails
+/// the test unless LITEROOT_ALLOW_SKIP_PRELOAD=1, and then the case is the
+/// conventional skip, named on stderr (never a pass).
+fn preload_path(test: &str) -> Option<PathBuf> {
     let preload = resolve_preload();
     if preload.exists() {
         return Some(preload);
     }
     if std::env::var("LITEROOT_ALLOW_SKIP_PRELOAD").as_deref() == Ok("1") {
-        eprintln!("shared_record_consumers: preload not built — skipping in-guest cases");
+        eprintln!(
+            "{test}: SKIP (not a pass): preload not built at {}, in-guest case not run",
+            preload.display()
+        );
         return None;
     }
     panic!(
@@ -443,17 +540,42 @@ fn run_literoot_logged(
     )
 }
 
-fn fixture_libs_available() -> bool {
+/// Whether the x86-64 host libraries the guest roots copy are present.
+/// Absent, the calling test `test` is the conventional skip, named on
+/// stderr (never a pass), so a run without them (aarch64 above all)
+/// shows which cases it did not cover; under LITEROOT_REQUIRE_FIXTURES
+/// it fails the test instead.
+fn fixture_libs_available(test: &str) -> bool {
     if Path::new("/lib64/libc.so.6").exists() && Path::new("/lib64/ld-linux-x86-64.so.2").exists() {
         return true;
     }
-    eprintln!("shared_record_consumers: host fixture libraries unavailable — skipping");
+    assert!(
+        std::env::var_os("LITEROOT_REQUIRE_FIXTURES").is_none(),
+        "{test}: host fixture libraries unavailable \
+         (/lib64/libc.so.6, /lib64/ld-linux-x86-64.so.2) under LITEROOT_REQUIRE_FIXTURES"
+    );
+    eprintln!(
+        "{test}: SKIP (not a pass): host fixture libraries unavailable \
+         (/lib64/libc.so.6, /lib64/ld-linux-x86-64.so.2)"
+    );
     false
+}
+
+/// Whether this process's effective capabilities hold CAP_SYS_ADMIN
+/// (bit 21 of `CapEff:` in /proc/self/status); None when unreadable.
+fn has_cap_sys_admin() -> Option<bool> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))?
+        .trim();
+    let caps = u64::from_str_radix(hex, 16).ok()?;
+    Some(caps & (1 << 21) != 0)
 }
 
 #[test]
 fn ptrace_parent_reads_fork_child_shared_exe_and_cmdline() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("ptrace_parent_reads_fork_child_shared_exe_and_cmdline") {
         return;
     }
     let dir = base_dir("ptrace-fork");
@@ -488,7 +610,7 @@ fn ptrace_parent_reads_fork_child_shared_exe_and_cmdline() {
 
 #[test]
 fn ptrace_parent_reads_exec_child_canonical_exe_and_cmdline() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("ptrace_parent_reads_exec_child_canonical_exe_and_cmdline") {
         return;
     }
     let dir = base_dir("ptrace-exec");
@@ -518,10 +640,10 @@ fn ptrace_parent_reads_exec_child_canonical_exe_and_cmdline() {
 
 #[test]
 fn inguest_parent_sees_child_hostname_and_shared_row() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("inguest_parent_sees_child_hostname_and_shared_row") {
         return;
     }
-    let Some(preload) = preload_path() else {
+    let Some(preload) = preload_path("inguest_parent_sees_child_hostname_and_shared_row") else {
         return;
     };
     let dir = base_dir("inguest-uts");
@@ -553,10 +675,10 @@ fn inguest_parent_sees_child_hostname_and_shared_row() {
 
 #[test]
 fn liteinst_sequential_forks_print_one_publish_refusal() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("liteinst_sequential_forks_print_one_publish_refusal") {
         return;
     }
-    let Some(preload) = preload_path() else {
+    let Some(preload) = preload_path("liteinst_sequential_forks_print_one_publish_refusal") else {
         return;
     };
     let dir = base_dir("liteinst-forkfill-seq");
@@ -596,10 +718,10 @@ fn liteinst_sequential_forks_print_one_publish_refusal() {
 
 #[test]
 fn liteinst_concurrent_forks_print_one_publish_refusal_repeatedly() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("liteinst_concurrent_forks_print_one_publish_refusal_repeatedly") {
         return;
     }
-    let Some(preload) = preload_path() else {
+    let Some(preload) = preload_path("liteinst_concurrent_forks_print_one_publish_refusal_repeatedly") else {
         return;
     };
     let dir = base_dir("liteinst-forkfill-par");
@@ -631,7 +753,7 @@ fn liteinst_concurrent_forks_print_one_publish_refusal_repeatedly() {
 
 #[test]
 fn ptrace_parent_keeps_successful_exec_row_after_failed_exec() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("ptrace_parent_keeps_successful_exec_row_after_failed_exec") {
         return;
     }
     let dir = base_dir("ptrace-failed-exec");
@@ -663,14 +785,18 @@ fn ptrace_parent_keeps_successful_exec_row_after_failed_exec() {
 
 #[test]
 fn overlong_uts_names_return_einval_and_leave_both_fields_unchanged() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("overlong_uts_names_return_einval_and_leave_both_fields_unchanged") {
         return;
     }
     let dir = base_dir("uts-length");
     let guest = build_guest(&dir);
     for (name, backend, preload) in [
         ("ptrace", Some("ptrace"), None),
-        ("liteinst", Some("liteinst"), preload_path()),
+        (
+            "liteinst",
+            Some("liteinst"),
+            preload_path("overlong_uts_names_return_einval_and_leave_both_fields_unchanged"),
+        ),
     ] {
         if backend == Some("liteinst") && preload.is_none() {
             continue;
@@ -709,7 +835,7 @@ fn snapshot_row_len(exe_len: usize, argv_lens: &[usize]) -> usize {
 
 #[test]
 fn cap_filled_shared_record_reports_refusals_without_stale_values() {
-    if !fixture_libs_available() {
+    if !fixture_libs_available("cap_filled_shared_record_reports_refusals_without_stale_values") {
         return;
     }
     let dir = base_dir("capfill");
@@ -802,6 +928,176 @@ fn cap_filled_shared_record_reports_refusals_without_stale_values() {
         stderr.matches("shared record publish refused").count(),
         1,
         "two refused publishes across exec must print one line: stderr={stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn liteinst_uts_writes_at_the_cap_print_one_refusal_each() {
+    // In-guest every child is its own process with its own
+    // per-process limiter. The UTS call sites must report the session
+    // count the store returns with a cap refusal; without it, each of
+    // the children prints its own line.
+    let test = "liteinst_uts_writes_at_the_cap_print_one_refusal_each";
+    if !fixture_libs_available(test) {
+        return;
+    }
+    let Some(preload) = preload_path(test) else {
+        return;
+    };
+    let dir = base_dir("liteinst-uts-cap");
+    let guest = build_guest(&dir);
+    let root = dir.join("root");
+    make_root(&root, &guest);
+    // Fill with fork rows, not exec'd fillers: under liteinst a guest exec
+    // is refused (UnsupportedOperation::Exec) unless the preload is built
+    // with exec-native-injection, and the default preload is not. The
+    // parent runs as `/bin/sr <fill>`; it and each of FILL_FORKS fork
+    // children publish one row of that exe and argv, and a row stays after
+    // its process exits. With HOST set and no domainname:
+    //   8 (magic, version, flags) + 4 + HOST (nodename) + 4 (row count)
+    //   + (FILL_FORKS + 1) * row_len == MAX_ENCODED_BYTES - 2.
+    const MAX_ENCODED_BYTES: usize = 1024 * 1024;
+    const HOST: &str = "uts-fill-host";
+    const FILL_FORKS: usize = 8;
+    let rows = FILL_FORKS + 1;
+    let rows_bytes = MAX_ENCODED_BYTES - 2 - (8 + 4 + HOST.len() + 4);
+    assert_eq!(rows_bytes % rows, 0, "HOST must make the rows divide evenly");
+    let row_len = rows_bytes / rows;
+    let fill_len = row_len - snapshot_row_len("/bin/sr".len(), &["/bin/sr".len(), 0]);
+    assert_eq!(snapshot_row_len("/bin/sr".len(), &["/bin/sr".len(), fill_len]), row_len);
+    assert!(fill_len < 131_072, "one argv string must stay under MAX_ARG_STRLEN: {fill_len}");
+    let fill = "F".repeat(fill_len);
+    let over = format!("{HOST}abc");
+    let fit = format!("{HOST}ab");
+    let fill_forks = FILL_FORKS.to_string();
+    let log = dir.join("side.log");
+    let (stdout, stderr, status, refused) = run_literoot_logged(
+        &root,
+        Some("liteinst"),
+        true,
+        &["/bin/sr", &fill],
+        &[
+            ("SR_MODE", "uts-kids"),
+            ("SR_HOST", HOST),
+            ("SR_FILL_FORKS", &fill_forks),
+            ("SR_KIDS", "5"),
+            ("SR_CTL_OVER", &over),
+            ("SR_CTL_FIT", &fit),
+        ],
+        Some(&preload),
+        &log,
+    );
+    assert!(
+        status.success(),
+        "status={status} stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("uts-kids=5"),
+        "the five children did not all run: stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The bracket: +3 bytes must be refused and +2 must fit, so the store
+    // was exactly 2 bytes under the cap when the five children wrote.
+    assert!(
+        stdout.contains(&format!("ctl-over={HOST}\n")),
+        "the +3 control fit: the store was more than 2 bytes under the cap, \
+         so the fill arithmetic does not hold here: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains(&format!("ctl-fit={fit}\n")),
+        "the +2 control was refused: the store was less than 2 bytes under \
+         the cap: stdout={stdout:?} stderr={stderr:?}"
+    );
+    // Kid 1's own row must be the first refused publish: only the count-1
+    // refusal prints, and it names its pid. With a one-row gap in the
+    // fill, kid 1's row would fit and top the store up to exactly 2 bytes
+    // under the cap, and kid 2 would be the first refused.
+    let kid1: i32 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("kid1-pid="))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("no kid1-pid line: stdout={stdout:?}"));
+    assert!(
+        stderr.contains(&format!("shared record publish refused: for pid {kid1}:")),
+        "kid 1's row was not the first refused publish, so the fill was not 9 rows: \
+         kid1={kid1} stderr={stderr:?}"
+    );
+    for (line, key) in [
+        (
+            "shared record UTS nodename write refused",
+            "refused guest nodename_write",
+        ),
+        (
+            "shared record UTS domainname write refused",
+            "refused guest domainname_write",
+        ),
+    ] {
+        assert_eq!(
+            stderr.matches(line).count(),
+            1,
+            "{line}: five refused children must print exactly one line \
+             (0 means the fill did not reach the cap): stderr={stderr:?}"
+        );
+        assert!(
+            refused.iter().any(|l| l == key),
+            "{key}: side log {refused:?}"
+        );
+    }
+    // The seven children's own rows (five kids, two controls) are refused
+    // publishes at the cap; the in-guest dedup prints one line for them.
+    assert_eq!(
+        stderr.matches("shared record publish refused").count(),
+        1,
+        "the children's rows must be refused at the cap with one line: stderr={stderr:?}"
+    );
+    assert!(
+        refused.iter().any(|l| l == "refused guest shared_record_publish"),
+        "side log: {refused:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_fake_overlong_uts_names_return_eperm_without_cap_sys_admin() {
+    // Without fake root, literoot must leave an overlong UTS name to
+    // the kernel, which checks CAP_SYS_ADMIN before the length
+    // (kernel/sys.c, sethostname and setdomainname): EPERM, not
+    // literoot's own EINVAL. With CAP_SYS_ADMIN the kernel answers
+    // EINVAL too, so that case cannot tell and is skipped by name.
+    let test = "non_fake_overlong_uts_names_return_eperm_without_cap_sys_admin";
+    if !fixture_libs_available(test) {
+        return;
+    }
+    match has_cap_sys_admin() {
+        Some(false) => {}
+        Some(true) => {
+            eprintln!(
+                "{test}: SKIP (not a pass): CAP_SYS_ADMIN is held, \
+                 so the kernel answers EINVAL either way"
+            );
+            return;
+        }
+        None => panic!("{test}: cannot read CapEff from /proc/self/status"),
+    }
+    let dir = base_dir("uts-eperm");
+    let guest = build_guest(&dir);
+    let root = dir.join("root");
+    make_root(&root, &guest);
+    let (stdout, stderr, status) = run_literoot(
+        &root,
+        Some("ptrace"),
+        false,
+        &["/bin/sr"],
+        &[("SR_MODE", "uts-eperm")],
+        None,
+    );
+    assert!(
+        status.success(),
+        "status={status} stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("rc_node=-1 errno_node=1 rc_domain=-1 errno_domain=1"),
+        "a non-fake overlong UTS write was not EPERM: stdout={stdout:?} stderr={stderr:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
