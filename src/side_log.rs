@@ -73,8 +73,17 @@ use crate::refusal_log;
 /// so it writes `launch`. `reporter`, an in-guest run in which no preload
 /// process acknowledged refusal reporting: the launcher fails such a run
 /// whether or not this log is open, and writes `reporter` only when the
-/// launch itself did not fail (`launch` wins, src/main.rs).
-pub const END_ERRORS: &[&str] = &["log_write", "connections_open", "launch", "reporter"];
+/// launch itself did not fail (`launch` wins, src/main.rs). `stats_record`,
+/// a requested stats record could not be written, or the run's measurement
+/// cgroup could not be read or cleaned up (`run_stats`); the run's status
+/// is then `STATS_RECORD_EXIT`, and this token outranks the others.
+pub const END_ERRORS: &[&str] = &[
+    "log_write",
+    "connections_open",
+    "launch",
+    "reporter",
+    "stats_record",
+];
 /// `route` labels.
 pub const ROUTES: &[&str] = &["preload", "static_m2", "ptrace"];
 /// `fork_policy` kinds: the record's five, `clone` split by `CLONE_THREAD`
@@ -121,6 +130,8 @@ pub const LAUNCHER: &[&str] = &[
     "preload_missing",
     "not_built",
     "interp_not_guest",
+    // The stats counter's per-run cgroup admission (src/run_stats.rs).
+    "stats_cgroup",
     "other",
 ];
 /// `path` kinds: path refusals by name (docs/design.md §4.9), the tokens

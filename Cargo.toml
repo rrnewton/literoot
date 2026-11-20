@@ -27,7 +27,7 @@ path = "src/main.rs"
 # Flip each edge to a crates.io version as releases land.
 default = ["run", "in-guest"]
 # `tool` is the backend-neutral RootfsTool + launcher scaffolding.
-tool = ["dep:reverie", "dep:libc", "dep:serde", "dep:tokio"]
+tool = ["dep:reverie", "dep:libc", "dep:serde", "dep:serde_json", "dep:tokio"]
 # `run` alone is the ptrace-only build: no in-guest backend crates
 # (reverie-liteinst / reverie-inguest / liteinst) are compiled into the
 # binary, so it builds on architectures the in-guest stack does not serve

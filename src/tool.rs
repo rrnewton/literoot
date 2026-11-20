@@ -1113,6 +1113,23 @@ fn run_backend(
     backend: &str,
     in_guest: bool,
 ) -> Result<u8, String> {
+    // LITEROOT_STATS / LITEROOT_EXIT_RECORD / LITEROOT_CGROUP (off by
+    // default): decided once, before any backend starts, and never passed
+    // to the guest; the run's own cgroup is entered here. A finished run
+    // concludes the record itself; every error path abandons it here, so
+    // the cgroup's cleanup is never left to Drop.
+    let stats = crate::run_stats::RunStats::from_env(&mut cmd)?;
+    run_backend_with(&stats, cmd, cfg, backend, in_guest).map_err(|e| stats.abandon(e))
+}
+
+/// [`run_backend`] once the record request is decided.
+fn run_backend_with(
+    stats: &crate::run_stats::RunStats,
+    mut cmd: reverie::process::Command,
+    cfg: LiterootConfig,
+    backend: &str,
+    in_guest: bool,
+) -> Result<u8, String> {
     let kill_on_exit = cfg.kill_on_exit;
     // The two memfds the guest tree shares, both created here: the
     // probe-cache generation (translate.rs probe coherence) and
@@ -1219,17 +1236,45 @@ fn run_backend(
             // Before anything is spawned: the preload must carry this
             // build's wire identity (config layout and refusal schema).
             crate::wire_id::check_preload(&preload)?;
-            let (output, _global) = runtime.block_on(async {
-                reverie_inguest::launcher::PreloadBackend::run_with_output_and_preload_data::<
-                    RootfsTool,
-                >(cmd, cfg, preload.clone(), selector.clone())
-                .await
-                .map_err(|e| launch_error(backend, e))
+            let (output, snapshot) = runtime.block_on(async {
+                use reverie::BackendStatsSource as _;
+                use reverie_inguest::launcher::PreloadBackend;
+                if stats.counting() {
+                    let (output, _global, source) =
+                        PreloadBackend::run_with_output_and_preload_data_and_stats::<RootfsTool>(
+                            cmd,
+                            cfg,
+                            preload.clone(),
+                            selector.clone(),
+                        )
+                        .await
+                        .map_err(|e| launch_error(backend, e))?;
+                    Ok::<_, String>((output, Some(source.backend_stats())))
+                } else {
+                    let (output, _global) =
+                        PreloadBackend::run_with_output_and_preload_data::<RootfsTool>(
+                            cmd,
+                            cfg,
+                            preload.clone(),
+                            selector.clone(),
+                        )
+                        .await
+                        .map_err(|e| launch_error(backend, e))?;
+                    Ok((output, None))
+                }
             })?;
             check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
-            return Ok(in_guest_exit(output.status));
+            // The run's exit code as main defines it (a missing reporter
+            // wins over the guest's code), then the stats record, whose
+            // failure outranks both.
+            return Ok(stats.conclude(
+                backend,
+                in_guest_exit(output.status),
+                snapshot.as_ref(),
+                None,
+            ));
         }
         #[cfg(not(feature = "in-guest"))]
         {
@@ -1250,20 +1295,43 @@ fn run_backend(
             let preload = select_preload(crate::preload_materialize::Flavour::Liteinst)?;
             crate::side_log::route("preload");
             crate::wire_id::check_preload(&preload)?;
-            let (output, _global) = runtime.block_on(async {
-                reverie_liteinst::LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
-                    cmd,
-                    cfg,
-                    preload.clone(),
-                    selector.clone(),
-                )
-                .await
-                .map_err(|e| launch_error(backend, e))
+            let (output, snapshot) = runtime.block_on(async {
+                use reverie::BackendStatsSource as _;
+                use reverie_liteinst::LiteinstBackend;
+                if stats.counting() {
+                    let (output, _global, source) =
+                        LiteinstBackend::run_with_output_and_preload_data_and_stats::<RootfsTool>(
+                            cmd,
+                            cfg,
+                            preload.clone(),
+                            selector.clone(),
+                        )
+                        .await
+                        .map_err(|e| launch_error(backend, e))?;
+                    Ok::<_, String>((output, Some(source.backend_stats())))
+                } else {
+                    let (output, _global) =
+                        LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
+                            cmd,
+                            cfg,
+                            preload.clone(),
+                            selector.clone(),
+                        )
+                        .await
+                        .map_err(|e| launch_error(backend, e))?;
+                    Ok((output, None))
+                }
             })?;
             check_reporter(&preload);
             std::io::stdout().write_all(&output.stdout).ok();
             std::io::stderr().write_all(&output.stderr).ok();
-            return Ok(in_guest_exit(output.status));
+            // As on the trap path: main's exit code, then the stats record.
+            return Ok(stats.conclude(
+                backend,
+                in_guest_exit(output.status),
+                snapshot.as_ref(),
+                None,
+            ));
         }
     }
 
@@ -1275,13 +1343,21 @@ fn run_backend(
                 .into(),
         );
     }
+    // Taken from the tracer before wait() consumes it; Some only
+    // when LITEROOT_STATS requested counting.
+    #[cfg(feature = "run")]
+    let mut stats_source = None;
     #[cfg(feature = "run")]
     let status = runtime.block_on(async {
+        // A disabled request is the builder's default, so an unset
+        // LITEROOT_STATS leaves the tracer exactly as before.
         let tracer = reverie_ptrace::TracerBuilder::<RootfsTool>::new(cmd)
             .config(cfg)
+            .backend_stats(stats.request())
             .spawn()
             .await
             .map_err(|e| format!("tracer spawn: {e}"))?;
+        stats_source = tracer.backend_stats();
         let root_pid = tracer.guest_pid().as_raw();
         let termination = tracer.termination_handle();
         let mut termination_requested = false;
@@ -1480,10 +1556,14 @@ fn run_backend(
     })?;
     #[cfg(feature = "run")]
     {
+        use reverie::BackendStatsSource as _;
         use std::os::unix::process::ExitStatusExt;
-        Ok(status
+        let code = status
             .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8)
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) as u8;
+        let snapshot = stats_source.map(|source| source.backend_stats());
+        let counts = snapshot.as_ref().map(crate::run_stats::ptrace_counts);
+        Ok(stats.conclude(backend, code, snapshot.as_ref(), counts))
     }
 }
 

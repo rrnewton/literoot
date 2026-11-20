@@ -23,6 +23,8 @@ mod exec_state;
 mod fake_creds;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
+#[cfg(feature = "tool")]
+mod run_stats;
 // Test builds compile it too, for the wire-digest pin (C5d): the codec and
 // sha2 are dev-dependencies.
 #[cfg(all(feature = "tool", any(test, feature = "private-runtime")))]
@@ -443,14 +445,42 @@ fn print_usage() {
 /// --kill-on-exit refusals (the unsupported-backend refusal
 /// and the runtime "kill-on-exit: refusing ..." errors)
 /// get 2, not the generic launcher-failure 125 (which the
-/// upstream proot suite counts as "skipped").
+/// upstream proot suite counts as "skipped"). A measurement
+/// cgroup failure (setup refused before the guest, or cleanup
+/// after a launcher error) gets the stats failure status.
 fn launcher_error_exit_code(error: &str) -> u8 {
     if error.starts_with("--kill-on-exit is supported only on the ptrace backend")
         || error.starts_with("kill-on-exit:")
     {
         2
+    } else if error.starts_with("LITEROOT_CGROUP:") {
+        STATS_FAILURE_EXIT
     } else {
         125
+    }
+}
+
+/// Exit status of every stats-record or measurement-cgroup failure
+/// (`run_stats::STATS_RECORD_EXIT`, kept equal by a test): neither 0 nor
+/// the launcher's 2, 3 or 125.
+const STATS_FAILURE_EXIT: u8 = 5;
+
+/// The side log's `end` error token. A stats-record or measurement-cgroup
+/// failure outranks the others: it is the one token a measurement harness
+/// must see to drop the run's record line.
+fn end_error(
+    stats_failed: bool,
+    launch_failed: bool,
+    reporter_missing: bool,
+) -> Option<&'static str> {
+    if stats_failed {
+        Some("stats_record")
+    } else if launch_failed {
+        Some("launch")
+    } else if reporter_missing {
+        Some("reporter")
+    } else {
+        None
     }
 }
 
@@ -483,6 +513,8 @@ fn launcher_token(error: &str) -> &'static str {
         "unlimited_stack_loader"
     } else if error.contains("static executables are not supported by the in-guest backend") {
         "static_floor"
+    } else if error.starts_with("LITEROOT_CGROUP:") {
+        "stats_cgroup"
     } else if launcher_error_exit_code(error) == 2 {
         "kill_on_exit"
     } else {
@@ -548,13 +580,11 @@ fn main() -> ExitCode {
         Ok(_) => launch(argv),
     };
     if refusal_log::is_open() {
-        side_log::end(if launch_failed() {
-            Some("launch")
-        } else if reporter_missing() {
-            Some("reporter")
-        } else {
-            None
-        });
+        side_log::end(end_error(
+            stats_record_failed(),
+            launch_failed(),
+            reporter_missing(),
+        ));
         if side_log::failed() {
             eprintln!("literoot: --refusal-log: a write failed");
             return ExitCode::from(REFUSAL_LOG_EXIT);
@@ -590,6 +620,15 @@ fn launch_failed() -> bool {
 fn reporter_missing() -> bool {
     #[cfg(feature = "tool")]
     return tool::reporter_missing();
+    #[cfg(not(feature = "tool"))]
+    return false;
+}
+
+/// Whether a requested stats record, or the measurement cgroup's cleanup,
+/// failed (see `run_stats::record_failed`).
+fn stats_record_failed() -> bool {
+    #[cfg(feature = "tool")]
+    return run_stats::record_failed();
     #[cfg(not(feature = "tool"))]
     return false;
 }
@@ -663,7 +702,13 @@ fn launch(argv: Vec<String>) -> ExitCode {
         match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command, cli.kill_on_exit) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
-                let code = launcher_error_exit_code(&e);
+                // A stats failure (the measurement cgroup's cleanup after
+                // this error) has the stats status, whatever the error.
+                let code = if stats_record_failed() {
+                    STATS_FAILURE_EXIT
+                } else {
+                    launcher_error_exit_code(&e)
+                };
                 if !tool::command_was_not_runnable() {
                     // A preload refusal is keyed by its own token, never by
                     // the text of the error.
@@ -729,6 +774,29 @@ mod kill_on_exit_parse_tests {
             2
         );
         assert_eq!(launcher_error_exit_code("tracer spawn: EPERM"), 125);
+    }
+
+    #[test]
+    fn measurement_cgroup_failures_have_the_stats_status_and_token() {
+        let error = "LITEROOT_CGROUP: /x is not a cgroup v2 directory";
+        assert_eq!(launcher_error_exit_code(error), super::STATS_FAILURE_EXIT);
+        assert_eq!(launcher_token(error), "stats_cgroup");
+        #[cfg(feature = "tool")]
+        assert_eq!(super::STATS_FAILURE_EXIT, crate::run_stats::STATS_RECORD_EXIT);
+    }
+
+    #[test]
+    fn a_stats_failure_outranks_every_other_end_token() {
+        use super::end_error;
+        for launch in [false, true] {
+            for reporter in [false, true] {
+                assert_eq!(end_error(true, launch, reporter), Some("stats_record"));
+            }
+        }
+        assert_eq!(end_error(false, true, true), Some("launch"));
+        assert_eq!(end_error(false, true, false), Some("launch"));
+        assert_eq!(end_error(false, false, true), Some("reporter"));
+        assert_eq!(end_error(false, false, false), None);
     }
 }
 
