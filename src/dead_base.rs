@@ -6,7 +6,9 @@
 //! walk passes (may_lookup), then ENOENT in the deleted directory
 //! (IS_DEADDIR). literoot reproduces the first part by asking the kernel: it
 //! injects a PROBE, the guest's own call with every dirfd -1 and every name
-//! the staged "x" (or "y"), which fails EBADF at path_init before any lookup
+//! the staged "x" (or "y") (setxattr and lsetxattr: setxattrat, with their
+//! value, size and flags in a staged struct), which fails EBADF at path_init
+//! before any lookup
 //! in every root and namespace, or reports the argument error first. The
 //! second part is the guest's own search check, `faccessat2` on the base.
 //! The third is local.
@@ -34,12 +36,16 @@ pub(crate) enum ArgSrc {
     Name(u8),
     /// A constant.
     Const(u64),
+    /// The staged `struct xattr_args` ([`xattr_args`]): the guest call's
+    /// value (arg 2), size (arg 3) and flags (arg 4).
+    XattrArgs,
 }
 
 use ArgSrc::Arg;
 use ArgSrc::Const;
 use ArgSrc::Name;
 use ArgSrc::NoBase;
+use ArgSrc::XattrArgs;
 
 /// How a dead-base call's argument checks are reproduced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +58,6 @@ pub(crate) enum Probe {
     Connect,
     /// L: no argument check runs before the lookup; nothing is injected.
     Local,
-    /// No probe can be issued: setxattrat has no number in literoot's
-    /// syscall table (Reverie's syscalls 0.6.18 ends at 461). The argument
-    /// checks are skipped; a dead NAME or a failed search check is refused
-    /// by name.
-    Unavailable,
 }
 
 /// One relative name of a call: its dirfd argument (None: the cwd) and its
@@ -105,8 +106,15 @@ const SYMLINK: &[Errno] = &[Errno::EFAULT, Errno::ENAMETOOLONG];
 const EXEC: &[Errno] = &[Errno::EAGAIN];
 // utimensat copies the times before the path (fs/utimes.c).
 const UTIMENS: &[Errno] = &[Errno::EINVAL, Errno::EFAULT];
+// setxattr_copy's argument errors, before the lookup (fs/xattr.c:622-645
+// at v7.1.3): the flags, the name (import_xattr_name), the size, the value.
+const XATTR: &[Errno] = &[Errno::EINVAL, Errno::ERANGE, Errno::EFAULT, Errno::E2BIG];
 
-#[cfg(target_arch = "x86_64")]
+/// XATTR_ARGS_SIZE_VER0 (include/linux/xattr.h): the size of the
+/// `struct xattr_args` setxattrat reads.
+pub(crate) const XATTR_ARGS_SIZE: usize = 16;
+const XA: ArgSrc = Const(XATTR_ARGS_SIZE as u64);
+
 const AT_SYMLINK_NOFOLLOW: u64 = libc::AT_SYMLINK_NOFOLLOW as u64;
 #[cfg(target_arch = "x86_64")]
 const AT_REMOVEDIR: u64 = libc::AT_REMOVEDIR as u64;
@@ -205,7 +213,29 @@ pub(crate) fn dead_base_probe(nr: Sysno) -> Option<Entry> {
         ),
         S::utimensat => row(AT01, t1(S::utimensat, [NoBase, Name(0), Arg(2), Arg(3), z, z]), UTIMENS),
         S::execve => row(CWD0, t1(S::execveat, [NoBase, Name(0), Arg(1), Arg(2), z, z]), EXEC),
-        S::setxattr | S::lsetxattr => row(CWD0, Probe::Unavailable, NONE),
+        // setxattrat (Linux 6.13) takes the value, size and flags in a
+        // struct, staged by the gate (`xattr_args`). An older kernel answers
+        // ENOSYS: probe_unsupported.
+        S::setxattr => row(
+            CWD0,
+            t1(S::setxattrat, [NoBase, Name(0), z, Arg(1), XattrArgs, XA]),
+            XATTR,
+        ),
+        S::lsetxattr => row(
+            CWD0,
+            t1(
+                S::setxattrat,
+                [
+                    NoBase,
+                    Name(0),
+                    Const(AT_SYMLINK_NOFOLLOW),
+                    Arg(1),
+                    XattrArgs,
+                    XA,
+                ],
+            ),
+            XATTR,
+        ),
         S::statfs | S::chdir | S::chroot => row(CWD0, Probe::Local, NONE),
         S::bind => row(&[], Probe::Bind, NONE),
         S::connect => row(&[], Probe::Connect, NONE),
@@ -214,8 +244,15 @@ pub(crate) fn dead_base_probe(nr: Sysno) -> Option<Entry> {
 }
 
 /// The T1 probe for `raw`, the guest call's arguments, with the staged names
-/// at `names[0]` ("x") and `names[1]` ("y").
-pub(crate) fn build_t1(nr: Sysno, args: &[ArgSrc; 6], raw: &SyscallArgs, names: [usize; 2]) -> Syscall {
+/// at `names[0]` ("x") and `names[1]` ("y"), and the staged
+/// `struct xattr_args` at `xattr_args` (0 when the row stages none).
+pub(crate) fn build_t1(
+    nr: Sysno,
+    args: &[ArgSrc; 6],
+    raw: &SyscallArgs,
+    names: [usize; 2],
+    xattr_args: usize,
+) -> Syscall {
     let guest = [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5];
     let value = |src: ArgSrc| -> usize {
         match src {
@@ -223,10 +260,26 @@ pub(crate) fn build_t1(nr: Sysno, args: &[ArgSrc; 6], raw: &SyscallArgs, names: 
             NoBase => -1i64 as usize,
             Name(n) => names[n as usize],
             Const(v) => v as usize,
+            XattrArgs => xattr_args,
         }
     };
     let a = args.map(value);
     Syscall::Other(nr, SyscallArgs::new(a[0], a[1], a[2], a[3], a[4], a[5]))
+}
+
+/// The `struct xattr_args` the setxattr and lsetxattr probe stages
+/// (include/uapi/linux/xattr.h: u64 value, u32 size, u32 flags): the guest's
+/// value pointer, size and flags. setxattr takes the size as a size_t and
+/// setxattrat as a u32, so a size above u32::MAX is staged as u32::MAX: both
+/// are above XATTR_SIZE_MAX, the same E2BIG from setxattr_copy. The flags
+/// are an int in both.
+pub(crate) fn xattr_args(raw: &SyscallArgs) -> [u8; XATTR_ARGS_SIZE] {
+    let size = u32::try_from(raw.arg3).unwrap_or(u32::MAX);
+    let mut out = [0u8; XATTR_ARGS_SIZE];
+    out[..8].copy_from_slice(&(raw.arg2 as u64).to_ne_bytes());
+    out[8..12].copy_from_slice(&size.to_ne_bytes());
+    out[12..].copy_from_slice(&(raw.arg4 as u32).to_ne_bytes());
+    out
 }
 
 /// What a probe's result means.
@@ -268,7 +321,7 @@ pub(crate) fn classify(probe: Probe, pre_lookup: &[Errno], result: Result<i64, E
         Probe::T1 { .. } => Errno::EBADF,
         Probe::Bind => Errno::EADDRINUSE,
         Probe::Connect => Errno::EINVAL,
-        Probe::Local | Probe::Unavailable => return ProbeOutcome::LookupReached,
+        Probe::Local => return ProbeOutcome::LookupReached,
     };
     match result {
         Err(e) if e == signal => ProbeOutcome::LookupReached,
@@ -372,9 +425,6 @@ mod tests {
                 Probe::Local => {
                     assert!(matches!(nr, Sysno::statfs | Sysno::chdir | Sysno::chroot), "{nr:?}");
                 }
-                Probe::Unavailable => {
-                    assert!(matches!(nr, Sysno::setxattr | Sysno::lsetxattr), "{nr:?}");
-                }
                 Probe::Bind | Probe::Connect => {}
             }
         }
@@ -386,12 +436,26 @@ mod tests {
         let raw = SyscallArgs::new(7, 0x1000, 8, 0x2000, 3, 0);
         let entry = dead_base_probe(Sysno::renameat2).unwrap();
         let Probe::T1 { nr, args } = entry.probe else { panic!() };
-        let built = build_t1(nr, &args, &raw, [0xa0, 0xb0]);
+        let built = build_t1(nr, &args, &raw, [0xa0, 0xb0], 0);
         let (n, a) = reverie::syscalls::SyscallInfo::into_parts(built);
         assert_eq!(n, Sysno::renameat2);
         assert_eq!(
             [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4],
             [usize::MAX, 0xa0, usize::MAX, 0xb0, 3]
+        );
+        // setxattr: dirfd -1, "x", at_flags 0, the guest's own name pointer,
+        // the staged struct, its size.
+        let raw = SyscallArgs::new(0x1000, 0x3000, 0x4000, 5, 1, 0);
+        let entry = dead_base_probe(Sysno::setxattr).unwrap();
+        let Probe::T1 { nr, args } = entry.probe else {
+            panic!()
+        };
+        let built = build_t1(nr, &args, &raw, [0xa0, 0xb0], 0xc0);
+        let (n, a) = reverie::syscalls::SyscallInfo::into_parts(built);
+        assert_eq!(n, Sysno::setxattrat);
+        assert_eq!(
+            [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5],
+            [usize::MAX, 0xa0, 0, 0x3000, 0xc0, XATTR_ARGS_SIZE]
         );
     }
 
@@ -440,12 +504,54 @@ mod tests {
         assert!(!create_with_trailing_slash(Path::new("../x/"), creat));
     }
 
-    /// Tracked follow-up: the table cannot name setxattrat today, which is why
-    /// setxattr and lsetxattr in a dead base are refused. When the pinned
-    /// syscalls crate gains it, this fails, and the probe must be restored.
+    /// setxattr and lsetxattr probe through setxattrat (Linux 6.13), which
+    /// Reverie's syscalls 0.8.1 names (463 on both arches). This replaces the
+    /// tripwire `sysno_has_no_setxattrat`, which fired as designed when the
+    /// pinned crate gained setxattrat: if either row loses its probe again,
+    /// this fails.
     #[test]
-    fn sysno_has_no_setxattrat() {
-        assert!(Sysno::iter().all(|nr| nr.name() != "setxattrat"));
+    fn setxattr_rows_probe_through_setxattrat() {
+        let follows = [
+            (Sysno::setxattr, Const(0)),
+            (Sysno::lsetxattr, Const(AT_SYMLINK_NOFOLLOW)),
+        ];
+        for (nr, at_flags) in follows {
+            let entry = dead_base_probe(nr).unwrap();
+            let want = t1(
+                Sysno::setxattrat,
+                [NoBase, Name(0), at_flags, Arg(1), XattrArgs, XA],
+            );
+            assert_eq!(entry.probe, want, "{nr:?}");
+            assert_eq!(entry.pre_lookup, XATTR, "{nr:?}");
+            assert_eq!(entry.slots, CWD0, "{nr:?}");
+            assert_eq!(entry.ids, SearchIds::Effective, "{nr:?}");
+        }
+        assert_eq!(Sysno::setxattrat.id(), 463);
+        assert_eq!(
+            XATTR,
+            &[Errno::EINVAL, Errno::ERANGE, Errno::EFAULT, Errno::E2BIG]
+        );
+    }
+
+    /// The staged struct: value, size, flags, in that order. A size above
+    /// u32::MAX is staged as u32::MAX (still above XATTR_SIZE_MAX, so the
+    /// same E2BIG), never truncated; the flags are their low 32 bits, as
+    /// setxattr's int.
+    #[test]
+    fn xattr_args_stage_value_size_and_flags() {
+        let staged = |size: usize, flags: usize| {
+            let b = xattr_args(&SyscallArgs::new(0, 0x10, 0x1234_5678_9abc, size, flags, 0));
+            (
+                u64::from_ne_bytes(b[..8].try_into().unwrap()),
+                u32::from_ne_bytes(b[8..12].try_into().unwrap()),
+                u32::from_ne_bytes(b[12..].try_into().unwrap()),
+            )
+        };
+        assert_eq!(staged(5, 2), (0x1234_5678_9abc, 5, 2));
+        assert_eq!(staged(65537, 0).1, 65537);
+        assert_eq!(staged((1 << 32) | 1, 0).1, u32::MAX);
+        assert_eq!(staged(usize::MAX, 0).1, u32::MAX);
+        assert_eq!(staged(0, (1 << 32) | 1).2, 1);
     }
 
     /// C5a.7: the syscall table Reverie resolves (syscalls 0.6.18,

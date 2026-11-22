@@ -6815,7 +6815,19 @@ impl RootfsTool {
                 (Ok(x), Ok(y)) => [x, y],
                 (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
             };
-            let probe = crate::dead_base::build_t1(probe_nr, &probe_args, &raw, names);
+            let xattr_args = if probe_args.contains(&crate::dead_base::ArgSrc::XattrArgs) {
+                let bytes = crate::dead_base::xattr_args(&raw);
+                match self
+                    .scratch_write_at(guest, &bytes, SCRATCH_PROBE_XATTR_ARGS)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                0
+            };
+            let probe = crate::dead_base::build_t1(probe_nr, &probe_args, &raw, names, xattr_args);
             let result = match self.admitted_inject(guest, probe).await {
                 Some(r) => r,
                 None => {
@@ -6855,10 +6867,6 @@ impl RootfsTool {
     ) -> Option<Result<i64, Error>> {
         use crate::translate::PathRefusal;
         use reverie::syscalls::Errno;
-        // setxattr and lsetxattr have no probe (D, P2-D1): where the answer
-        // would come from the dead-base path, the argument errors native
-        // gives first cannot be reproduced, so it is refused by name.
-        let unavailable = entry.probe == crate::dead_base::Probe::Unavailable;
         for g in gated {
             let name = crate::dead_base::search_name(&g.path);
             let flags = crate::dead_base::search_flags(entry.ids, &name);
@@ -6890,7 +6898,7 @@ impl RootfsTool {
             };
             match result {
                 Ok(0) => {}
-                Err(e) if e == Errno::EACCES && !unavailable => {
+                Err(e) if e == Errno::EACCES => {
                     note_path_report(Refusal::Answered(PathAnswer::DeadBaseSearch));
                     return Some(Err(Errno::EACCES.into()));
                 }
@@ -6903,9 +6911,6 @@ impl RootfsTool {
             // Step 3: the Tool's climb and decide, after the search check.
             match unnamed_route(cfg, &g.base, &g.path) {
                 UnnamedRoute::DeadName if g.dead_name => {
-                    if unavailable {
-                        return Some(self.refuse_probe(PathRefusal::ProbeUnsupported));
-                    }
                     let answer = if open_flags.is_some_and(|f| {
                         crate::dead_base::create_with_trailing_slash(&g.path, f)
                     }) {
@@ -8160,6 +8165,39 @@ fn guest_rest(rest: PathBuf) -> PathBuf {
     }
 }
 
+/// Every number the pinned syscalls crate names above 461 (0.6.18's last),
+/// and what literoot does with it. None is subscribed
+/// ([`RootfsTool::subscriptions`]), and the handler's default arm would
+/// forward one unchanged: each reaches the kernel with the guest's own
+/// arguments, untranslated, like the older getxattr, listxattr, removexattr
+/// and open_tree. A crate bump that names a new number fails
+/// `numbers_above_461_have_a_written_disposition` until the number is added
+/// here, or translated, or refused by name. It is a record the test reads,
+/// so it is compiled for tests only.
+#[cfg(test)]
+pub(crate) const UNSUBSCRIBED_ABOVE_461: [(Sysno, &str); 8] = [
+    (Sysno::mseal, "N/A: no path argument"),
+    (Sysno::setxattrat, "dirfd and path: forwarded untranslated"),
+    (Sysno::getxattrat, "dirfd and path: forwarded untranslated"),
+    (Sysno::listxattrat, "dirfd and path: forwarded untranslated"),
+    (
+        Sysno::removexattrat,
+        "dirfd and path: forwarded untranslated",
+    ),
+    (
+        Sysno::open_tree_attr,
+        "dirfd and path: forwarded untranslated",
+    ),
+    (
+        Sysno::file_getattr,
+        "dirfd and path: forwarded untranslated",
+    ),
+    (
+        Sysno::file_setattr,
+        "dirfd and path: forwarded untranslated",
+    ),
+];
+
 /// The size of a thread's scratch page.
 const SCRATCH_PAGE: usize = 4096;
 
@@ -8185,6 +8223,9 @@ const SCRATCH_STATUS_LEN: usize = 1024;
 /// at 0..2048 that the arms use after the gate.
 const SCRATCH_PROBE_X: usize = 2048;
 const SCRATCH_PROBE_Y: usize = 2056;
+/// The setxattr and lsetxattr probe's `struct xattr_args` (16 bytes), after
+/// the two names and clear of SCRATCH_OPEN_HOW.
+const SCRATCH_PROBE_XATTR_ARGS: usize = 2064;
 /// Scratch offset of the open_how the ptrace cmdline route stages for the
 /// guest's rewritten openat2 (24 bytes), clear of the path at 0.
 const SCRATCH_OPEN_HOW: usize = 2304;
@@ -9828,6 +9869,38 @@ mod seams;
 mod tests {
     use super::*;
     use crate::exec_state::ExecState;
+
+    /// The general tripwire for new syscall numbers: the set of numbers the
+    /// pinned syscalls crate names above 461 equals `UNSUBSCRIBED_ABOVE_461`
+    /// exactly, and none of them is subscribed. A crate bump that names more
+    /// fails here until each new number has a written disposition.
+    #[test]
+    fn numbers_above_461_have_a_written_disposition() {
+        // syscalls' Sysno::iter() never yields Sysno::last(): next() stops at
+        // `next_id < Self::last().id()` (syscalls 0.6.18 and 0.8.1,
+        // src/arch/macros.rs:74). Enumerate the ids up to last() instead.
+        let named: std::collections::BTreeSet<i32> = (462..=Sysno::last().id())
+            .filter_map(|id| Sysno::new(id as usize))
+            .map(|nr| nr.id())
+            .collect();
+        let table: std::collections::BTreeSet<i32> = UNSUBSCRIBED_ABOVE_461
+            .iter()
+            .map(|(nr, _)| nr.id())
+            .collect();
+        assert_eq!(named, table);
+        assert_eq!(table.len(), UNSUBSCRIBED_ABOVE_461.len(), "a duplicate row");
+        let source = include_str!("rootfs_tool.rs");
+        let at = source.find("fn subscriptions(").expect("subscriptions");
+        let body = &source[at..at + source[at..].find("\n    }\n").expect("its end")];
+        for (nr, why) in UNSUBSCRIBED_ABOVE_461 {
+            assert!(!why.is_empty(), "{nr:?}");
+            let name = format!("Sysno::{},", nr.name());
+            assert!(
+                !body.contains(&name),
+                "{nr:?} is subscribed: its row is wrong"
+            );
+        }
+    }
 
     /// The launcher and the preload compile these wire types from the same
     /// files: no `#[cfg` inside any of them may give the two builds

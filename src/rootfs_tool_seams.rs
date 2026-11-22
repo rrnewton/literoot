@@ -1235,6 +1235,167 @@ fn renameat_and_statat_go_through_the_dead_base_gate() {
     });
 }
 
+const DEAD_BASE_SEARCH: Refusal = Refusal::Answered(super::PathAnswer::DeadBaseSearch);
+
+/// setxattr(`name`, `value`, `size`, `flags`) or lsetxattr on "x": a dead
+/// base's T1 route through setxattrat.
+fn setxattr_call(nr: Sysno, name: usize, value: usize, size: usize, flags: usize) -> Syscall {
+    Syscall::from_raw(
+        nr,
+        SyscallArgs::new(c"x".as_ptr() as usize, name, value, size, flags, 0),
+    )
+}
+
+/// setxattr and lsetxattr in a deleted cwd, scripted. The T1 probe is
+/// setxattrat with dirfd -1, the staged "x", AT_SYMLINK_NOFOLLOW for
+/// lsetxattr only, the guest's own name pointer, and the staged
+/// `struct xattr_args` (the guest's value, size and flags) of 16 bytes at
+/// SCRATCH_PROBE_XATTR_ARGS. EBADF goes on to the search check and ENOENT
+/// (dead_base_name); each argument errno setxattr_copy can give is the
+/// call's answer, with nothing more injected; ENOSYS (a kernel before 6.13)
+/// and ENOMEM (not in the expected set) are probe_unsupported; a failed
+/// search check is answered EACCES (dead_base_search). Before the probe was
+/// restored, the last case and the dead name were refused by name.
+#[test]
+fn setxattr_probes_through_setxattrat() {
+    let _lane = serial();
+    take_reports();
+    in_dead_cwd(0o700, |root| {
+        let (name, value) = (c"user.a".as_ptr() as usize, c"v".as_ptr() as usize);
+        let nofollow = libc::AT_SYMLINK_NOFOLLOW as u64;
+        for (nr, at_flags) in [(Sysno::setxattr, 0), (Sysno::lsetxattr, nofollow)] {
+            let call = setxattr_call(nr, name, value, 1, 1);
+            let mut scratch = Scratch::new();
+            let tool = tool_with(&mut scratch);
+            let mut g = RecordingGuest::new(ptrace_cfg(root));
+            g.expect([err(Errno::EBADF), ok0()]);
+            let r = dispatch(&tool, &mut g, call);
+            assert_eq!(errno(&r), Some(Errno::ENOENT), "{nr:?}");
+            assert_eq!(take_reports(), vec![DEAD_BASE_NAME], "{nr:?}");
+            let injected = g.injected();
+            assert_eq!(injected.len(), 2, "{nr:?}: the probe and the search check");
+            let (probe, a) = injected[0];
+            assert_eq!(probe, Sysno::setxattrat, "{nr:?}");
+            assert_eq!(a[0] as i64, -1, "{nr:?}: dirfd -1");
+            assert_eq!([a[2], a[3], a[5]], [at_flags, name as u64, 16], "{nr:?}");
+            let staged_at = scratch.addr() + super::SCRATCH_PROBE_XATTR_ARGS;
+            assert_eq!(a[4], staged_at as u64, "{nr:?}: the staged struct");
+            let (_, raw) = call.into_parts();
+            let want = crate::dead_base::xattr_args(&raw);
+            assert_eq!(
+                scratch.at(super::SCRATCH_PROBE_XATTR_ARGS, 16),
+                &want[..],
+                "{nr:?}"
+            );
+            assert_eq!(injected[1].0, Sysno::faccessat2, "{nr:?}: the search check");
+
+            for e in [Errno::EINVAL, Errno::ERANGE, Errno::EFAULT, Errno::E2BIG] {
+                let mut scratch = Scratch::new();
+                let tool = tool_with(&mut scratch);
+                let mut g = RecordingGuest::new(ptrace_cfg(root));
+                g.expect([err(e)]);
+                let r = dispatch(&tool, &mut g, call);
+                assert_eq!(errno(&r), Some(e), "{nr:?} {e:?}: the call's answer");
+                assert!(take_reports().is_empty(), "{nr:?} {e:?}");
+                assert_eq!(g.injected().len(), 1, "{nr:?} {e:?}: only the probe");
+            }
+            for e in [Errno::ENOSYS, Errno::ENOMEM] {
+                let mut scratch = Scratch::new();
+                let tool = tool_with(&mut scratch);
+                let mut g = RecordingGuest::new(ptrace_cfg(root));
+                g.expect([err(e)]);
+                let r = dispatch(&tool, &mut g, call);
+                assert_eq!(errno(&r), Some(Errno::EACCES), "{nr:?} {e:?}");
+                assert_eq!(take_reports(), vec![PROBE_UNSUPPORTED], "{nr:?} {e:?}");
+                assert_eq!(g.injected().len(), 1, "{nr:?} {e:?}: only the probe");
+            }
+            let mut scratch = Scratch::new();
+            let tool = tool_with(&mut scratch);
+            let mut g = RecordingGuest::new(ptrace_cfg(root));
+            g.expect([err(Errno::EBADF), err(Errno::EACCES)]);
+            let r = dispatch(&tool, &mut g, call);
+            assert_eq!(errno(&r), Some(Errno::EACCES), "{nr:?}: the search check");
+            assert_eq!(take_reports(), vec![DEAD_BASE_SEARCH], "{nr:?}");
+        }
+    });
+}
+
+/// setxattr and lsetxattr in a deleted cwd against the REAL kernel: every
+/// injection runs natively, and each case's answer through the Tool equals
+/// the same call made natively in the same deleted cwd. The cases cover each
+/// argument check setxattr_copy makes before the lookup (fs/xattr.c:622-645
+/// at v7.1.3), including a size above u32::MAX, which setxattr takes as a
+/// size_t and setxattrat as a u32. On a kernel without setxattrat (before
+/// 6.13) every case is probe_unsupported instead.
+#[test]
+fn setxattr_probe_matches_native() {
+    let _lane = serial();
+    take_reports();
+    in_dead_cwd(0o700, |root| {
+        let long = std::ffi::CString::new(format!("user.{}", "a".repeat(251))).unwrap();
+        let (name, value) = (c"user.a".as_ptr() as usize, c"v".as_ptr() as usize);
+        let cases: [(&str, usize, usize, usize, usize); 9] = [
+            ("valid", name, value, 1, 0),
+            ("flags 4", name, value, 1, 4),
+            ("empty name", c"".as_ptr() as usize, value, 1, 0),
+            ("256-byte name", long.as_ptr() as usize, value, 1, 0),
+            ("size 65537", name, value, 65537, 0),
+            ("size 2^32+1", name, value, (1 << 32) | 1, 0),
+            ("value pointer 1", name, 1, 1, 0),
+            ("name pointer 1", 1, value, 1, 0),
+            ("no value", name, 0, 0, 0),
+        ];
+        // Does this kernel have setxattrat? Its own probe answers EBADF if so.
+        let args = crate::dead_base::xattr_args(&SyscallArgs::new(0, name, value, 1, 0, 0));
+        // Full-width variadic arguments: dirfd -1, at_flags 0, usize 16.
+        let (dirfd, at_flags, usize_16): (libc::c_long, libc::c_long, libc::c_long) = (-1, 0, 16);
+        let setxattrat = Sysno::setxattrat.id() as libc::c_long;
+        // SAFETY: every pointer is this process's own memory.
+        let has = unsafe {
+            libc::syscall(
+                setxattrat,
+                dirfd,
+                c"x".as_ptr(),
+                at_flags,
+                name,
+                args.as_ptr(),
+                usize_16,
+            )
+        } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOSYS);
+        for nr in [Sysno::setxattr, Sysno::lsetxattr] {
+            for (what, n, v, size, flags) in cases {
+                // SAFETY: as above; a bad pointer is the case under test.
+                let native = unsafe {
+                    libc::syscall(nr.id() as libc::c_long, c"x".as_ptr(), n, v, size, flags)
+                };
+                let native = (native < 0).then(|| {
+                    Errno::new(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+                });
+                let mut scratch = Scratch::new();
+                let tool = tool_with(&mut scratch);
+                let mut g = RecordingGuest::new(ptrace_cfg(root));
+                g.native_rest = true;
+                let r = dispatch(&tool, &mut g, setxattr_call(nr, n, v, size, flags));
+                take_reports();
+                if has {
+                    assert_eq!(errno(&r), native, "{nr:?} {what}: the Tool against native");
+                    assert!(
+                        native.is_some(),
+                        "{nr:?} {what}: a dead base never succeeds"
+                    );
+                } else {
+                    assert_eq!(
+                        errno(&r),
+                        Some(Errno::EACCES),
+                        "{nr:?} {what}: no setxattrat"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// S.4: a T1 success is refused (probe_unsupported) and nothing is closed:
 /// the number names whatever the guest already holds there. The sentinel is
 /// a live descriptor of an owned scratch file; the result seam makes T1

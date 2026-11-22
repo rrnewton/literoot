@@ -184,6 +184,18 @@ and `io_uring` path ops (§4.6). Reverse-translation syscalls:
 `getdents64` is *not* rewritten (dirents are names, not paths — but
 see §4.5 for the `/proc` exceptions).
 
+Not every call above is in the code's subscription list
+(`RootfsTool::subscriptions`); an unsubscribed call reaches the kernel
+with the guest's own arguments, untranslated. The numbers the pinned
+syscalls crate names above 461 (mseal, setxattrat, getxattrat,
+listxattrat, removexattrat, open_tree_attr, file_getattr, file_setattr)
+are all unsubscribed: mseal takes no path; the other seven take a dirfd
+and a path and are forwarded untranslated. Each has a written row in
+`UNSUBSCRIBED_ABOVE_461`, and a test fails when the crate names a number
+without one. Whether forwarding a path-taking call untranslated is a
+guest-root escape is an open question tracked separately, together with
+the older unsubscribed calls (the getxattr family, truncate, utime).
+
 Each handler does the same three steps: (1) read the guest path
 string/buffer, (2) `translate(guest_path, dirfd, cwd)` → host path,
 (3) inject the syscall with a Tool-owned copy of the translated path
@@ -325,11 +337,12 @@ family, `synthetic_file_unavailable`, is not a refusal: the call is answered by 
 | `synthetic_file_unavailable` (answered, not refused) | a cmdline literoot answers itself (its own process's, or a shared-record row's, §4.9.5) cannot be made. In-guest: the probe gate is closed (a guest filter installed or being installed in the process, which its children inherit, a flagged record, or the thread's dispatch ON or unreadable), memfd_create fails or admission refuses it, the Tool-side write fails or the calling thread's descriptor is not the empty memfd (the memfd is closed first), or openat2's argument probe proves nothing. On ptrace: the tracer itself is not dumpable, the guest left the tracer's mount namespace, the tracer's argument check gives any answer but EBADF, EINVAL, E2BIG or EAGAIN, the tracer's memfd cannot be made, or the guest's rewritten call fails with anything but EMFILE, ENFILE, ENOMEM or a restart code, or opens another object | the kernel's own cmdline file, which on every backend holds the argv literoot exec'd: `[rootfs interpreter, program, args…]` for a dynamically linked program or a script | the process's command line | nothing is refused: the guest gets the kernel's file, and the line says the synthesized answer was unavailable |
 
 `probe_unsupported` triggers:
-1. **setxattr or lsetxattr with a dead name, or a failed search check, in a dead base.** literoot's syscall table
-   (Reverie's syscalls 0.6.18, last number 461) cannot name setxattrat. So the call is refused on every kernel,
-   6.13 and later included, where setxattrat exists. It is refused by name, before argument validation. Native
-   answers the argument errors first (EINVAL, ERANGE, E2BIG, EFAULT), then ENOENT or EACCES. A ".." climb that lands
-   on a live directory is translated normally (fix 3's route).
+1. *(Retired at the syscalls 0.8.1 pin.)* setxattr and lsetxattr in a dead base used to be refused here, because
+   syscalls 0.6.18 (last number 461) could not name setxattrat. They now probe through setxattrat (Linux 6.13), with
+   their value, size and flags staged as its `struct xattr_args` (a size above u32::MAX is staged as u32::MAX, the
+   same E2BIG). Native's argument errors (EINVAL, ERANGE, EFAULT, E2BIG) come first, then EACCES or ENOENT, as for
+   every T1 row. A kernel before 6.13 answers the probe ENOSYS, which is trigger 2. The number is kept so that the
+   triggers below keep theirs.
 2. **An untrusted probe result.** A probe or the search check returned ENOSYS, EPERM, a success (nothing is closed),
    or anything outside its expected set. EINTR and the ERESTART* codes are outside every expected set, and there is
    never a second injection.
