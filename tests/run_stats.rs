@@ -23,7 +23,10 @@ fn literoot_bin() -> PathBuf {
 
 // Same resolution as backend_smoke.rs. Compiled exactly where a preload
 // test is: the trap tests (inguest-trap) and the x86_64 liteinst test.
-#[cfg(any(feature = "inguest-trap", all(target_arch = "x86_64", feature = "in-guest")))]
+#[cfg(any(
+    feature = "inguest-trap",
+    all(target_arch = "x86_64", feature = "in-guest")
+))]
 fn preload_or_skip() -> Option<PathBuf> {
     let preload = if let Ok(p) = std::env::var("LITEROOT_PRELOAD") {
         PathBuf::from(p)
@@ -214,7 +217,10 @@ const PTRACE_KEYS: [&str; 12] = [
 /// Ptrace counts by kind, with a guest that forks twice and execs twice,
 /// so swapped accessors of different kinds read wrong. (Two fields with
 /// equal values, such as two that stay 0, cannot be told apart by any
-/// guest.)
+/// guest.) Under literoot the fork, vfork and clone stop counts all stay
+/// 0: literoot injects every fork-kind call, the injection consumes the
+/// child-creation stop, and Reverie counts those stops only in its run
+/// loop. So those three accessors are such a case.
 #[cfg(feature = "run")]
 #[test]
 fn ptrace_record_counts_stops_by_kind() {
@@ -248,10 +254,17 @@ fn ptrace_record_counts_stops_by_kind() {
         count(&record, "/ptrace/exec_stops") >= 2,
         "two children exec /bin/true"
     );
+    // literoot injects every clone, clone3, fork and vfork, and Reverie
+    // counts child-creation stops only in its run loop, so the injection
+    // consumes them; Reverie pins that sum at 0 when the Tool injects every
+    // call (reverie-ptrace plain_guest_regression_tests).
     let forks = count(&record, "/ptrace/fork_stops")
         + count(&record, "/ptrace/vfork_stops")
         + count(&record, "/ptrace/clone_stops");
-    assert!(forks >= 2, "sh creates two children");
+    assert_eq!(
+        forks, 0,
+        "literoot injects every fork; Reverie counts only run-loop child stops"
+    );
     assert_eq!(
         count(&record, "/dispatch/counters/ptrace_seccomp_stops"),
         seccomp
