@@ -115,6 +115,13 @@ impl Run<'_> {
     /// As `go`, plus literoot's stderr, for checks against fixed text only
     /// (never printed).
     fn go_with_stderr(&self, dir: &Path) -> (i32, Vec<String>, String) {
+        let (status, lines, _, stderr) = self.go_with_output(dir);
+        (status, lines, stderr)
+    }
+
+    /// As `go`, plus literoot's stdout, which carries the guest's, and its
+    /// stderr, for checks against fixed text only (never printed).
+    fn go_with_output(&self, dir: &Path) -> (i32, Vec<String>, String, String) {
         let log = dir.join("refusal.log");
         let _ = std::fs::remove_file(&log);
         let mut cmd = Command::new(literoot_bin());
@@ -133,8 +140,9 @@ impl Run<'_> {
             .lines()
             .map(str::to_owned)
             .collect();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        (out.status.code().unwrap_or(-1), lines, stderr)
+        (out.status.code().unwrap_or(-1), lines, stdout, stderr)
     }
 }
 
@@ -217,10 +225,13 @@ const PTRACE_KEYS: [&str; 12] = [
 /// Ptrace counts by kind, with a guest that forks twice and execs twice,
 /// so swapped accessors of different kinds read wrong. (Two fields with
 /// equal values, such as two that stay 0, cannot be told apart by any
-/// guest.) Under literoot the fork, vfork and clone stop counts all stay
-/// 0: literoot injects every fork-kind call, the injection consumes the
-/// child-creation stop, and Reverie counts those stops only in its run
-/// loop. So those three accessors are such a case.
+/// guest.) Under literoot the fork, vfork, clone and exec stop counts all
+/// stay 0: literoot injects every fork-kind call and every execve (the
+/// launcher's own included), the injection consumes the event stop, and
+/// Reverie counts those stops only in its run loop. So those four
+/// accessors are such a case, and the children's two execs are shown by
+/// their own output instead, which only /bin/echo running in each child
+/// can print.
 #[cfg(feature = "run")]
 #[test]
 fn ptrace_record_counts_stops_by_kind() {
@@ -229,10 +240,13 @@ fn ptrace_record_counts_stops_by_kind() {
     let run = Run {
         backend: "ptrace",
         vars: vec![("LITEROOT_STATS", stats.clone())],
-        argv: &["/bin/sh", "-c", "/bin/true; /bin/true; exit 0"],
+        argv: &["/bin/sh", "-c", "/bin/echo e1; /bin/echo e2; exit 0"],
     };
-    let (status, log) = run.go(&dir);
+    let (status, log, stdout, _) = run.go_with_output(&dir);
     assert_eq!(status, 0);
+    // The positive witness that both children exec'd, independent of every
+    // Reverie counter: only /bin/echo, running in each child, prints these.
+    assert_eq!(stdout, "e1\ne2\n", "two children exec /bin/echo");
     let record = one_record(&stats);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_common(&record, "ptrace", "counting", &log);
@@ -245,14 +259,29 @@ fn ptrace_record_counts_stops_by_kind() {
     let seccomp = count(&record, "/ptrace/seccomp_stops");
     assert!(seccomp > 0);
     assert!(stops >= seccomp, "every seccomp stop is a stop event");
-    assert!(
-        count(&record, "/ptrace/tracees_started") >= 3,
+    assert_eq!(
+        count(&record, "/ptrace/tracees_started"),
+        3,
         "sh and two children"
     );
-    assert!(count(&record, "/ptrace/exited_tracees") >= 3);
-    assert!(
-        count(&record, "/ptrace/exec_stops") >= 2,
-        "two children exec /bin/true"
+    assert_eq!(count(&record, "/ptrace/exited_tracees"), 3);
+    // Under literoot's ptrace backend every exec made through execve goes
+    // uncounted, because literoot subscribes to execve and injects every
+    // one, the launcher's own included; so exec_stops is 0 for any guest
+    // that execs only through execve, as this one does. This checks
+    // Reverie's counting contract, not the children (the stdout witness
+    // above proves they ran). Reverie loads the seccomp filter just before
+    // the spawn's execve, so even that one traps to the tool. An injected
+    // exec's stop is consumed inside the injection, and Reverie's snapshot
+    // counts "lifecycle transitions observed by the ptrace run loops",
+    // stating an injection carve-out for tracees_started and none for
+    // exec_stops. (A tool that subscribes to nothing, like Reverie's no-op
+    // tool, does count the spawn's exec stop; so would a native execveat,
+    // which literoot does not subscribe to.)
+    assert_eq!(
+        count(&record, "/ptrace/exec_stops"),
+        0,
+        "literoot injects every execve; Reverie counts only run-loop exec stops"
     );
     // literoot injects every clone, clone3, fork and vfork, and Reverie
     // counts child-creation stops only in its run loop, so the injection
