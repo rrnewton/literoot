@@ -1251,15 +1251,13 @@ fn run_backend_with(
                         .map_err(|e| launch_error(backend, e))?;
                     Ok::<_, String>((output, Some(source.backend_stats())))
                 } else {
-                    let (output, _global) =
-                        PreloadBackend::run_with_output_and_preload_data::<RootfsTool>(
-                            cmd,
-                            cfg,
-                            preload.clone(),
-                            selector.clone(),
-                        )
-                        .await
-                        .map_err(|e| launch_error(backend, e))?;
+                    let (output, _global) = PreloadBackend::run_with_output_and_preload_data::<
+                        RootfsTool,
+                    >(
+                        cmd, cfg, preload.clone(), selector.clone()
+                    )
+                    .await
+                    .map_err(|e| launch_error(backend, e))?;
                     Ok((output, None))
                 }
             })?;
@@ -1310,15 +1308,13 @@ fn run_backend_with(
                         .map_err(|e| launch_error(backend, e))?;
                     Ok::<_, String>((output, Some(source.backend_stats())))
                 } else {
-                    let (output, _global) =
-                        LiteinstBackend::run_with_output_and_preload_data::<RootfsTool>(
-                            cmd,
-                            cfg,
-                            preload.clone(),
-                            selector.clone(),
-                        )
-                        .await
-                        .map_err(|e| launch_error(backend, e))?;
+                    let (output, _global) = LiteinstBackend::run_with_output_and_preload_data::<
+                        RootfsTool,
+                    >(
+                        cmd, cfg, preload.clone(), selector.clone()
+                    )
+                    .await
+                    .map_err(|e| launch_error(backend, e))?;
                     Ok((output, None))
                 }
             })?;

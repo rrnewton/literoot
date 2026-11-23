@@ -13,18 +13,18 @@ mod arch;
 mod dead_base;
 #[cfg(feature = "tool")]
 mod exec_stage;
-mod refusal_log;
-mod side_log;
-#[cfg(test)]
-mod test_source;
 #[cfg(feature = "tool")]
 mod exec_state;
 #[cfg(feature = "tool")]
 mod fake_creds;
+mod refusal_log;
 #[cfg(feature = "tool")]
 mod rootfs_tool;
 #[cfg(feature = "tool")]
 mod run_stats;
+mod side_log;
+#[cfg(test)]
+mod test_source;
 // Test builds compile it too, for the wire-digest pin (C5d): the codec and
 // sha2 are dev-dependencies.
 #[cfg(all(feature = "tool", any(test, feature = "private-runtime")))]
@@ -699,7 +699,13 @@ fn launch(argv: Vec<String>) -> ExitCode {
     }
     #[cfg(feature = "tool")]
     {
-        match tool::run_guest(&cli.config, &cli.cwd_guest, &cli.backend, &cli.command, cli.kill_on_exit) {
+        match tool::run_guest(
+            &cli.config,
+            &cli.cwd_guest,
+            &cli.backend,
+            &cli.command,
+            cli.kill_on_exit,
+        ) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
                 // A stats failure (the measurement cgroup's cleanup after
@@ -782,7 +788,10 @@ mod kill_on_exit_parse_tests {
         assert_eq!(launcher_error_exit_code(error), super::STATS_FAILURE_EXIT);
         assert_eq!(launcher_token(error), "stats_cgroup");
         #[cfg(feature = "tool")]
-        assert_eq!(super::STATS_FAILURE_EXIT, crate::run_stats::STATS_RECORD_EXIT);
+        assert_eq!(
+            super::STATS_FAILURE_EXIT,
+            crate::run_stats::STATS_RECORD_EXIT
+        );
     }
 
     #[test]
